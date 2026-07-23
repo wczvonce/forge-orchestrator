@@ -2,6 +2,39 @@
 
 Dátum auditu: 22. júl 2026
 
+## Runtime routing, fallback a verification hardening — 24. júl 2026
+
+Údržba prebehla priamo maintainerom na izolovanej Git vetve; Forge nebol
+spustený autonómne nad vlastnou inštaláciou.
+
+1. Všetky produkčné Claude calls používajú jediný subscription-safe router.
+   Legacy rescue vetva už nečíta hardcoded Opus model/effort pri spustení.
+2. Runtime výsledky rozlišujú success, max turns, unavailable/not included,
+   credits/API-required, auth failure, subscription limit, rate limit, timeout,
+   refusal, sandbox denial a všeobecný CLI failure.
+3. Iba model-availability dôvody povoľujú candidate fallback. Rovnaký Decision,
+   packet, acceptance criteria, chain counters a unavailable-model evidence sa
+   zachovajú aj cez resume.
+4. Premium limit platí pre celý continuation chain. Rescue po jeho vyčerpaní
+   môže použiť povolený Sonnet, ale nikdy ďalší premium model.
+5. Economy zostáva `sonnet`/`low`, pretože aktuálny bezmodelový CLI preflight
+   nepotvrdil lacnejší subscription-included alias. Konfigurácia nevymýšľa
+   model ID.
+6. Routing evidence pravdivo ukladá requested turn budget, skutočné použitie
+   `--max-turns`, efektívny timeout, packet-attempt limit a chain worker limit.
+7. Test report adaptery podporujú pytest/unittest text, JUnit XML,
+   Jest/Vitest, Playwright, Gradle/Android JUnit, TRX a Flutter JSON. Odmietajú
+   0 vykonaných testov pri test checku, malformed, stale a mimo-projektové
+   reporty. Build/lint/type-check count nevyžadujú.
+8. ProjectPlan vykonáva deterministickú DFS validáciu celého DAG, vrátane
+   cyklov vytvorených cez `plan_patch`, a kontroluje existenciu ready packetu.
+9. Pôvodných 84 testov zostalo zachovaných. Pribudlo 46 explicitných scenárov;
+   celá 130-testová fake-CLI sada a multi-packet fallback E2E prešli bez
+   reálneho modelového requestu.
+10. Bezpečnostné hranice zostali nezmenené: ChatGPT/Claude.ai subscription
+    auth, žiadne API keys/billing/credits, read-only Codex, Claude safe mode,
+    redakcia a žiadny push/deploy/publish z Forge runtime.
+
 ## Adaptive Autonomous Orchestration — 23. júl 2026
 
 Táto údržba bola vykonaná priamo maintainerom nad lokálnymi zdrojmi, nie autonómnym Forge cyklom nad vlastnou inštaláciou. Pred prvou zmenou nebežal aktívny Forge proces, vznikla timestampovaná záloha so SHA-256 manifestom a baseline prešiel: Python syntax, 36 pôvodných fake-CLI testov, JSON konfigurácie aj wrapper `DoctorOnly`.

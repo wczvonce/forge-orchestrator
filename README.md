@@ -7,6 +7,41 @@ Forge používa existujúce ChatGPT a Claude.ai predplatné, nie API kľúče:
 - **Forge** je lokálna Python slučka, ktorá vyberá správny model podľa fázy, zbiera iba potrebné dôkazy, spúšťa kontroly a bezpečne zastavuje proces.
 - **Live Monitor** je obyčajný lokálny PowerShell. Jeho obnovovanie nespotrebúva modelové tokeny.
 
+## Subscription-safe runtime routing — 24. júl 2026
+
+Každé produkčné Claude volanie, vrátane opravy po zaseknutí, prechádza cez
+`run_claude_routed()` a `resolve_worker_runtime()`. Staré
+`claude_escalation_*` hodnoty zostávajú čitateľné pre kompatibilitu, ale už
+nemôžu spustiť priamy hardcoded Opus call. Rescue je logický profil, nie názov
+modelu.
+
+Ak CLI odmietne povoleného kandidáta ako unavailable, unsupported, not found,
+not included, invalid alias alebo vyžadujúceho usage credits/API billing,
+Forge zopakuje presne ten istý packet s ďalším subscription-safe kandidátom.
+Auth failure, subscription/rate limit a timeout sa za modelový fallback
+nevydávajú. Po vyčerpaní kandidátov skončí worker dôvodom
+`model_unavailable_without_credits`; Forge nezapne kredity ani API.
+
+Economy používa lacnejší model iba po explicitnom potvrdení, že je podporovaný
+CLI a zahrnutý v predplatnom. V aktuálnom auditovanom lokálnom profile sa taký
+lacnejší model bez modelového volania nepotvrdil, preto ostáva pravdivý fallback
+`sonnet`/`low`.
+
+Routing log uvádza `requested_turn_budget`, `cli_turn_limit_enforced`,
+`effective_timeout`, `max_packet_attempts` a `max_chain_worker_calls`.
+`--max-turns` sa odošle iba po pozitívnom capability preflighte; inak hranice
+vynucujú timeout, packet attempts, worker-call, elapsed a no-progress budgety.
+
+Test checks normalizujú `tests_discovered`, `tests_executed`, `tests_passed`,
+`tests_failed` a `tests_skipped`. Podporované dôkazy zahŕňajú pytest/unittest
+text, JUnit XML, Jest/Vitest JSON, Playwright JSON, Gradle/Android JUnit, TRX a
+Flutter JSON events. Povinný test check s nulou vykonaných testov, neplatným,
+starým alebo mimoprojektovým reportom nie je zelený. Build, lint a type-check
+nepotrebujú test count.
+
+ProjectPlan validuje celý dependency DAG, vypíše konkrétnu cestu cyklu a
+odmietne aktívny nedokončený plán bez dependency-ready packetu.
+
 ## Predvolená modelová politika
 
 Režim `EconomySafe` je predvolený:
@@ -211,7 +246,11 @@ python -m py_compile .\forge.py
 python -m unittest discover -s .\tests -v
 ```
 
-Testy používajú falošné Codex a Claude CLI procesy. Sada pokrýva pôvodných 36 regresných scenárov aj adaptívne schémy, ProjectPlan, dependency packety, modelový router, check tiers, test count/report gate, evidence index, project identity, heartbeat, hard chain budgety a kompletný viac-child-run E2E až po čerstvú release suite a `done` — bez reálneho modelového volania.
+Testy používajú falošné Codex a Claude CLI procesy. Sada pokrýva 84 pôvodných
+regresných scenárov a 46 nových routing/fallback/report/DAG scenárov, spolu 130
+testov. Multi-packet fake E2E simuluje odmietnutý economy model, bezpečný
+fallback, economy aj complex packet, reportované test counts, automatické
+resume, čerstvú release suite a `done` — bez reálneho modelového volania.
 
 ## Limity
 

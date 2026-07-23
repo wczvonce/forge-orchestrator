@@ -489,7 +489,7 @@ class FakeClaudeTests(unittest.TestCase):
         self.assertEqual(result["premium_claude_escalations_used"], 1)
         self.assertTrue((run_logs / "01E1-worker.json").exists())
         self.assertIn("opus", args)
-        self.assertIn("xhigh", args)
+        self.assertIn("high", args)
 
     def continuation_config(self):
         config = self.config(timeout=10)
@@ -708,7 +708,14 @@ class FakeClaudeTests(unittest.TestCase):
         self.assertNotIn("opus", args)
         self.assertEqual(child["chain_premium_escalations"], 1)
         self.assertEqual(child["run_premium_claude_escalations_used"], 0)
-        self.assertFalse(list(Path(child["logs_path"]).glob("*E*-worker.json")))
+        rescue_routes = [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in Path(child["logs_path"]).glob("*E*-worker-routing.json")
+        ]
+        self.assertTrue(rescue_routes)
+        self.assertTrue(
+            all(route["selected_model"] != "opus" for route in rescue_routes)
+        )
 
     def test_unchanged_fingerprint_skips_general_architecture_review(self):
         _, _, source = self._create_needs_continuation()

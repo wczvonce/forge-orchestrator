@@ -491,6 +491,21 @@ while ($true) {
     if ($WorkerReason) {
       Write-Host ("Prečo: {0}" -f $WorkerReason)
     }
+    $RequestedTurns = Get-OptionalProperty -Object $Status -Name "requested_turn_budget"
+    $TurnLimitEnforced = Get-OptionalProperty -Object $Status -Name "cli_turn_limit_enforced"
+    $EffectiveTimeout = Get-OptionalProperty -Object $Status -Name "effective_timeout"
+    if ($RequestedTurns) {
+      $EnforcementText = if ($TurnLimitEnforced) {
+        "áno, priamo cez Claude CLI"
+      }
+      else {
+        "nie; Forge používa časový a chain limit"
+      }
+      Write-Host (
+        "Limit pokusu: {0} turnov | CLI vynútenie: {1} | čas: {2} s" -f `
+          (Protect-Text $RequestedTurns), $EnforcementText, (Protect-Text $EffectiveTimeout)
+      ) -ForegroundColor DarkCyan
+    }
   }
   Write-Host ""
   Write-Host "Aktuálny krok:" -ForegroundColor Yellow

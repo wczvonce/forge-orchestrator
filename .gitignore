@@ -1,0 +1,26 @@
+# Local runtimes and generated Python files
+.venv/
+__pycache__/
+*.py[cod]
+
+# Forge runtime state, immutable run logs and local backups
+.forge/
+backups/
+*.log
+*.audit-original
+
+# Local authentication and secret-bearing files
+.env
+.env.*
+!.env.example
+.claude/
+.codex/
+.agents/
+*.key
+*.pem
+
+# Operating-system and editor artifacts
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

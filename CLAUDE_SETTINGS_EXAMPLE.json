@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(git push *)",
+      "Bash(gh pr merge *)",
+      "Bash(npm publish *)",
+      "Bash(docker push *)",
+      "PowerShell(git push *)",
+      "PowerShell(gh pr merge *)",
+      "PowerShell(npm publish *)",
+      "PowerShell(docker push *)"
+    ]
+  }
+}

@@ -1,0 +1,115 @@
+{
+  "mode": "economy-safe-strict",
+  "codex_architecture_model": "gpt-5.6-sol",
+  "codex_architecture_reasoning_effort": "xhigh",
+  "codex_review_model": "gpt-5.6-terra",
+  "codex_review_reasoning_effort": "medium",
+  "codex_important_model": "gpt-5.6-sol",
+  "codex_important_reasoning_effort": "high",
+  "codex_final_model": "gpt-5.6-sol",
+  "codex_final_reasoning_effort": "xhigh",
+  "require_chatgpt_auth": true,
+  "ignore_codex_user_config": true,
+  "ignore_codex_rules": true,
+  "codex_usage_telemetry": true,
+  "claude_model": "sonnet",
+  "claude_effort": "medium",
+  "claude_max_turns": 45,
+  "claude_escalation_enabled": true,
+  "claude_escalation_model": "opus",
+  "claude_escalation_effort": "xhigh",
+  "claude_escalation_max_turns": 20,
+  "claude_escalation_max_per_run": 1,
+  "claude_escalate_after_failed_iterations": 2,
+  "claude_escalate_on_worker_failure": true,
+  "claude_escalate_on_no_progress": true,
+  "permission_mode": "auto",
+  "claude_bare_mode": false,
+  "claude_safe_mode": true,
+  "claude_strict_mcp": true,
+  "claude_tools": "Bash,Read,Edit,Write,Glob,Grep",
+  "strict_subscription_auth": true,
+  "security_profile": "strict",
+  "sandbox_checks": "required",
+  "check_network_domains": [],
+  "max_iterations": 2,
+  "claude_timeout_seconds": 3600,
+  "check_timeout_seconds": 1200,
+  "max_diff_chars": 18000,
+  "max_untracked_preview_chars": 8000,
+  "max_untracked_file_chars": 1500,
+  "max_untracked_preview_files": 12,
+  "max_file_tree_entries": 200,
+  "max_check_success_chars": 300,
+  "max_check_failure_chars": 4000,
+  "max_checks_prompt_chars": 8000,
+  "max_worker_summary_chars": 3000,
+  "max_worker_raw_chars": 60000,
+  "max_repeated_goal_chars": 1200,
+  "incremental_evidence": true,
+  "run_scoped_logs": true,
+  "runtime_preflight": true,
+  "auto_detect_checks": true,
+  "final_review_after_last_worker": true,
+  "adaptive_orchestration": true,
+  "adaptive_auto_supervisor": true,
+  "claude_supports_model": true,
+  "claude_supports_effort": true,
+  "claude_supports_max_turns": false,
+  "confirmed_subscription_models": [],
+  "chain_budgets": {
+    "max_child_runs": 6,
+    "max_codex_calls": 18,
+    "max_worker_calls": 16,
+    "max_elapsed_seconds": 21600,
+    "max_full_check_suites": 6,
+    "max_premium_escalations": 1,
+    "max_no_progress_events": 3
+  },
+  "adaptive_profiles": {
+    "claude": {
+      "economy": {
+        "max_turns": 10,
+        "reason": "Mechanical, explicit, low-risk work.",
+        "candidates": [{"model": "sonnet", "effort": "low"}]
+      },
+      "standard": {
+        "max_turns": 22,
+        "reason": "Routine implementation and everyday fixes.",
+        "candidates": [{"model": "sonnet", "effort": "medium"}]
+      },
+      "complex": {
+        "max_turns": 32,
+        "reason": "Multi-layer or security-sensitive implementation.",
+        "candidates": [{"model": "sonnet", "effort": "high"}]
+      },
+      "frontier": {
+        "max_turns": 35,
+        "reason": "Exceptional high-risk or frontier implementation.",
+        "candidates": [
+          {"model": "fable", "effort": "high", "requires_subscription_confirmation": true},
+          {"model": "opus", "effort": "high"},
+          {"model": "sonnet", "effort": "high"}
+        ]
+      },
+      "rescue": {
+        "max_turns": 30,
+        "reason": "Bounded strategy change after measured stuck evidence.",
+        "candidates": [
+          {"model": "opus", "effort": "high"},
+          {"model": "sonnet", "effort": "high"}
+        ]
+      }
+    },
+    "codex": {
+      "architecture": {"phase": "architecture"},
+      "routine_review": {"phase": "review"},
+      "important_review": {"phase": "important"},
+      "final_review": {"phase": "final"}
+    }
+  },
+  "check_definitions": [],
+  "check_cache_enabled": false,
+  "heartbeat_interval_seconds": 15,
+  "checks": []
+}

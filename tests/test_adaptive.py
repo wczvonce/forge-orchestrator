@@ -1,0 +1,572 @@
+from __future__ import annotations
+
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+import forge_adaptive as adaptive
+import forge
+from pydantic import ValidationError
+
+
+class AdaptiveSchemaTests(unittest.TestCase):
+    def packet(self, **overrides):
+        payload = {
+            "packet_id": "packet-001",
+            "title": "Create foundation",
+            "objective": "Create a safe project foundation.",
+            "acceptance_criteria": ["Foundation works", "Targeted checks pass"],
+        }
+        payload.update(overrides)
+        return adaptive.WorkPacket(**payload)
+
+    def test_work_packet_rejects_unknown_fields(self):
+        with self.assertRaises(ValidationError):
+            adaptive.WorkPacket(
+                packet_id="packet-001",
+                title="Test",
+                objective="Test",
+                acceptance_criteria=["Pass"],
+                invented_model="expensive",
+            )
+
+    def test_work_packet_has_one_to_four_acceptance_criteria(self):
+        with self.assertRaises(ValidationError):
+            self.packet(acceptance_criteria=[])
+        with self.assertRaises(ValidationError):
+            self.packet(acceptance_criteria=["1", "2", "3", "4", "5"])
+
+    def test_economy_is_rejected_for_high_risk_packet(self):
+        with self.assertRaises(ValidationError):
+            self.packet(risk="high", recommended_worker_profile="economy")
+
+    def test_decision_schema_is_strict_and_versioned(self):
+        schema = adaptive.AdaptiveDecision.model_json_schema()
+        self.assertEqual(schema["additionalProperties"], False)
+        decision = adaptive.AdaptiveDecision(
+            status="continue",
+            assessment="Implement",
+            next_prompt="Implement packet.",
+        )
+        self.assertEqual(decision.schema_version, adaptive.ADAPTIVE_SCHEMA_VERSION)
+
+    def test_continue_requires_prompt(self):
+        with self.assertRaises(ValidationError):
+            adaptive.AdaptiveDecision(status="continue", assessment="Missing prompt")
+
+
+class ProjectPlanTests(unittest.TestCase):
+    def packet(self, packet_id="packet-001", **overrides):
+        payload = {
+            "packet_id": packet_id,
+            "title": packet_id,
+            "objective": f"Implement {packet_id}.",
+            "acceptance_criteria": [f"{packet_id} works"],
+        }
+        payload.update(overrides)
+        return adaptive.WorkPacket(**payload)
+
+    def test_stable_project_identity_and_plan_persist(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp)
+            first = adaptive.stable_project_identity(project)
+            second = adaptive.stable_project_identity(project)
+            self.assertEqual(first["project_id"], second["project_id"])
+            plan = adaptive.load_or_create_plan(project, "Create app")
+            plan.work_packets.append(self.packet())
+            plan.active_packet_id = "packet-001"
+            adaptive.save_plan(project, plan)
+            loaded = adaptive.load_or_create_plan(project, "Create app")
+            self.assertEqual(loaded.plan_id, plan.plan_id)
+            self.assertEqual(loaded.active_packet_id, "packet-001")
+
+    def test_goal_change_does_not_silently_replace_plan(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp)
+            plan = adaptive.load_or_create_plan(project, "Goal A")
+            adaptive.save_plan(project, plan)
+            with self.assertRaises(RuntimeError):
+                adaptive.load_or_create_plan(project, "Goal B")
+
+    def test_patch_cannot_complete_before_dependency(self):
+        base = adaptive.ProjectPlan(
+            plan_id="plan-1",
+            project_id="project-1",
+            goal_hash="g",
+            spec_hash="s",
+            created_at=adaptive.utc_now(),
+            updated_at=adaptive.utc_now(),
+            work_packets=[
+                self.packet("packet-001"),
+                self.packet("packet-002", dependencies=["packet-001"]),
+            ],
+        )
+        patch = adaptive.PlanPatch(
+            update_packets=[
+                adaptive.PacketUpdate(
+                    packet_id="packet-002",
+                    status="completed",
+                    justification="Claim complete",
+                )
+            ]
+        )
+        with self.assertRaises(ValueError):
+            adaptive.apply_plan_patch(base, patch, checks_passed=True)
+
+    def test_patch_cannot_weaken_acceptance_criteria(self):
+        base = adaptive.ProjectPlan(
+            plan_id="plan-1",
+            project_id="project-1",
+            goal_hash="g",
+            spec_hash="s",
+            created_at=adaptive.utc_now(),
+            updated_at=adaptive.utc_now(),
+            work_packets=[
+                self.packet(
+                    acceptance_criteria=["Feature works", "Tests pass"]
+                )
+            ],
+        )
+        patch = adaptive.PlanPatch(
+            update_packets=[
+                adaptive.PacketUpdate(
+                    packet_id="packet-001",
+                    acceptance_criteria=["Feature works"],
+                    justification="Unsafe weakening",
+                )
+            ]
+        )
+        with self.assertRaises(ValueError):
+            adaptive.apply_plan_patch(base, patch, checks_passed=True)
+
+    def test_patch_requires_checks_to_complete_packet(self):
+        base = adaptive.ProjectPlan(
+            plan_id="plan-1",
+            project_id="project-1",
+            goal_hash="g",
+            spec_hash="s",
+            created_at=adaptive.utc_now(),
+            updated_at=adaptive.utc_now(),
+            work_packets=[self.packet()],
+        )
+        patch = adaptive.PlanPatch(
+            update_packets=[
+                adaptive.PacketUpdate(
+                    packet_id="packet-001",
+                    status="completed",
+                    justification="Verified",
+                )
+            ]
+        )
+        with self.assertRaises(ValueError):
+            adaptive.apply_plan_patch(base, patch, checks_passed=False)
+        updated = adaptive.apply_plan_patch(base, patch, checks_passed=True)
+        self.assertEqual(updated.completed_packet_ids, ["packet-001"])
+
+    def test_replan_preserves_completed_packets_and_safe_assumptions(self):
+        completed = self.packet("packet-001", status="completed")
+        pending = self.packet(
+            "packet-002",
+            dependencies=["packet-001"],
+        )
+        base = adaptive.ProjectPlan(
+            plan_id="plan-1",
+            project_id="project-1",
+            goal_hash="g",
+            spec_hash="s",
+            created_at=adaptive.utc_now(),
+            updated_at=adaptive.utc_now(),
+            work_packets=[completed, pending],
+            completed_packet_ids=["packet-001"],
+            safe_assumptions=["Use a local offline database."],
+        )
+        patch = adaptive.PlanPatch(
+            active_packet_id="packet-002",
+            append_safe_assumptions=["Prefer a reversible MVP."],
+            explanation="Continue with the next dependency-ready packet.",
+        )
+        updated = adaptive.apply_plan_patch(base, patch, checks_passed=True)
+        self.assertEqual(updated.completed_packet_ids, ["packet-001"])
+        self.assertEqual(updated.work_packets[0].status, "completed")
+        self.assertEqual(updated.active_packet_id, "packet-002")
+        self.assertEqual(
+            updated.safe_assumptions,
+            ["Use a local offline database.", "Prefer a reversible MVP."],
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            assumptions = adaptive.write_assumptions(
+                Path(temp), updated.safe_assumptions
+            ).read_text(encoding="utf-8")
+        self.assertIn("Use a local offline database.", assumptions)
+        self.assertIn("Prefer a reversible MVP.", assumptions)
+
+
+class AdaptiveRouterTests(unittest.TestCase):
+    def packet(self, **overrides):
+        payload = {
+            "packet_id": "packet-001",
+            "title": "Routine UI",
+            "objective": "Add list screen.",
+            "acceptance_criteria": ["Screen works"],
+        }
+        payload.update(overrides)
+        return adaptive.WorkPacket(**payload)
+
+    def profiles(self):
+        return {
+            "adaptive_profiles": {
+                "claude": {
+                    "economy": {
+                        "max_turns": 8,
+                        "reason": "Low-risk mechanical work.",
+                        "candidates": [{"model": "sonnet", "effort": "low"}],
+                    },
+                    "frontier": {
+                        "max_turns": 30,
+                        "reason": "Exceptional work.",
+                        "candidates": [
+                            {
+                                "model": "fable",
+                                "effort": "high",
+                                "requires_subscription_confirmation": True,
+                            },
+                            {"model": "opus", "effort": "high"},
+                            {"model": "sonnet", "effort": "high"},
+                        ],
+                    },
+                }
+            },
+            "confirmed_subscription_models": [],
+            "claude_supports_model": True,
+            "claude_supports_effort": True,
+            "claude_supports_max_turns": False,
+        }
+
+    def test_economy_rejected_for_authentication(self):
+        packet = self.packet(objective="Change authentication and authorization")
+        profile, reason = adaptive.choose_worker_profile(
+            packet,
+            "economy",
+            no_progress_count=0,
+            repeated_failure_count=0,
+            checks_failed=False,
+        )
+        self.assertEqual(profile, "complex")
+        self.assertIn("rejected", reason)
+
+    def test_mechanical_low_risk_packet_uses_economy(self):
+        packet = self.packet(difficulty="mechanical", risk="low")
+        profile, _ = adaptive.choose_worker_profile(
+            packet,
+            "standard",
+            no_progress_count=0,
+            repeated_failure_count=0,
+            checks_failed=False,
+        )
+        self.assertEqual(profile, "economy")
+
+    def test_routine_packet_uses_standard(self):
+        profile, _ = adaptive.choose_worker_profile(
+            self.packet(difficulty="routine", risk="medium"),
+            "economy",
+            no_progress_count=0,
+            repeated_failure_count=0,
+            checks_failed=False,
+        )
+        self.assertEqual(profile, "standard")
+
+    def test_complex_database_packet_uses_complex(self):
+        profile, _ = adaptive.choose_worker_profile(
+            self.packet(
+                title="Database transaction",
+                objective="Implement a multi-layer database transaction.",
+                difficulty="complex",
+                risk="high",
+                recommended_worker_profile="complex",
+                check_tier="milestone",
+            ),
+            "standard",
+            no_progress_count=0,
+            repeated_failure_count=0,
+            checks_failed=False,
+        )
+        self.assertEqual(profile, "complex")
+
+    def test_simple_packet_cannot_force_frontier(self):
+        profile, _ = adaptive.choose_worker_profile(
+            self.packet(),
+            "frontier",
+            no_progress_count=0,
+            repeated_failure_count=0,
+            checks_failed=False,
+        )
+        self.assertEqual(profile, "complex")
+
+    def test_rescue_requires_measured_stuck_condition(self):
+        packet = self.packet(recommended_worker_profile="rescue")
+        profile, _ = adaptive.choose_worker_profile(
+            packet,
+            "rescue",
+            no_progress_count=0,
+            repeated_failure_count=0,
+            checks_failed=False,
+        )
+        self.assertEqual(profile, "complex")
+        profile, _ = adaptive.choose_worker_profile(
+            packet,
+            "rescue",
+            no_progress_count=1,
+            repeated_failure_count=0,
+            checks_failed=False,
+        )
+        self.assertEqual(profile, "rescue")
+
+    def test_frontier_skips_unconfirmed_fable_without_credits(self):
+        routing = adaptive.resolve_worker_runtime("frontier", self.profiles())
+        self.assertEqual(routing.selected_model, "opus")
+        self.assertEqual(routing.fallback_from, "fable")
+        self.assertFalse(routing.max_turns_argument_allowed)
+
+    def test_router_falls_back_from_unavailable_model(self):
+        routing = adaptive.resolve_worker_runtime(
+            "frontier", self.profiles(), unsupported_models={"opus"}
+        )
+        self.assertEqual(routing.selected_model, "sonnet")
+
+    def test_routine_packet_uses_routine_codex_review(self):
+        profile, _ = adaptive.choose_codex_profile(
+            phase="review",
+            packet=self.packet(),
+            repeated_failure_count=0,
+            milestone=False,
+        )
+        self.assertEqual(profile, "routine_review")
+
+    def test_high_risk_packet_uses_important_codex_review(self):
+        profile, _ = adaptive.choose_codex_profile(
+            phase="review",
+            packet=self.packet(
+                difficulty="complex",
+                risk="high",
+                recommended_worker_profile="complex",
+                check_tier="milestone",
+            ),
+            repeated_failure_count=0,
+            milestone=False,
+        )
+        self.assertEqual(profile, "important_review")
+
+    def test_final_review_profile_is_always_strong(self):
+        profile, _ = adaptive.choose_codex_profile(
+            phase="final",
+            packet=self.packet(),
+            repeated_failure_count=0,
+            milestone=False,
+        )
+        self.assertEqual(profile, "final_review")
+
+    def test_unknown_profile_is_not_allowlisted(self):
+        with self.assertRaises(RuntimeError):
+            adaptive.resolve_worker_runtime("invented-premium", self.profiles())
+
+
+class AdaptiveChecksAndEvidenceTests(unittest.TestCase):
+    def config(self):
+        return {
+            "check_definitions": [
+                {
+                    "check_id": "diff",
+                    "command": "git diff --check",
+                    "tier": "smoke",
+                },
+                {
+                    "check_id": "unit",
+                    "command": "python -m unittest",
+                    "tier": "targeted",
+                    "test_count_pattern": "Ran (?P<count>\\d+) tests?",
+                },
+                {
+                    "check_id": "build",
+                    "command": "npm run build",
+                    "tier": "release",
+                    "required_before_done": True,
+                },
+            ]
+        }
+
+    def test_check_tiers_select_only_allowlisted_commands(self):
+        targeted = adaptive.select_check_definitions(self.config(), "targeted")
+        self.assertEqual([item.check_id for item in targeted], ["diff", "unit"])
+        release = adaptive.select_check_definitions(self.config(), "release")
+        self.assertEqual([item.check_id for item in release], ["diff", "unit", "build"])
+        with self.assertRaises(ValueError):
+            adaptive.select_check_definitions(
+                self.config(), "targeted", requested_ids=["invented-shell"]
+            )
+
+    def test_unsafe_check_command_is_rejected(self):
+        commands = [
+            "git push origin main",
+            "npm publish",
+            "vercel deploy --prod",
+            "firebase deploy",
+            "gh release create v1.0.0",
+        ]
+        for index, command in enumerate(commands):
+            with self.subTest(command=command), self.assertRaises(ValidationError):
+                adaptive.CheckDefinition(
+                    check_id=f"unsafe-{index}",
+                    command=command,
+                    tier="release",
+                )
+
+    def test_release_check_cannot_be_cached(self):
+        with self.assertRaises(ValidationError):
+            adaptive.CheckDefinition(
+                check_id="release",
+                command="npm run build",
+                tier="release",
+                cacheable=True,
+            )
+
+    def test_security_check_cannot_be_cached(self):
+        with self.assertRaises(ValidationError):
+            adaptive.CheckDefinition(
+                check_id="security-audit",
+                command="python -m bandit -r src",
+                tier="milestone",
+                cacheable=True,
+            )
+
+    def test_test_count_and_report_validation(self):
+        definition = adaptive.normalize_check_definitions(self.config())[1]
+        self.assertEqual(adaptive.detect_test_count("Ran 36 tests in 2s", definition), 36)
+
+    def test_zero_exit_without_expected_test_count_is_not_green(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp)
+            config = forge.DEFAULT_CONFIG.copy()
+            config.update(
+                {
+                    "adaptive_orchestration": True,
+                    "auto_detect_checks": False,
+                    "sandbox_checks": "off",
+                    "check_definitions": [
+                        {
+                            "check_id": "fake-tests",
+                            "command": (
+                                f'"{__import__("sys").executable}" '
+                                '-c "print(\'No tests collected\')"'
+                            ),
+                            "tier": "targeted",
+                            "timeout_seconds": 30,
+                            "test_count_pattern": "Ran (?P<count>\\d+) tests?",
+                        }
+                    ],
+                }
+            )
+            results = forge.run_checks(project, config, tier="targeted")
+        self.assertEqual(results[0].exit_code, 0)
+        self.assertIsNone(results[0].test_count)
+        self.assertFalse(results[0].report_valid)
+        self.assertFalse(forge.checks_passed(results))
+
+    def test_cache_key_changes_with_lockfile_or_toolchain(self):
+        definition = adaptive.CheckDefinition(
+            check_id="unit", command="python -m unittest", cacheable=True
+        )
+        common = {
+            "definition": definition,
+            "input_hashes": {"a.py": "1"},
+            "environment_fingerprint": "env",
+            "config_hash": "cfg",
+            "generated_source_hashes": {},
+            "external_change_fingerprint": "external",
+        }
+        first = adaptive.check_cache_key(
+            **common,
+            lockfile_hashes={"lock": "1"},
+            toolchain_versions={"python": "3.12"},
+        )
+        second = adaptive.check_cache_key(
+            **common,
+            lockfile_hashes={"lock": "2"},
+            toolchain_versions={"python": "3.12"},
+        )
+        self.assertNotEqual(first, second)
+
+    def test_evidence_index_omits_success_output(self):
+        evidence = adaptive.build_evidence_index(
+            before_manifest={"a.py": "1"},
+            after_manifest={"a.py": "2", "auth.py": "3"},
+            repository_fingerprint="fp",
+            diff_text="@@ -1 +1 @@\n-old\n+new",
+            checks=[
+                {"check_id": "unit", "exit_code": 0, "output": "very long success"},
+                {"check_id": "lint", "exit_code": 1, "output": "failure detail"},
+            ],
+        )
+        serialized = evidence.model_dump_json()
+        self.assertNotIn("very long success", serialized)
+        self.assertIn("failure detail", serialized)
+        self.assertIn("auth.py", evidence.risk_areas)
+
+
+class ChainBudgetTests(unittest.TestCase):
+    def test_every_hard_budget_has_a_terminal_reason(self):
+        budgets = adaptive.ChainBudgets(
+            max_child_runs=2,
+            max_codex_calls=3,
+            max_worker_calls=4,
+            max_elapsed_seconds=60,
+            max_full_check_suites=2,
+            max_premium_escalations=1,
+            max_no_progress_events=2,
+        )
+        cases = [
+            adaptive.ChainCounters(child_runs=2),
+            adaptive.ChainCounters(codex_calls=3),
+            adaptive.ChainCounters(worker_calls=4),
+            adaptive.ChainCounters(elapsed_seconds=60),
+            adaptive.ChainCounters(full_check_suites=2),
+            adaptive.ChainCounters(premium_escalations=1),
+            adaptive.ChainCounters(no_progress_events=2),
+        ]
+        for counters in cases:
+            with self.subTest(counters=counters):
+                self.assertIn(
+                    "budget exhausted",
+                    adaptive.budget_exhaustion(counters, budgets),
+                )
+
+    def test_elapsed_and_no_progress_limits_are_terminal(self):
+        budgets = adaptive.ChainBudgets(
+            max_elapsed_seconds=60,
+            max_no_progress_events=2,
+        )
+        self.assertIn(
+            "elapsed seconds",
+            adaptive.budget_exhaustion(
+                adaptive.ChainCounters(elapsed_seconds=60),
+                budgets,
+            ),
+        )
+        self.assertIn(
+            "no-progress events",
+            adaptive.budget_exhaustion(
+                adaptive.ChainCounters(no_progress_events=2),
+                budgets,
+            ),
+        )
+
+    def test_schema_export_is_valid_json(self):
+        with tempfile.TemporaryDirectory() as temp:
+            paths = adaptive.export_schemas(Path(temp))
+            self.assertGreaterEqual(len(paths), 7)
+            for path in paths:
+                json.loads(path.read_text(encoding="utf-8"))
+
+
+if __name__ == "__main__":
+    unittest.main()

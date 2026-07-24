@@ -94,6 +94,26 @@ def _text_metrics(text: str) -> TestMetrics:
             report_format="text",
         )
 
+    mocha_counts = {
+        label: sum(
+            _integer(value)
+            for value in re.findall(rf"\b(\d+)\s+{label}\b", text, re.I)
+        )
+        for label in ("passing", "failing", "pending")
+    }
+    if any(mocha_counts.values()):
+        passed = mocha_counts["passing"]
+        failed = mocha_counts["failing"]
+        skipped = mocha_counts["pending"]
+        return TestMetrics(
+            discovered=passed + failed + skipped,
+            executed=passed + failed,
+            passed=passed,
+            failed=failed,
+            skipped=skipped,
+            report_format="mocha-text",
+        )
+
     return TestMetrics(
         report_valid=False,
         failure_reason="No supported test execution count was found.",
@@ -197,6 +217,22 @@ def _json_metrics(payload: Any, report_format: str) -> TestMetrics:
             report_format=report_format,
         )
     stats = payload.get("stats")
+    if report_format == "mocha-json":
+        stats = stats if isinstance(stats, dict) else {}
+        discovered = _integer(stats.get("tests"))
+        passed = _integer(stats.get("passes"))
+        failed = _integer(stats.get("failures"))
+        skipped = _integer(stats.get("pending"))
+        if discovered == 0:
+            discovered = passed + failed + skipped
+        return TestMetrics(
+            discovered=discovered,
+            executed=passed + failed,
+            passed=passed,
+            failed=failed,
+            skipped=skipped,
+            report_format="mocha-json",
+        )
     if report_format == "playwright-json" or isinstance(stats, dict):
         stats = stats if isinstance(stats, dict) else {}
         passed = _integer(stats.get("expected"))
@@ -306,7 +342,12 @@ def _parse_report(path: Path, report_format: str) -> TestMetrics:
             metrics = _junit_metrics(ET.fromstring(text), inferred)
         elif inferred == "trx":
             metrics = _trx_metrics(ET.fromstring(text))
-        elif inferred in {"jest-json", "vitest-json", "playwright-json"}:
+        elif inferred in {
+            "jest-json",
+            "vitest-json",
+            "playwright-json",
+            "mocha-json",
+        }:
             metrics = _json_metrics(json.loads(text), inferred)
         elif inferred == "flutter-json":
             metrics = _flutter_metrics(text)
@@ -396,11 +437,19 @@ def evaluate_test_evidence(
     report_format = str(getattr(definition, "report_format", "auto"))
     raw_report_path = getattr(definition, "report_path", None)
     if not raw_report_path:
-        metrics = (
-            _flutter_metrics(output)
-            if report_format == "flutter-json"
-            else _text_metrics(output)
-        )
+        if report_format == "flutter-json":
+            metrics = _flutter_metrics(output)
+        elif report_format == "mocha-json":
+            try:
+                metrics = _json_metrics(json.loads(output), report_format)
+            except json.JSONDecodeError as exc:
+                metrics = TestMetrics(
+                    report_format=report_format,
+                    report_valid=False,
+                    failure_reason=f"Malformed test report: {exc}",
+                )
+        else:
+            metrics = _text_metrics(output)
     else:
         try:
             path = _safe_report_path(project, str(raw_report_path))

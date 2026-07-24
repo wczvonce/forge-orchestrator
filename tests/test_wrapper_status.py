@@ -717,6 +717,7 @@ class WrapperSafetyContractTests(unittest.TestCase):
         *,
         exit_code: int,
         requested_run_id: str = "source-run",
+        expected_decision_recovery_sha256: str = "",
     ) -> subprocess.CompletedProcess[str]:
         powershell = shutil.which("powershell.exe")
         self.assertIsNotNone(powershell)
@@ -769,7 +770,8 @@ class WrapperSafetyContractTests(unittest.TestCase):
                     "  -Python $python `",
                     "  -Project 'C:\\safe-project' `",
                     "  -RequestedRunId $env:FORGE_REQUESTED_RUN_ID `",
-                    "  -SupervisorConfig 'C:\\strict.json'",
+                    "  -SupervisorConfig 'C:\\strict.json' `",
+                    "  -ExpectedDecisionRecoverySha256 $env:FORGE_EXPECTED_SHA",
                     "",
                 ]
             ),
@@ -782,6 +784,7 @@ class WrapperSafetyContractTests(unittest.TestCase):
         env["FORGE_FAKE_PAYLOAD"] = json.dumps(payload)
         env["FORGE_FAKE_EXIT"] = str(exit_code)
         env["FORGE_REQUESTED_RUN_ID"] = requested_run_id
+        env["FORGE_EXPECTED_SHA"] = expected_decision_recovery_sha256
         return subprocess.run(
             [
                 powershell,
@@ -836,6 +839,9 @@ class WrapperSafetyContractTests(unittest.TestCase):
             "model_calls_made": 0,
             "supervisor_config_enforced": True,
             "effective_security_profile": "strict",
+            "post_worker_decision_recovery_eligible": False,
+            "bounded_packet_recovery_eligible": False,
+            "budget_tranche_extension_eligible": False,
         }
         accepted = self.run_resume_eligibility_function(valid, exit_code=0)
         self.assertEqual(
@@ -852,6 +858,9 @@ class WrapperSafetyContractTests(unittest.TestCase):
             ("state_mutated", 0),
             ("model_calls_made", "0"),
             ("supervisor_config_enforced", 1),
+            ("post_worker_decision_recovery_eligible", 1),
+            ("bounded_packet_recovery_eligible", 1),
+            ("budget_tranche_extension_eligible", 1),
         ):
             with self.subTest(field=field):
                 malformed = dict(valid)
@@ -869,6 +878,63 @@ class WrapperSafetyContractTests(unittest.TestCase):
         )
         self.assertEqual(latest.returncode, 0, msg=latest.stdout + latest.stderr)
         self.assertIn("source-run", latest.stdout)
+
+    @unittest.skipUnless(os.name == "nt", "PowerShell JSON contract tests are Windows-only")
+    def test_post_worker_recovery_requires_exact_sha_and_bijective_flags(self) -> None:
+        expected_sha = "a" * 64
+        recovery = {
+            "schema_version": 4,
+            "eligible": True,
+            "source_run_id": "failed-source",
+            "source_stop_reason_code": "technical_failure",
+            "source_automatic_resume_allowed": False,
+            "action": "validated_post_worker_decision_recovery",
+            "state_mutated": False,
+            "model_calls_made": 0,
+            "supervisor_config_enforced": True,
+            "effective_security_profile": "strict",
+            "post_worker_decision_recovery_eligible": True,
+            "bounded_packet_recovery_eligible": False,
+            "budget_tranche_extension_eligible": False,
+            "post_worker_decision_recovery": {
+                "raw_decision_sha256": expected_sha,
+            },
+        }
+        accepted = self.run_resume_eligibility_function(
+            recovery,
+            exit_code=0,
+            requested_run_id="failed-source",
+            expected_decision_recovery_sha256=expected_sha,
+        )
+        self.assertEqual(
+            accepted.returncode,
+            0,
+            msg=accepted.stdout + accepted.stderr,
+        )
+
+        for field, value in (
+            ("bounded_packet_recovery_eligible", True),
+            ("budget_tranche_extension_eligible", True),
+            ("source_automatic_resume_allowed", True),
+        ):
+            with self.subTest(field=field):
+                contradictory = dict(recovery)
+                contradictory[field] = value
+                rejected = self.run_resume_eligibility_function(
+                    contradictory,
+                    exit_code=0,
+                    requested_run_id="failed-source",
+                    expected_decision_recovery_sha256=expected_sha,
+                )
+                self.assertNotEqual(rejected.returncode, 0)
+
+        wrong_sha = self.run_resume_eligibility_function(
+            recovery,
+            exit_code=0,
+            requested_run_id="failed-source",
+            expected_decision_recovery_sha256="b" * 64,
+        )
+        self.assertNotEqual(wrong_sha.returncode, 0)
 
     @unittest.skipUnless(os.name == "nt", "PowerShell JSON contract tests are Windows-only")
     def test_rejected_eligibility_preserves_reason_without_success_fields(self) -> None:

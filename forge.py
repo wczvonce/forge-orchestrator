@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import platform
 import queue
@@ -33,6 +34,7 @@ from forge_adaptive import (
     ProjectPlan,
     WorkPacket,
     apply_plan_patch,
+    atomic_json,
     authorize_final_review_recovery,
     begin_packet_attempt,
     bootstrap_packet,
@@ -154,6 +156,31 @@ BOOTSTRAP_SECRET_ASSIGNMENT_RE = re.compile(
 
 class Decision(AdaptiveDecision):
     """Versioned strict Codex decision with legacy fields kept readable."""
+
+
+def normalize_codex_decision_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Drop only an ineffective drift reason paired with native JSON false.
+
+    The approval boolean is security-sensitive.  This normalization never
+    coerces it, never changes ``true``, and rejects non-boolean JSON values
+    before Pydantic can coerce them.  The strict Decision model remains
+    unchanged; this is the single transport normalization permitted between a
+    Codex JSON artifact and model validation.
+    """
+
+    if not isinstance(payload, dict):
+        raise ValueError("Codex decision payload must be a JSON object.")
+    normalized = dict(payload)
+    if "approve_check_contract_drift" in payload:
+        approval = payload["approve_check_contract_drift"]
+        if type(approval) is not bool:
+            raise ValueError(
+                "approve_check_contract_drift must be a native JSON boolean."
+            )
+        reason = payload.get("check_contract_approval_reason")
+        if approval is False and isinstance(reason, str) and reason.strip():
+            normalized["check_contract_approval_reason"] = ""
+    return normalized
 
 
 class CheckResult(BaseModel):
@@ -1915,14 +1942,1142 @@ def load_verified_adaptive_resume_state(
     return identity, current_plan, current_contract
 
 
+POST_WORKER_DECISION_RECOVERY_ACTION = (
+    "validated_post_worker_decision_recovery"
+)
+MAX_PROJECT_WORK_PACKETS = 12
+
+
+def _strict_nonnegative_counter(
+    payload: dict[str, Any], field: str, *, floating: bool = False
+) -> int | float:
+    value = payload.get(field)
+    if floating:
+        if type(value) not in {int, float}:
+            raise RuntimeError(
+                f"Post-worker decision recovery counter {field} is not a native "
+                "JSON number."
+            )
+        numeric = float(value)
+        if not math.isfinite(numeric) or numeric < 0:
+            raise RuntimeError(
+                f"Post-worker decision recovery counter {field} is invalid."
+            )
+        return numeric
+    if type(value) is not int or value < 0:
+        raise RuntimeError(
+            f"Post-worker decision recovery counter {field} is not a "
+            "non-negative native JSON integer."
+        )
+    return value
+
+
+def _decision_recovery_packet_id(
+    source_packet_id: str, source_run_id: str, raw_sha256: str
+) -> str:
+    suffix = (
+        "-decision-recovery-"
+        + hashlib.sha256(
+            f"{source_run_id}:{raw_sha256}".encode("utf-8")
+        ).hexdigest()[:12]
+    )
+    prefix_limit = 80 - len(suffix)
+    prefix = source_packet_id[:prefix_limit].rstrip("._-") or "packet"
+    packet_id = prefix + suffix
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", packet_id):
+        raise RuntimeError(
+            "Deterministic post-worker decision recovery packet ID is invalid."
+        )
+    return packet_id
+
+
+def _validated_decision_recovery_sha256(value: str | None) -> str:
+    candidate = str(value or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", candidate):
+        raise RuntimeError(
+            "Post-worker decision recovery requires an explicit audited lowercase "
+            "SHA-256 value."
+        )
+    return candidate
+
+
+def _decision_recovery_journal_path(
+    project: Path, source_run_id: str
+) -> Path:
+    return (
+        project
+        / ".forge"
+        / "decision-recovery-journals"
+        / f"{_safe_run_id(source_run_id)}.json"
+    )
+
+
+def _load_decision_recovery_journal(
+    project: Path, source_run_id: str
+) -> dict[str, Any] | None:
+    path = _decision_recovery_journal_path(project, source_run_id)
+    parent = path.parent
+    if not parent.exists():
+        return None
+    if not parent.is_dir() or parent.is_symlink():
+        raise RuntimeError(
+            "Decision-recovery journal directory is not a direct Forge-owned "
+            "directory."
+        )
+    if not path.exists():
+        return None
+    if (
+        not path.is_file()
+        or path.is_symlink()
+        or path.resolve().parent != parent.resolve()
+    ):
+        raise RuntimeError(
+            "Decision-recovery journal is not a direct Forge-owned regular file."
+        )
+    return load_json_object(path, "Decision-recovery journal")
+
+
+def _prepare_recovery_plan_for_persistence(plan: ProjectPlan) -> ProjectPlan:
+    prepared = ProjectPlan.model_validate(plan.model_dump(mode="json"))
+    prepared.updated_at = utc_now()
+    prepared.last_validated_at = prepared.updated_at
+    prepared.last_validation_summary = (
+        "Pydantic schema and plan invariants passed."
+    )
+    return ProjectPlan.model_validate(prepared.model_dump(mode="json"))
+
+
+def _mark_decision_recovery_child_started(
+    project: Path,
+    source_run_id: str,
+    child_run_id: str,
+) -> None:
+    journal = _load_decision_recovery_journal(project, source_run_id)
+    if (
+        journal is None
+        or journal.get("phase") != "prepared"
+        or journal.get("child_run_id") is not None
+    ):
+        raise RuntimeError(
+            "Decision-recovery journal cannot authorize another child run."
+        )
+    updated = dict(journal)
+    updated["phase"] = "child_started"
+    updated["child_run_id"] = _safe_run_id(child_run_id)
+    atomic_json(
+        _decision_recovery_journal_path(project, source_run_id),
+        updated,
+    )
+
+
+def _runtime_decision_for_recovery(
+    recovery: dict[str, Any],
+) -> Decision:
+    try:
+        decision = Decision.model_validate(recovery["normalized_decision"])
+    except Exception as exc:
+        raise RuntimeError(
+            "Normalized post-worker recovery decision is invalid."
+        ) from exc
+    payload = decision.model_dump(mode="json")
+    payload["active_packet_id"] = recovery["replacement_packet_id"]
+    payload["plan_patch"] = None
+    return Decision.model_validate(payload)
+
+
+def _assert_no_existing_recovery_child(
+    project: Path, source_run_id: str
+) -> None:
+    runs_directory = project / ".forge" / "runs"
+    if not runs_directory.is_dir():
+        return
+    for candidate in runs_directory.iterdir():
+        if candidate.name == source_run_id:
+            continue
+        if candidate.is_symlink():
+            raise RuntimeError(
+                "Post-worker decision recovery found a symlinked run entry; "
+                "one-shot lineage cannot be proven."
+            )
+        if not candidate.is_dir():
+            continue
+        run_path = candidate / "run.json"
+        if not run_path.exists():
+            continue
+        if (
+            not run_path.is_file()
+            or run_path.is_symlink()
+            or run_path.resolve().parent != candidate.resolve()
+        ):
+            raise RuntimeError(
+                "Post-worker decision recovery found an unsafe child run "
+                "artifact."
+            )
+        try:
+            child = load_json_object(run_path, "Forge child run")
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "Post-worker decision recovery found an unreadable child run; "
+                "one-shot lineage cannot be proven."
+            ) from exc
+        if child.get("parent_run_id") == source_run_id:
+            raise RuntimeError(
+                "Post-worker decision recovery is one-shot: a child run already "
+                "references this failed source run."
+            )
+
+
+def _load_authentic_post_worker_decision(
+    source_directory: Path,
+    source_result: dict[str, Any],
+    *,
+    expected_raw_sha256: str,
+) -> tuple[Decision, dict[str, Any], str, str, int]:
+    """Validate the sole unmatched raw decision that caused source failure."""
+
+    logs = source_directory / "logs"
+    if (
+        not logs.is_dir()
+        or logs.is_symlink()
+        or logs.resolve().parent != source_directory.resolve()
+    ):
+        raise RuntimeError(
+            "Post-worker decision recovery requires a direct run-scoped logs "
+            "directory, not a symlink or external path."
+        )
+    unmatched: list[Path] = []
+    for raw_path in sorted(logs.iterdir(), key=lambda item: item.name):
+        match = re.fullmatch(r"(\d{2})-decision-raw\.json", raw_path.name)
+        if match is None:
+            continue
+        if (
+            not raw_path.is_file()
+            or raw_path.is_symlink()
+            or raw_path.resolve().parent != logs.resolve()
+        ):
+            raise RuntimeError(
+                "A matching post-worker raw decision artifact is not a direct "
+                "regular run-scoped file."
+            )
+        validated_path = logs / f"{match.group(1)}-decision.json"
+        if validated_path.exists():
+            if (
+                not validated_path.is_file()
+                or validated_path.is_symlink()
+                or validated_path.resolve().parent != logs.resolve()
+            ):
+                raise RuntimeError(
+                    "A paired validated decision artifact is not a direct regular "
+                    "run-scoped file."
+                )
+        else:
+            unmatched.append(raw_path)
+    if len(unmatched) != 1:
+        raise RuntimeError(
+            "Post-worker decision recovery requires exactly one direct, unmatched "
+            "run-scoped NN-decision-raw.json artifact."
+        )
+
+    raw_path = unmatched[0]
+    iteration_match = re.fullmatch(
+        r"(\d{2})-decision-raw\.json", raw_path.name
+    )
+    assert iteration_match is not None
+    iteration = int(iteration_match.group(1))
+    if iteration < 2:
+        raise RuntimeError(
+            "The unmatched decision is not a post-worker review iteration."
+        )
+    try:
+        raw_text = raw_path.read_text(encoding="utf-8")
+        raw_payload = json.loads(raw_text)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "The unmatched post-worker decision is not valid UTF-8 JSON."
+        ) from exc
+    if not isinstance(raw_payload, dict):
+        raise RuntimeError(
+            "The unmatched post-worker decision must contain a JSON object."
+        )
+
+    expected_error = (
+        "Codex vrátil neplatné rozhodnutie:\n"
+        + truncate(redact_text(raw_text), 5000)
+    )
+    if (
+        source_result.get("error") != expected_error
+        or source_result.get("final_message") != expected_error
+    ):
+        raise RuntimeError(
+            "The unmatched raw decision does not exactly reproduce the persisted "
+            "Codex decision-validation failure."
+        )
+    if (
+        raw_payload.get("approve_check_contract_drift") is not False
+        or not isinstance(
+            raw_payload.get("check_contract_approval_reason"), str
+        )
+        or not raw_payload["check_contract_approval_reason"].strip()
+    ):
+        raise RuntimeError(
+            "The failed decision is not the one permitted native-false approval "
+            "normalization case."
+        )
+    try:
+        Decision.model_validate(raw_payload)
+    except Exception:
+        pass
+    else:
+        raise RuntimeError(
+            "The raw decision already validates; no bounded normalization "
+            "recovery is justified."
+        )
+    normalized = normalize_codex_decision_payload(raw_payload)
+    changed_fields = sorted(
+        key
+        for key in set(raw_payload) | set(normalized)
+        if raw_payload.get(key) != normalized.get(key)
+    )
+    if changed_fields != ["check_contract_approval_reason"]:
+        raise RuntimeError(
+            "The raw decision requires more than the single permitted "
+            "native-false reason normalization."
+        )
+    try:
+        decision = Decision.model_validate(normalized)
+    except Exception as exc:
+        raise RuntimeError(
+            "The raw decision remains invalid after the sole permitted "
+            "normalization."
+        ) from exc
+    if (
+        decision.status != "continue"
+        or decision.decision_kind
+        not in {"implement_packet", "repair_packet", "verify_packet"}
+        or not (decision.next_prompt or "").strip()
+        or decision.approve_check_contract_drift
+        or decision.check_contract_approval_reason
+    ):
+        raise RuntimeError(
+            "The normalized raw decision is not a non-approving bounded worker "
+            "continuation."
+        )
+
+    previous_stem = f"{iteration - 1:02d}"
+    required_previous = {
+        "decision": logs / f"{previous_stem}-decision.json",
+        "worker": logs / f"{previous_stem}-worker.json",
+        "checks": logs / f"{previous_stem}-checks.json",
+        "post_worker_evidence": (
+            logs / f"{previous_stem}-post-worker-evidence-index.json"
+        ),
+        "review_evidence": logs / f"{iteration:02d}-evidence-index.json",
+        "codex_usage": logs / f"{iteration:02d}-codex-usage.json",
+    }
+    for label, artifact in required_previous.items():
+        if (
+            not artifact.is_file()
+            or artifact.is_symlink()
+            or artifact.resolve().parent != logs.resolve()
+        ):
+            raise RuntimeError(
+                f"Post-worker decision recovery is missing direct artifact: {label}."
+            )
+    if (logs / f"{iteration:02d}-worker.json").exists():
+        raise RuntimeError(
+            "A worker artifact already exists for the unmatched decision "
+            "iteration; recovery provenance is ambiguous."
+        )
+
+    try:
+        previous_decision = load_json_object(
+            required_previous["decision"], "Previous validated decision"
+        )
+        if source_result.get("final_decision") != previous_decision:
+            raise RuntimeError(
+                "The failed result's final_decision does not exactly match the "
+                "latest direct validated decision artifact."
+            )
+        Decision.model_validate(previous_decision)
+        worker = WorkerResult.model_validate(
+            load_json_object(required_previous["worker"], "Source worker result")
+        )
+        previous_checks_payload = json.loads(
+            required_previous["checks"].read_text(encoding="utf-8")
+        )
+        source_checks_payload = source_result.get("checks")
+        if (
+            not isinstance(previous_checks_payload, list)
+            or previous_checks_payload != source_checks_payload
+        ):
+            raise RuntimeError(
+                "Source result checks differ from the direct post-worker checks "
+                "artifact."
+            )
+        source_checks = [
+            CheckResult.model_validate(item)
+            for item in previous_checks_payload
+        ]
+        post_worker_evidence = load_json_object(
+            required_previous["post_worker_evidence"],
+            "Post-worker evidence",
+        )
+        review_evidence = load_json_object(
+            required_previous["review_evidence"],
+            "Decision review evidence",
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "Post-worker recovery evidence is malformed."
+        ) from exc
+    if not worker.valid_worker_outcome:
+        raise RuntimeError(
+            "Post-worker decision recovery cannot follow an invalid worker outcome."
+        )
+    if not checks_passed(source_checks):
+        raise RuntimeError(
+            "Post-worker decision recovery requires fresh persisted green checks."
+        )
+    repository_fingerprint = source_result.get("repository_fingerprint")
+    if (
+        post_worker_evidence.get("repository_fingerprint")
+        != repository_fingerprint
+        or review_evidence.get("repository_fingerprint")
+        != repository_fingerprint
+    ):
+        raise RuntimeError(
+            "Post-worker evidence fingerprints do not match the failed result."
+        )
+    raw_sha256 = hashlib.sha256(raw_path.read_bytes()).hexdigest()
+    if raw_sha256 != _validated_decision_recovery_sha256(
+        expected_raw_sha256
+    ):
+        raise RuntimeError(
+            "The unmatched raw decision does not match the explicit audited "
+            "SHA-256 authorization."
+        )
+    return decision, normalized, raw_path.name, raw_sha256, iteration
+
+
+def _validate_post_worker_counter_lineage(
+    project: Path,
+    source_directory: Path,
+    source_run: dict[str, Any],
+    source_result: dict[str, Any],
+    continuation: ContinuationPayload,
+) -> None:
+    parent_id = source_result.get("parent_run_id")
+    if (
+        not isinstance(parent_id, str)
+        or not parent_id.strip()
+        or source_run.get("parent_run_id") != parent_id
+    ):
+        raise RuntimeError(
+            "Post-worker decision recovery requires an exact parent-run lineage."
+        )
+    parent_directory = (
+        project / ".forge" / "runs" / _safe_run_id(parent_id)
+    )
+    runs_directory = (project / ".forge" / "runs").resolve()
+    if (
+        not parent_directory.is_dir()
+        or parent_directory.is_symlink()
+        or parent_directory.resolve().parent != runs_directory
+        or (parent_directory / "run.json").is_symlink()
+        or (parent_directory / "result.json").is_symlink()
+    ):
+        raise RuntimeError(
+            "Post-worker decision recovery requires a direct parent run and "
+            "direct parent run/result artifacts."
+        )
+    parent_run = load_json_object(
+        parent_directory / "run.json", "Post-worker recovery parent run"
+    )
+    parent_result = read_result_compat(parent_directory / "result.json")
+    if (
+        parent_run.get("run_id") != parent_id
+        or parent_run.get("continuation_chain_id")
+        != continuation.continuation_chain_id
+        or parent_result.get("run_id") != parent_id
+        or parent_result.get("continuation_chain_id")
+        != continuation.continuation_chain_id
+        or parent_result.get("final_status") != "needs_continuation"
+    ):
+        raise RuntimeError(
+            "Post-worker decision recovery parent lineage is inconsistent."
+        )
+    raw_parent_continuation = parent_result.get("continuation")
+    try:
+        parent = ContinuationPayload.model_validate(raw_parent_continuation)
+    except Exception as exc:
+        raise RuntimeError(
+            "Post-worker decision recovery parent has no valid continuation "
+            "counters."
+        ) from exc
+    if continuation.chain_child_runs != parent.chain_child_runs + 1:
+        raise RuntimeError(
+            "Post-worker decision recovery child-run counter is inconsistent."
+        )
+    monotonic_pairs = (
+        (continuation.chain_codex_calls, parent.chain_codex_calls, "Codex"),
+        (continuation.chain_worker_calls, parent.chain_worker_calls, "worker"),
+        (
+            continuation.chain_elapsed_seconds,
+            parent.chain_elapsed_seconds,
+            "elapsed",
+        ),
+        (
+            continuation.chain_full_check_suites,
+            parent.chain_full_check_suites,
+            "full-check",
+        ),
+        (
+            continuation.chain_premium_escalations,
+            parent.chain_premium_escalations,
+            "premium",
+        ),
+        (
+            continuation.chain_no_progress_events,
+            parent.chain_no_progress_events,
+            "no-progress",
+        ),
+    )
+    for current, previous, label in monotonic_pairs:
+        if current < previous:
+            raise RuntimeError(
+                f"Post-worker decision recovery {label} counter decreased."
+            )
+    if (
+        continuation.chain_worker_calls <= parent.chain_worker_calls
+        or continuation.chain_codex_calls <= parent.chain_codex_calls
+    ):
+        raise RuntimeError(
+            "The failed child does not account for both a worker dispatch and a "
+            "post-worker Codex decision."
+        )
+
+    telemetry_path = source_directory / "telemetry.json"
+    if (
+        not telemetry_path.is_file()
+        or telemetry_path.is_symlink()
+        or telemetry_path.resolve().parent != source_directory.resolve()
+    ):
+        raise RuntimeError(
+            "Post-worker decision recovery requires direct source telemetry."
+        )
+    telemetry = load_json_object(telemetry_path, "Source run telemetry")
+    if (
+        telemetry.get("run_id") != source_result.get("run_id")
+        or telemetry.get("continuation_chain_id")
+        != continuation.continuation_chain_id
+        or telemetry.get("parent_run_id") != parent_id
+        or telemetry.get("final_status") != "failed"
+        or telemetry.get("child_run_index") != continuation.chain_child_runs
+        or telemetry.get("chain_elapsed_seconds")
+        != continuation.chain_elapsed_seconds
+        or telemetry.get("budget_extension_count")
+        != continuation.budget_extension_count
+        or telemetry.get("chain_model_fallbacks")
+        != source_result.get("chain_model_fallbacks")
+        or telemetry.get("unavailable_models")
+        != source_result.get("unavailable_models")
+        or telemetry.get("premium_escalations")
+        != source_result.get("run_premium_claude_escalations_used")
+        or source_result.get("premium_claude_escalations_used")
+        != continuation.chain_premium_escalations
+    ):
+        raise RuntimeError(
+            "Source telemetry does not preserve the failed run's chain counters."
+        )
+
+
+def _load_post_worker_decision_recovery_context(
+    project: Path,
+    source_directory: Path,
+    source_run: dict[str, Any],
+    source_result: dict[str, Any],
+    *,
+    source_run_id: str,
+    resume_kind: ResumeKind,
+    expected_decision_recovery_sha256: str | None,
+) -> dict[str, Any]:
+    """Build a read-only, one-shot explicit-human recovery context."""
+
+    if resume_kind != "explicit_human":
+        raise RuntimeError(
+            "Post-worker decision recovery is allowed only through an explicit "
+            "human run-chain resume; direct and automatic resume are forbidden."
+        )
+    if (
+        type(source_result.get("schema_version")) is not int
+        or source_result["schema_version"] != SCHEMA_VERSION
+        or source_result.get("final_status") != "failed"
+        or source_result.get("stop_reason_code") != "technical_failure"
+        or source_result.get("automatic_resume_allowed") is not False
+        or source_result.get("continuation") is not None
+        or source_result.get("checks_passed") is not True
+    ):
+        raise RuntimeError(
+            "The source is not the exact schema-4 post-worker Codex "
+            "decision-validation failure eligible for explicit recovery."
+        )
+    runs_directory = (project / ".forge" / "runs").resolve()
+    if (
+        source_directory.is_symlink()
+        or source_directory.resolve().parent != runs_directory
+        or (source_directory / "run.json").is_symlink()
+        or (source_directory / "result.json").is_symlink()
+    ):
+        raise RuntimeError(
+            "Post-worker decision recovery requires a direct immutable run "
+            "directory and direct run/result artifacts."
+        )
+    _assert_no_existing_recovery_child(project, source_run_id)
+
+    decision, normalized, raw_name, raw_sha256, raw_iteration = (
+        _load_authentic_post_worker_decision(
+            source_directory,
+            source_result,
+            expected_raw_sha256=_validated_decision_recovery_sha256(
+                expected_decision_recovery_sha256
+            ),
+        )
+    )
+    source_packet_id = source_result.get("active_packet_id")
+    if (
+        not isinstance(source_packet_id, str)
+        or not source_packet_id.strip()
+        or decision.active_packet_id != source_packet_id
+    ):
+        raise RuntimeError(
+            "The normalized decision does not target the failed run's exact "
+            "active packet."
+        )
+
+    counter_values = {
+        "chain_child_runs": _strict_nonnegative_counter(
+            source_result, "chain_child_runs"
+        ),
+        "chain_codex_calls": _strict_nonnegative_counter(
+            source_result, "chain_codex_calls"
+        ),
+        "chain_worker_calls": _strict_nonnegative_counter(
+            source_result, "chain_worker_calls"
+        ),
+        "chain_elapsed_seconds": _strict_nonnegative_counter(
+            source_result, "chain_elapsed_seconds", floating=True
+        ),
+        "chain_full_check_suites": _strict_nonnegative_counter(
+            source_result, "chain_full_check_suites"
+        ),
+        "chain_premium_escalations": _strict_nonnegative_counter(
+            source_result, "chain_premium_escalations"
+        ),
+        "chain_no_progress_events": _strict_nonnegative_counter(
+            source_result, "chain_no_progress_events"
+        ),
+    }
+    for field in (
+        "no_progress_count",
+        "failed_iterations",
+        "repeated_failure_count",
+        "chain_model_fallbacks",
+        "budget_extension_count",
+    ):
+        _strict_nonnegative_counter(source_result, field)
+    unavailable_models = source_result.get("unavailable_models")
+    if not isinstance(unavailable_models, dict):
+        raise RuntimeError(
+            "Post-worker decision recovery unavailable-model state is malformed."
+        )
+    goal = source_result.get("goal")
+    if not isinstance(goal, str) or not goal.strip():
+        raise RuntimeError(
+            "Post-worker decision recovery source has no exact non-empty goal."
+        )
+
+    repository_fingerprint = source_result.get("repository_fingerprint")
+    if (
+        not isinstance(repository_fingerprint, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", repository_fingerprint)
+        or repo_fingerprint(project) != repository_fingerprint
+    ):
+        raise RuntimeError(
+            "Repository fingerprint changed after the failed post-worker "
+            "decision; explicit recovery stopped before plan mutation."
+        )
+    repository_manifest = repo_manifest(project)
+    if any(
+        isinstance(digest, str) and digest.startswith("large:")
+        for digest in repository_manifest.values()
+    ):
+        raise RuntimeError(
+            "Post-worker decision recovery requires content hashes for every "
+            "repository file; large metadata-only manifest entries are forbidden."
+        )
+    source_checks_payload = source_result.get("checks")
+    if not isinstance(source_checks_payload, list):
+        raise RuntimeError(
+            "Post-worker decision recovery source has no structured checks."
+        )
+    source_checks = [
+        CheckResult.model_validate(item) for item in source_checks_payload
+    ]
+    if not checks_passed(source_checks):
+        raise RuntimeError(
+            "Post-worker decision recovery requires checks_passed=true with "
+            "valid green check artifacts."
+        )
+    if source_result.get("last_check_tier") != decision.check_tier:
+        raise RuntimeError(
+            "The normalized decision check tier differs from the persisted "
+            "post-worker check tier."
+        )
+
+    required_identity: dict[str, str] = {}
+    for field in (
+        "project_id",
+        "plan_id",
+        "plan_hash",
+        "check_contract_hash",
+        "config_hash",
+        "continuation_chain_id",
+    ):
+        value = source_result.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError(
+                f"Post-worker decision recovery source is missing {field}."
+            )
+        required_identity[field] = value
+    if (
+        source_run.get("run_id") != source_run_id
+        or source_result.get("run_id") != source_run_id
+        or source_run.get("continuation_chain_id")
+        != required_identity["continuation_chain_id"]
+        or source_run.get("project_id") != required_identity["project_id"]
+        or source_run.get("plan_id") != required_identity["plan_id"]
+        or source_run.get("config_hash") != required_identity["config_hash"]
+        or source_run.get("goal") != source_result.get("goal")
+    ):
+        raise RuntimeError(
+            "Run/result identity differs in the failed recovery source."
+        )
+
+    continuation = ContinuationPayload(
+        source_run_id=source_run_id,
+        continuation_chain_id=required_identity["continuation_chain_id"],
+        next_prompt=decision.next_prompt or "",
+        acceptance_criteria=decision.acceptance_criteria,
+        risks=decision.risks,
+        last_check_results=source_checks,
+        repository_fingerprint=repository_fingerprint,
+        repository_manifest=repository_manifest,
+        no_progress_count=int(source_result["no_progress_count"]),
+        failed_iterations=int(source_result["failed_iterations"]),
+        chain_worker_calls=int(counter_values["chain_worker_calls"]),
+        chain_elapsed_seconds=float(
+            counter_values["chain_elapsed_seconds"]
+        ),
+        chain_full_check_suites=int(
+            counter_values["chain_full_check_suites"]
+        ),
+        chain_premium_escalations=int(
+            counter_values["chain_premium_escalations"]
+        ),
+        last_failure_signature=source_result.get(
+            "last_failure_signature"
+        ),
+        repeated_failure_count=int(source_result["repeated_failure_count"]),
+        project_id=required_identity["project_id"],
+        plan_id=required_identity["plan_id"],
+        plan_hash=required_identity["plan_hash"],
+        active_packet_id=source_packet_id,
+        chain_child_runs=int(counter_values["chain_child_runs"]),
+        chain_codex_calls=int(counter_values["chain_codex_calls"]),
+        chain_no_progress_events=int(
+            counter_values["chain_no_progress_events"]
+        ),
+        last_release_check_run_id=source_result.get(
+            "last_release_check_run_id"
+        ),
+        unavailable_models=dict(
+            unavailable_models
+        ),
+        chain_model_fallbacks=int(source_result["chain_model_fallbacks"]),
+        check_contract_hash=required_identity["check_contract_hash"],
+        config_hash=required_identity["config_hash"],
+        base_chain_budgets=source_result.get("base_chain_budgets"),
+        effective_chain_budgets=source_result.get(
+            "effective_chain_budgets"
+        ),
+        budget_extension_count=int(source_result["budget_extension_count"]),
+        last_budget_extension_source_run_id=source_result.get(
+            "last_budget_extension_source_run_id"
+        ),
+    )
+    merged_config, source_config_hash, legacy_config_compatibility = (
+        _verified_resume_config(
+            source_directory,
+            source_run,
+            source_result,
+            continuation,
+            resume_kind=resume_kind,
+        )
+    )
+    if legacy_config_compatibility:
+        raise RuntimeError(
+            "Post-worker decision recovery requires a canonical source config "
+            "snapshot; legacy config compatibility is forbidden."
+        )
+    (
+        base_chain_budgets,
+        effective_chain_budgets,
+        budget_extension_count,
+        budget_extended,
+    ) = _resolve_resume_budgets(
+        source_run,
+        source_result,
+        continuation,
+        merged_config,
+        source_run_id=source_run_id,
+        source_stop_reason="technical_failure",
+        resume_kind=resume_kind,
+        legacy_config_compatibility=False,
+    )
+    if budget_extended:
+        raise RuntimeError(
+            "Post-worker decision recovery must not extend the chain budget."
+        )
+
+    result_plan_path = source_directory / "project-plan.result.json"
+    contract_snapshot_path = (
+        source_directory / "check-contract.snapshot.json"
+    )
+    current_plan_path = project / ".forge" / "project-plan.json"
+    current_contract_path = project / ".forge" / "check-contract.json"
+    if (
+        not result_plan_path.is_file()
+        or result_plan_path.is_symlink()
+        or not contract_snapshot_path.is_file()
+        or contract_snapshot_path.is_symlink()
+        or not current_plan_path.is_file()
+        or current_plan_path.is_symlink()
+        or not current_contract_path.is_file()
+        or current_contract_path.is_symlink()
+    ):
+        raise RuntimeError(
+            "Post-worker decision recovery requires direct source snapshots and "
+            "direct current plan/contract artifacts."
+        )
+    try:
+        result_plan = ProjectPlan.model_validate_json(
+            result_plan_path.read_text(encoding="utf-8")
+        )
+        contract_snapshot = CheckContract.model_validate_json(
+            contract_snapshot_path.read_text(encoding="utf-8")
+        )
+        current_plan = ProjectPlan.model_validate_json(
+            current_plan_path.read_text(encoding="utf-8")
+        )
+        current_contract = CheckContract.model_validate_json(
+            current_contract_path.read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Post-worker decision recovery plan/contract snapshot is invalid."
+        ) from exc
+    identity = stable_project_identity(project, create_if_missing=False)
+    if (
+        identity.get("project_id") != required_identity["project_id"]
+        or result_plan.plan_id != required_identity["plan_id"]
+        or result_plan.project_id != required_identity["project_id"]
+        or plan_hash(result_plan) != required_identity["plan_hash"]
+        or contract_snapshot.model_dump(mode="json")
+        != current_contract.model_dump(mode="json")
+        or current_contract.contract_hash
+        != required_identity["check_contract_hash"]
+        or check_contract_runtime_error(
+            project, current_contract, merged_config
+        )
+        is not None
+    ):
+        raise RuntimeError(
+            "Source plan, project identity, or check contract differs from the "
+            "failed run's exact validated state."
+        )
+    active_packet = active_plan_packet(result_plan)
+    maximum_attempts = int(merged_config.get("max_packet_attempts", 3))
+    if (
+        active_packet is None
+        or active_packet.packet_id != source_packet_id
+        or active_packet.status not in {"in_progress", "verification"}
+        or active_packet.attempts != maximum_attempts + 1
+        or not active_packet.final_review_recovery_used
+        or active_packet.final_review_recovery_authorized
+        or len(result_plan.work_packets) >= MAX_PROJECT_WORK_PACKETS
+    ):
+        raise RuntimeError(
+            "The failed active packet is not the exact exhausted, consumed "
+            "final-review recovery state required for a bounded replan."
+        )
+    completed_downstream = [
+        packet.packet_id
+        for packet in result_plan.work_packets
+        if source_packet_id in packet.dependencies
+        and packet.status in {"completed", "superseded"}
+    ]
+    if completed_downstream:
+        raise RuntimeError(
+            "Completed or superseded downstream packets depend on the failed "
+            "packet; dependency rewiring would be inconsistent."
+        )
+    contracted = {
+        item.check_id: item for item in current_contract.check_definitions
+    }
+    if (
+        not decision.check_ids
+        or any(check_id not in contracted for check_id in decision.check_ids)
+        or decision.recommended_worker_profile in {"frontier", "rescue"}
+    ):
+        raise RuntimeError(
+            "The normalized decision requests an uncontracted check or a "
+            "non-routine premium/recovery worker profile."
+        )
+    tier_order = {
+        "smoke": 0,
+        "targeted": 1,
+        "milestone": 2,
+        "release": 3,
+    }
+    if any(
+        tier_order[contracted[check_id].tier]
+        > tier_order[decision.check_tier]
+        for check_id in decision.check_ids
+    ):
+        raise RuntimeError(
+            "The normalized decision's check tier cannot execute all requested "
+            "contracted checks."
+        )
+    if decision.plan_patch is not None:
+        patch = decision.plan_patch
+        if (
+            patch.add_packets
+            or patch.active_packet_id not in {None, source_packet_id}
+            or any(
+                update.packet_id != source_packet_id
+                for update in patch.update_packets
+            )
+            or patch.append_milestones
+            or patch.append_release_gates
+            or patch.append_architectural_decisions
+            or patch.append_safe_assumptions
+            or patch.append_risks
+        ):
+            raise RuntimeError(
+                "The raw decision contains a broader model-authored replan; "
+                "bounded deterministic recovery refused it."
+            )
+
+    _validate_post_worker_counter_lineage(
+        project,
+        source_directory,
+        source_run,
+        source_result,
+        continuation,
+    )
+    replacement_packet_id = _decision_recovery_packet_id(
+        source_packet_id,
+        source_run_id,
+        raw_sha256,
+    )
+    if any(
+        packet.packet_id == replacement_packet_id
+        for packet in result_plan.work_packets
+    ):
+        raise RuntimeError(
+            "The deterministic post-worker decision recovery packet already "
+            "exists in the immutable source plan."
+        )
+    recovery = {
+        "action": POST_WORKER_DECISION_RECOVERY_ACTION,
+        "source_run_id": source_run_id,
+        "source_packet_id": source_packet_id,
+        "replacement_packet_id": replacement_packet_id,
+        "raw_decision_file": raw_name,
+        "raw_decision_sha256": raw_sha256,
+        "raw_decision_iteration": raw_iteration,
+        "source_plan_hash": required_identity["plan_hash"],
+        "source_contract_hash": required_identity[
+            "check_contract_hash"
+        ],
+        "source_repository_fingerprint": repository_fingerprint,
+        "normalized_decision": normalized,
+        "journal_state": "none",
+        "journal_target_plan_hash": None,
+    }
+    journal = _load_decision_recovery_journal(project, source_run_id)
+    source_plan_payload = result_plan.model_dump(mode="json")
+    if journal is None:
+        if current_plan.model_dump(mode="json") != source_plan_payload:
+            raise RuntimeError(
+                "Current plan is neither the exact failed source plan nor a "
+                "journal-authenticated recovery target."
+            )
+    else:
+        expected_journal_fields = {
+            "schema_version",
+            "action",
+            "source_run_id",
+            "source_packet_id",
+            "replacement_packet_id",
+            "raw_decision_sha256",
+            "source_plan_hash",
+            "source_contract_hash",
+            "source_repository_fingerprint",
+            "source_config_hash",
+            "prepared_by_run_id",
+            "created_at",
+            "phase",
+            "child_run_id",
+            "target_plan_hash",
+            "target_plan",
+        }
+        if set(journal) != expected_journal_fields:
+            raise RuntimeError(
+                "Decision-recovery journal fields are incomplete or unexpected."
+            )
+        exact_journal_values = {
+            "schema_version": SCHEMA_VERSION,
+            "action": POST_WORKER_DECISION_RECOVERY_ACTION,
+            "source_run_id": source_run_id,
+            "source_packet_id": source_packet_id,
+            "replacement_packet_id": replacement_packet_id,
+            "raw_decision_sha256": raw_sha256,
+            "source_plan_hash": required_identity["plan_hash"],
+            "source_contract_hash": required_identity[
+                "check_contract_hash"
+            ],
+            "source_repository_fingerprint": repository_fingerprint,
+            "source_config_hash": source_config_hash,
+        }
+        if any(
+            journal.get(field) != value
+            for field, value in exact_journal_values.items()
+        ):
+            raise RuntimeError(
+                "Decision-recovery journal provenance does not match the "
+                "validated failed source."
+            )
+        if (
+            journal.get("phase") != "prepared"
+            or journal.get("child_run_id") is not None
+        ):
+            raise RuntimeError(
+                "Decision-recovery journal shows that a child run already "
+                "started; recovery is one-shot."
+            )
+        try:
+            _safe_run_id(str(journal["prepared_by_run_id"]))
+            if (
+                not isinstance(journal["created_at"], str)
+                or not journal["created_at"].strip()
+            ):
+                raise ValueError("created_at")
+            target_plan = ProjectPlan.model_validate(journal["target_plan"])
+        except Exception as exc:
+            raise RuntimeError(
+                "Decision-recovery journal target metadata is invalid."
+            ) from exc
+        target_plan_hash = plan_hash(target_plan)
+        if (
+            journal.get("target_plan_hash") != target_plan_hash
+            or not re.fullmatch(r"[0-9a-f]{64}", target_plan_hash)
+        ):
+            raise RuntimeError(
+                "Decision-recovery journal target plan hash is invalid."
+            )
+        derived_plan, _ = apply_post_worker_decision_recovery_plan(
+            result_plan,
+            recovery,
+            merged_config,
+        )
+        derived_plan.updated_at = target_plan.updated_at
+        derived_plan.last_validated_at = target_plan.last_validated_at
+        derived_plan.last_validation_summary = (
+            target_plan.last_validation_summary
+        )
+        derived_plan = ProjectPlan.model_validate(
+            derived_plan.model_dump(mode="json")
+        )
+        if (
+            derived_plan.model_dump(mode="json")
+            != target_plan.model_dump(mode="json")
+        ):
+            raise RuntimeError(
+                "Decision-recovery journal target is not the deterministic "
+                "transform of the immutable source plan."
+            )
+        current_payload = current_plan.model_dump(mode="json")
+        target_payload = target_plan.model_dump(mode="json")
+        if current_payload == source_plan_payload:
+            recovery["journal_state"] = "intent_only"
+        elif current_payload == target_payload:
+            recovery["journal_state"] = "target_applied"
+            continuation_payload = continuation.model_dump(mode="json")
+            continuation_payload["plan_hash"] = target_plan_hash
+            continuation_payload["active_packet_id"] = replacement_packet_id
+            continuation = ContinuationPayload.model_validate(
+                continuation_payload
+            )
+        else:
+            raise RuntimeError(
+                "Current plan differs from both states authorized by the "
+                "decision-recovery journal."
+            )
+        recovery["journal_target_plan_hash"] = target_plan_hash
+    return {
+        "source_run_id": source_run_id,
+        "source_directory": str(source_directory),
+        "goal": source_result["goal"],
+        "config": merged_config,
+        "continuation": continuation.model_dump(mode="json"),
+        "source_result_schema_version": SCHEMA_VERSION,
+        "source_stop_reason_code": "technical_failure",
+        "source_automatic_resume_allowed": False,
+        "resume_kind": resume_kind,
+        "source_config_hash": source_config_hash,
+        "legacy_config_compatibility": False,
+        "base_chain_budgets": base_chain_budgets.model_dump(mode="json"),
+        "effective_chain_budgets": effective_chain_budgets.model_dump(
+            mode="json"
+        ),
+        "budget_extension_count": budget_extension_count,
+        "budget_extended": False,
+        "bounded_packet_recovery_eligible": False,
+        "recovery_authorized_from_run_id": None,
+        "post_worker_decision_recovery_eligible": True,
+        "post_worker_decision_recovery": recovery,
+    }
+
+
 def load_resume_context(
     project: Path,
     requested_run_id: str,
     *,
     resume_kind: ResumeKind = "direct_manual",
     authorize_packet_recovery: bool = True,
+    expected_decision_recovery_sha256: str | None = None,
 ) -> dict[str, Any]:
     resume_kind = _validate_resume_kind(resume_kind)
+    if expected_decision_recovery_sha256 is not None:
+        _validated_decision_recovery_sha256(
+            expected_decision_recovery_sha256
+        )
+        if str(requested_run_id).strip().lower() == "latest":
+            raise RuntimeError(
+                "Post-worker decision recovery requires an exact source run ID; "
+                "'latest' is forbidden."
+            )
     project = validate_existing_project_path(project)
     source_directory = resolve_resume_run_directory(project, requested_run_id)
     source_run = load_json_object(source_directory / "run.json", "Zdrojový Forge run")
@@ -1932,6 +3087,23 @@ def load_resume_context(
     if source_directory.name != source_run_id:
         raise RuntimeError(
             "Zdrojový result.json nezodpovedá run adresáru; resume sa bezpečne zastavil."
+        )
+    if source_result.get("final_status") == "failed":
+        return _load_post_worker_decision_recovery_context(
+            project,
+            source_directory,
+            source_run,
+            source_result,
+            source_run_id=source_run_id,
+            resume_kind=resume_kind,
+            expected_decision_recovery_sha256=(
+                expected_decision_recovery_sha256
+            ),
+        )
+    if expected_decision_recovery_sha256 is not None:
+        raise RuntimeError(
+            "An expected decision-recovery SHA-256 may be supplied only for the "
+            "explicit failed-run recovery path."
         )
     if source_result.get("final_status") != "needs_continuation":
         raise RuntimeError(
@@ -4476,7 +5648,12 @@ def ask_orchestrator(
 
     try:
         payload = json.loads(output_path.read_text(encoding="utf-8"))
-        decision = Decision.model_validate(payload)
+        normalized_payload = normalize_codex_decision_payload(payload)
+        decision = Decision.model_validate(normalized_payload)
+        # Keep the run-scoped raw artifact faithful to the Codex response.  It
+        # is redacted and atomically rewritten for storage safety, but the
+        # ineffective reason is removed only from the validated Decision and
+        # the later *-decision.json artifact.
         atomic_save_json(output_path, payload)
     except Exception as exc:
         raise RuntimeError(
@@ -5444,6 +6621,168 @@ def active_plan_packet(plan: ProjectPlan | None) -> WorkPacket | None:
     )
 
 
+def apply_post_worker_decision_recovery_plan(
+    plan: ProjectPlan,
+    recovery: dict[str, Any],
+    config: dict[str, Any],
+) -> tuple[ProjectPlan, Decision]:
+    """Deterministically supersede one exhausted packet without refunding it."""
+
+    if not isinstance(recovery, dict):
+        raise RuntimeError("Post-worker decision recovery provenance is missing.")
+    required_strings = (
+        "source_run_id",
+        "source_packet_id",
+        "replacement_packet_id",
+        "raw_decision_sha256",
+        "source_plan_hash",
+        "source_repository_fingerprint",
+    )
+    for field in required_strings:
+        if not isinstance(recovery.get(field), str) or not recovery[field]:
+            raise RuntimeError(
+                f"Post-worker decision recovery provenance is missing {field}."
+            )
+    if recovery.get("action") != POST_WORKER_DECISION_RECOVERY_ACTION:
+        raise RuntimeError("Post-worker decision recovery action is invalid.")
+    maximum_attempts = int(config.get("max_packet_attempts", 3))
+    if maximum_attempts < 1:
+        raise RuntimeError(
+            "Post-worker decision recovery requires a positive packet-attempt "
+            "budget."
+        )
+    if plan_hash(plan) != recovery["source_plan_hash"]:
+        raise RuntimeError(
+            "Persistent plan changed before post-worker recovery replan."
+        )
+    try:
+        decision = Decision.model_validate(recovery["normalized_decision"])
+    except Exception as exc:
+        raise RuntimeError(
+            "Normalized post-worker recovery decision is invalid."
+        ) from exc
+    source_packet_id = recovery["source_packet_id"]
+    replacement_packet_id = recovery["replacement_packet_id"]
+    if (
+        decision.status != "continue"
+        or decision.decision_kind
+        not in {"implement_packet", "repair_packet", "verify_packet"}
+        or decision.active_packet_id != source_packet_id
+        or not (decision.next_prompt or "").strip()
+        or not decision.acceptance_criteria
+    ):
+        raise RuntimeError(
+            "Normalized post-worker recovery decision is not a bounded packet "
+            "replacement instruction."
+        )
+
+    updated = ProjectPlan.model_validate(plan.model_dump(mode="json"))
+    if len(updated.work_packets) >= MAX_PROJECT_WORK_PACKETS:
+        raise RuntimeError(
+            "Post-worker decision recovery would exceed the project packet limit."
+        )
+    by_id = {packet.packet_id: packet for packet in updated.work_packets}
+    source = by_id.get(source_packet_id)
+    if source is None or replacement_packet_id in by_id:
+        raise RuntimeError(
+            "Post-worker decision recovery packet identity is inconsistent."
+        )
+    if (
+        source.status not in {"in_progress", "verification"}
+        or not source.final_review_recovery_used
+        or source.final_review_recovery_authorized
+    ):
+        raise RuntimeError(
+            "Post-worker decision recovery source is not the consumed exhausted "
+            "packet."
+        )
+
+    downstream = [
+        packet
+        for packet in updated.work_packets
+        if source_packet_id in packet.dependencies
+    ]
+    inconsistent = [
+        packet.packet_id
+        for packet in downstream
+        if packet.status in {"completed", "superseded"}
+    ]
+    if inconsistent:
+        raise RuntimeError(
+            "Completed or superseded downstream dependencies cannot be rewired."
+        )
+
+    context_parts = [
+        decision.assessment.strip(),
+        decision.packet_assessment.strip(),
+        decision.routing_reason.strip(),
+    ]
+    replacement = WorkPacket(
+        packet_id=replacement_packet_id,
+        title=(source.title + " — decision recovery")[:160],
+        objective=(decision.next_prompt or "").strip(),
+        context="\n\n".join(part for part in context_parts if part),
+        dependencies=list(source.dependencies),
+        acceptance_criteria=list(decision.acceptance_criteria),
+        status="in_progress",
+        difficulty=source.difficulty,
+        risk=source.risk,
+        recommended_worker_profile=decision.recommended_worker_profile,
+        recommended_review_profile=decision.recommended_review_profile,
+        check_tier=decision.check_tier,
+        max_worker_turns=decision.recommended_worker_max_turns,
+        expected_paths=list(source.expected_paths),
+        forbidden_scope=list(source.forbidden_scope),
+        # This is a one-shot human-authorized recovery packet. It starts at the
+        # normal limit with exactly one recovery attempt authorized. A valid
+        # dispatch consumes that slot; a transport failure can use the existing
+        # precise recovery refund without creating another logical attempt.
+        attempts=maximum_attempts,
+        final_review_recovery_authorized=True,
+        final_review_recovery_used=False,
+        last_fingerprint=None,
+        last_failure_signature=None,
+        closes_milestone=decision.closes_milestone,
+        requires_fresh_release_check=decision.requires_release_check,
+    )
+
+    source.status = "superseded"
+    source_index = next(
+        index
+        for index, packet in enumerate(updated.work_packets)
+        if packet.packet_id == source_packet_id
+    )
+    updated.work_packets.insert(source_index + 1, replacement)
+    for packet in downstream:
+        rewritten_dependencies: list[str] = []
+        seen_dependencies: set[str] = set()
+        for dependency in packet.dependencies:
+            rewritten = (
+                replacement_packet_id
+                if dependency == source_packet_id
+                else dependency
+            )
+            if rewritten not in seen_dependencies:
+                rewritten_dependencies.append(rewritten)
+                seen_dependencies.add(rewritten)
+        packet.dependencies = rewritten_dependencies
+    updated.active_packet_id = replacement_packet_id
+    updated.status = "active"
+    updated.completed_packet_ids = [
+        packet.packet_id
+        for packet in updated.work_packets
+        if packet.status == "completed"
+    ]
+    updated.updated_at = utc_now()
+    updated = ProjectPlan.model_validate(updated.model_dump(mode="json"))
+
+    # The raw plan patch described the exhausted source packet and includes an
+    # attempts increment. Recovery owns the deterministic replan and never
+    # carries that model-authored counter mutation into the new packet.
+    runtime_decision = _runtime_decision_for_recovery(recovery)
+    return updated, runtime_decision
+
+
 def update_plan_from_decision(
     project: Path,
     plan: ProjectPlan,
@@ -5683,6 +7022,22 @@ def _run_forge_locked(
     project_plan: ProjectPlan | None = None
     check_contract: CheckContract | None = None
     baseline_snapshot: dict[str, Any] | None = None
+    post_worker_recovery: dict[str, Any] | None = None
+    post_worker_recovery_decision: Decision | None = None
+    if resume_context is not None:
+        candidate_recovery = resume_context.get(
+            "post_worker_decision_recovery"
+        )
+        if candidate_recovery is not None:
+            if not isinstance(candidate_recovery, dict):
+                raise RuntimeError(
+                    "Post-worker decision recovery provenance is malformed."
+                )
+            post_worker_recovery = candidate_recovery
+    if post_worker_recovery is not None and not adaptive_enabled:
+        raise RuntimeError(
+            "Post-worker decision recovery requires adaptive orchestration."
+        )
     if adaptive_enabled:
         inherited_adaptive_values = (
             {
@@ -5743,10 +7098,180 @@ def _run_forge_locked(
                 inherited_continuation,
                 goal=goal,
             )
-        save_plan(
+            if post_worker_recovery is not None:
+                # Eligibility is deliberately read-only. Re-run its complete
+                # provenance validation under the project lock, immediately
+                # before the only persistent plan mutation.
+                fresh_context = load_resume_context(
+                    project,
+                    str(resume_context["source_run_id"]),
+                    resume_kind="explicit_human",
+                    authorize_packet_recovery=False,
+                    expected_decision_recovery_sha256=str(
+                        post_worker_recovery.get("raw_decision_sha256") or ""
+                    ),
+                )
+                fresh_recovery = fresh_context.get(
+                    "post_worker_decision_recovery"
+                )
+                if (
+                    fresh_recovery != post_worker_recovery
+                    or fresh_context.get("continuation")
+                    != resume_context.get("continuation")
+                    or fresh_context.get("source_config_hash")
+                    != resume_context.get("source_config_hash")
+                    or fresh_context.get("base_chain_budgets")
+                    != resume_context.get("base_chain_budgets")
+                    or fresh_context.get("effective_chain_budgets")
+                    != resume_context.get("effective_chain_budgets")
+                    or fresh_context.get("budget_extension_count")
+                    != resume_context.get("budget_extension_count")
+                ):
+                    raise RuntimeError(
+                        "Post-worker decision recovery provenance changed between "
+                        "eligibility and the locked replan."
+                    )
+                post_worker_recovery = fresh_recovery
+                journal_state = str(
+                    post_worker_recovery.get("journal_state") or ""
+                )
+                if journal_state == "none":
+                    transformed_plan, post_worker_recovery_decision = (
+                        apply_post_worker_decision_recovery_plan(
+                            project_plan,
+                            post_worker_recovery,
+                            config,
+                        )
+                    )
+                    target_plan = _prepare_recovery_plan_for_persistence(
+                        transformed_plan
+                    )
+                    target_plan_hash = plan_hash(target_plan)
+                    journal_payload = {
+                        "schema_version": SCHEMA_VERSION,
+                        "action": POST_WORKER_DECISION_RECOVERY_ACTION,
+                        "source_run_id": post_worker_recovery[
+                            "source_run_id"
+                        ],
+                        "source_packet_id": post_worker_recovery[
+                            "source_packet_id"
+                        ],
+                        "replacement_packet_id": post_worker_recovery[
+                            "replacement_packet_id"
+                        ],
+                        "raw_decision_sha256": post_worker_recovery[
+                            "raw_decision_sha256"
+                        ],
+                        "source_plan_hash": post_worker_recovery[
+                            "source_plan_hash"
+                        ],
+                        "source_contract_hash": post_worker_recovery[
+                            "source_contract_hash"
+                        ],
+                        "source_repository_fingerprint": (
+                            post_worker_recovery[
+                                "source_repository_fingerprint"
+                            ]
+                        ),
+                        "source_config_hash": fresh_context[
+                            "source_config_hash"
+                        ],
+                        "prepared_by_run_id": run_id,
+                        "created_at": utc_now(),
+                        "phase": "prepared",
+                        "child_run_id": None,
+                        "target_plan_hash": target_plan_hash,
+                        "target_plan": target_plan.model_dump(mode="json"),
+                    }
+                    # The journal is the write-ahead record. It must become
+                    # durable before the persistent plan can leave source state.
+                    atomic_json(
+                        _decision_recovery_journal_path(
+                            project,
+                            str(resume_context["source_run_id"]),
+                        ),
+                        journal_payload,
+                    )
+                    post_worker_recovery["journal_state"] = "intent_only"
+                    post_worker_recovery[
+                        "journal_target_plan_hash"
+                    ] = target_plan_hash
+                    project_plan = target_plan
+                elif journal_state in {"intent_only", "target_applied"}:
+                    journal_payload = _load_decision_recovery_journal(
+                        project,
+                        str(resume_context["source_run_id"]),
+                    )
+                    if journal_payload is None:
+                        raise RuntimeError(
+                            "Validated recovery journal disappeared before plan "
+                            "persistence."
+                        )
+                    target_plan = ProjectPlan.model_validate(
+                        journal_payload["target_plan"]
+                    )
+                    if (
+                        plan_hash(target_plan)
+                        != post_worker_recovery[
+                            "journal_target_plan_hash"
+                        ]
+                    ):
+                        raise RuntimeError(
+                            "Recovery journal target changed before persistence."
+                        )
+                    project_plan = target_plan
+                    post_worker_recovery_decision = (
+                        _runtime_decision_for_recovery(
+                            post_worker_recovery
+                        )
+                    )
+                else:
+                    raise RuntimeError(
+                        "Decision-recovery journal state is invalid."
+                    )
+        if post_worker_recovery is None:
+            save_plan(
+                project,
+                project_plan,
+                snapshot_path=run_directory / "project-plan.initial.json",
+            )
+        else:
+            # Exact target bytes are already authenticated by the write-ahead
+            # journal. Persist them atomically without a second timestamp change.
+            atomic_json(
+                forge_dir / "project-plan.json",
+                project_plan.model_dump(mode="json"),
+            )
+            atomic_json(
+                run_directory / "project-plan.initial.json",
+                project_plan.model_dump(mode="json"),
+            )
+            post_worker_recovery["journal_state"] = "target_applied"
+            recovery_record = dict(post_worker_recovery)
+            recovery_record["recovered_plan_hash"] = plan_hash(project_plan)
+            recovery_record["source_packet_attempts_preserved"] = True
+            recovery_record["replacement_packet_attempts_at_replan"] = (
+                int(config.get("max_packet_attempts", 3))
+            )
+            recovery_record[
+                "replacement_recovery_authorized_at_replan"
+            ] = True
+            recovery_record["replacement_recovery_used_at_replan"] = False
+            save_json(
+                run_directory / "decision-recovery.json",
+                recovery_record,
+            )
+            atomic_json(
+                run_directory / "project-plan.decision-recovery.json",
+                project_plan.model_dump(mode="json"),
+            )
+    if post_worker_recovery is not None:
+        # Consume the one-shot authorization before the child becomes visible
+        # or any model can be dispatched. A crash after this point fails closed.
+        _mark_decision_recovery_child_started(
             project,
-            project_plan,
-            snapshot_path=run_directory / "project-plan.initial.json",
+            str(resume_context["source_run_id"]),
+            run_id,
         )
     status = StatusTracker(
         project,
@@ -5804,6 +7329,22 @@ def _run_forge_locked(
                 ),
                 "safety_overrides": list(
                     resume_context.get("safety_overrides", [])
+                ),
+                "post_worker_decision_recovery": (
+                    {
+                        "action": post_worker_recovery["action"],
+                        "source_packet_id": post_worker_recovery[
+                            "source_packet_id"
+                        ],
+                        "replacement_packet_id": post_worker_recovery[
+                            "replacement_packet_id"
+                        ],
+                        "raw_decision_sha256": post_worker_recovery[
+                            "raw_decision_sha256"
+                        ],
+                    }
+                    if post_worker_recovery is not None
+                    else None
                 ),
             }
             if inherited_continuation is not None
@@ -6180,7 +7721,64 @@ def _run_forge_locked(
                         logs / f"{iteration:02d}-check-contract-drift.json",
                         reviewed_check_contract_evidence,
                     )
-                if (
+                if post_worker_recovery_decision is not None:
+                    persistent_plan_path = forge_dir / "project-plan.json"
+                    try:
+                        persistent_plan = ProjectPlan.model_validate_json(
+                            persistent_plan_path.read_text(encoding="utf-8")
+                        )
+                    except Exception as exc:
+                        raise RuntimeError(
+                            "Recovered persistent plan became unreadable before "
+                            "worker dispatch."
+                        ) from exc
+                    if (
+                        persistent_plan_path.is_symlink()
+                        or current_fingerprint
+                        != inherited_continuation.repository_fingerprint
+                        or current_manifest
+                        != inherited_continuation.repository_manifest
+                        or resume_contract_error is not None
+                        or project_plan is None
+                        or persistent_plan.model_dump(mode="json")
+                        != project_plan.model_dump(mode="json")
+                    ):
+                        raise RuntimeError(
+                            "Post-worker recovery state changed after the locked "
+                            "replan; Forge stopped before any model call."
+                        )
+                    decision = Decision.model_validate(
+                        post_worker_recovery_decision.model_dump(mode="json")
+                    )
+                    status.set_phase(
+                        "codex_review",
+                        iteration=iteration,
+                        current_agent="Forge",
+                        message=(
+                            "Explicit recovery uses the audited normalized raw "
+                            "decision without a new model review."
+                        ),
+                    )
+                    review_prompt = textwrap.dedent(
+                        f"""
+                        EXPLICIT POST-WORKER DECISION RECOVERY
+                        SOURCE RUN: {parent_run_id}
+                        RAW DECISION SHA-256: {post_worker_recovery['raw_decision_sha256']}
+                        REPLACEMENT PACKET: {post_worker_recovery['replacement_packet_id']}
+                        EXACT NORMALIZED NEXT PROMPT:
+                        {decision.next_prompt}
+
+                        ACCEPTANCE CRITERIA:
+                        {chr(10).join('- ' + item for item in decision.acceptance_criteria)}
+                        """
+                    ).strip()
+                    print(
+                        "[Forge][Resume] Používam auditované normalizované "
+                        "post-worker rozhodnutie a nový packet; vyčerpaný packet "
+                        "ani jeho pokusy sa neresetujú.",
+                        flush=True,
+                    )
+                elif (
                     current_fingerprint
                     == inherited_continuation.repository_fingerprint
                     and resume_contract_error is None
@@ -8368,6 +9966,7 @@ def resume_eligibility(
     *,
     supervisor_config: dict[str, Any] | None = None,
     in_wsl: bool | None = None,
+    expected_decision_recovery_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Return a model-free, non-mutating decision for an explicit human resume."""
     try:
@@ -8376,6 +9975,9 @@ def resume_eligibility(
             requested_run_id,
             resume_kind="explicit_human",
             authorize_packet_recovery=False,
+            expected_decision_recovery_sha256=(
+                expected_decision_recovery_sha256
+            ),
         )
         safety_overrides: list[str] = []
         effective_security_profile = str(
@@ -8405,14 +10007,45 @@ def resume_eligibility(
             "message": truncate(redact_text(str(exc)), 5000),
             "bounded_packet_recovery_eligible": False,
             "budget_tranche_extension_eligible": False,
+            "post_worker_decision_recovery_eligible": False,
             "model_calls_made": 0,
             "state_mutated": False,
             "supervisor_config_enforced": supervisor_config is not None,
         }
 
+    post_worker_recovery = bool(
+        context.get("post_worker_decision_recovery_eligible", False)
+    )
+    if post_worker_recovery and supervisor_config is None:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "eligible": False,
+            "source_run_id": context["source_run_id"],
+            "resume_kind": "explicit_human",
+            "source_stop_reason_code": context[
+                "source_stop_reason_code"
+            ],
+            "source_automatic_resume_allowed": context[
+                "source_automatic_resume_allowed"
+            ],
+            "action": "none",
+            "reason_code": "supervised_run_chain_required",
+            "message": (
+                "Post-worker decision recovery requires an explicit supervised "
+                "run-chain configuration."
+            ),
+            "bounded_packet_recovery_eligible": False,
+            "budget_tranche_extension_eligible": False,
+            "post_worker_decision_recovery_eligible": False,
+            "model_calls_made": 0,
+            "state_mutated": False,
+            "supervisor_config_enforced": False,
+        }
     packet_recovery = bool(context["bounded_packet_recovery_eligible"])
     budget_extension = bool(context["budget_extended"])
-    if packet_recovery:
+    if post_worker_recovery:
+        action = POST_WORKER_DECISION_RECOVERY_ACTION
+    elif packet_recovery:
         action = "bounded_final_review_recovery"
     elif budget_extension:
         action = "extend_chain_budget_one_tranche"
@@ -8431,6 +10064,12 @@ def resume_eligibility(
         "reason_code": "eligible",
         "message": "Explicit resume passed all model-free core validations.",
         "bounded_packet_recovery_eligible": packet_recovery,
+        "post_worker_decision_recovery_eligible": post_worker_recovery,
+        "post_worker_decision_recovery": (
+            context.get("post_worker_decision_recovery")
+            if post_worker_recovery
+            else None
+        ),
         "recovery_authorized_from_run_id": context[
             "recovery_authorized_from_run_id"
         ],
@@ -8456,51 +10095,79 @@ def resume_forge(
     *,
     resume_kind: ResumeKind = "direct_manual",
     supervisor_config: dict[str, Any] | None = None,
+    expected_decision_recovery_sha256: str | None = None,
 ) -> int:
-    try:
-        if supervisor_config is not None:
-            preliminary_context = load_resume_context(
-                project,
-                requested_run_id,
-                resume_kind=resume_kind,
-                authorize_packet_recovery=False,
+    resolved_project = validate_existing_project_path(project)
+    with project_run_lock(
+        resolved_project,
+        create_forge_directory=False,
+    ):
+        try:
+            if supervisor_config is not None:
+                preliminary_context = load_resume_context(
+                    resolved_project,
+                    requested_run_id,
+                    resume_kind=resume_kind,
+                    authorize_packet_recovery=False,
+                    expected_decision_recovery_sha256=(
+                        expected_decision_recovery_sha256
+                    ),
+                )
+                effective_config, safety_overrides = (
+                    enforce_unattended_resume_config(
+                        preliminary_context["config"],
+                        supervisor_config,
+                    )
+                )
+                # The writer lock stays held from this authorization through
+                # child-run initialization and every plan mutation.
+                resume_context = load_resume_context(
+                    resolved_project,
+                    requested_run_id,
+                    resume_kind=resume_kind,
+                    authorize_packet_recovery=True,
+                    expected_decision_recovery_sha256=(
+                        expected_decision_recovery_sha256
+                    ),
+                )
+                resume_context["config"] = effective_config
+                resume_context["safety_overrides"] = safety_overrides
+            else:
+                resume_context = load_resume_context(
+                    resolved_project,
+                    requested_run_id,
+                    resume_kind=resume_kind,
+                    authorize_packet_recovery=True,
+                    expected_decision_recovery_sha256=(
+                        expected_decision_recovery_sha256
+                    ),
+                )
+            if (
+                resume_context.get("post_worker_decision_recovery_eligible")
+                and supervisor_config is None
+            ):
+                raise RuntimeError(
+                    "Post-worker decision recovery requires an explicit "
+                    "supervised run-chain configuration."
+                )
+        except Exception as exc:
+            print(
+                "[Forge][ResumeFailed] "
+                + truncate(redact_text(str(exc)), 5000),
+                file=sys.stderr,
             )
-            effective_config, safety_overrides = enforce_unattended_resume_config(
-                preliminary_context["config"],
-                supervisor_config,
-            )
-            # Only after the unattended safety envelope is valid may the core
-            # persist a one-shot packet recovery authorization.
-            resume_context = load_resume_context(
-                project,
-                requested_run_id,
-                resume_kind=resume_kind,
-            )
-            resume_context["config"] = effective_config
-            resume_context["safety_overrides"] = safety_overrides
-        else:
-            resume_context = load_resume_context(
-                project,
-                requested_run_id,
-                resume_kind=resume_kind,
-            )
-    except Exception as exc:
+            return EXIT_FAILED
         print(
-            "[Forge][ResumeFailed] " + truncate(redact_text(str(exc)), 5000),
-            file=sys.stderr,
+            "[Forge][Resume] Zdrojový run: "
+            f"{resume_context['source_run_id']}; vytvorí sa nový nemenný run directory.",
+            flush=True,
         )
-        return EXIT_FAILED
-    print(
-        "[Forge][Resume] Zdrojový run: "
-        f"{resume_context['source_run_id']}; vytvorí sa nový nemenný run directory.",
-        flush=True,
-    )
-    return run_forge(
-        project,
-        str(resume_context["goal"]),
-        Path(__file__).with_name("forge.config.json"),
-        resume_context=resume_context,
-    )
+        return _run_forge_locked(
+            resolved_project,
+            str(resume_context["goal"]),
+            Path(__file__).with_name("forge.config.json"),
+            resume_context=resume_context,
+        )
 
 
 def _run_chain_impl(
@@ -8509,6 +10176,7 @@ def _run_chain_impl(
     config_path: Path,
     *,
     resume_run_id: str | None = None,
+    expected_decision_recovery_sha256: str | None = None,
 ) -> int:
     """Bounded local supervisor that only follows validated continuation payloads."""
     project = (
@@ -8601,6 +10269,9 @@ def _run_chain_impl(
             resume_run_id,
             resume_kind="explicit_human",
             supervisor_config=supervisor_config,
+            expected_decision_recovery_sha256=(
+                expected_decision_recovery_sha256
+            ),
         )
     else:
         if not isinstance(goal, str) or not goal.strip():
@@ -8765,6 +10436,7 @@ def run_chain(
     config_path: Path,
     *,
     resume_run_id: str | None = None,
+    expected_decision_recovery_sha256: str | None = None,
 ) -> int:
     """Run the bounded supervisor and always persist a terminal supervisor state."""
     started = time.monotonic()
@@ -8784,6 +10456,9 @@ def run_chain(
             goal,
             config_path,
             resume_run_id=resume_run_id,
+            expected_decision_recovery_sha256=(
+                expected_decision_recovery_sha256
+            ),
         )
     except (Exception, SystemExit) as exc:
         failure_message = truncate(
@@ -8953,6 +10628,13 @@ def parse_args() -> argparse.Namespace:
             "overí aj unattended safety envelope, ktorý použije run-chain."
         ),
     )
+    eligibility.add_argument(
+        "--expected-decision-recovery-sha256",
+        help=(
+            "Explicit audited lowercase SHA-256 of the unmatched raw decision; "
+            "required only for bounded failed-run decision recovery."
+        ),
+    )
     chain = sub.add_parser(
         "run-chain",
         help=(
@@ -8977,6 +10659,13 @@ def parse_args() -> argparse.Namespace:
         default=Path(__file__).with_name("forge.config.json"),
         help="Cesta ku konfiguračnému JSON súboru pre prvý run.",
     )
+    chain.add_argument(
+        "--expected-decision-recovery-sha256",
+        help=(
+            "Explicit audited lowercase SHA-256 for the first failed-run "
+            "decision recovery; it is never reused by automatic child resumes."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -8996,6 +10685,9 @@ def main() -> int:
             args.project,
             args.run_id,
             supervisor_config=supervisor_config,
+            expected_decision_recovery_sha256=(
+                args.expected_decision_recovery_sha256
+            ),
         )
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return EXIT_DONE if result["eligible"] else EXIT_FAILED
@@ -9006,11 +10698,24 @@ def main() -> int:
                 file=sys.stderr,
             )
             return EXIT_FAILED
+        if (
+            args.expected_decision_recovery_sha256 is not None
+            and args.resume_run_id is None
+        ):
+            print(
+                "--expected-decision-recovery-sha256 requires "
+                "--resume-run-id.",
+                file=sys.stderr,
+            )
+            return EXIT_FAILED
         return run_chain(
             args.project,
             args.goal,
             args.config.resolve(),
             resume_run_id=args.resume_run_id,
+            expected_decision_recovery_sha256=(
+                args.expected_decision_recovery_sha256
+            ),
         )
     return 1
 

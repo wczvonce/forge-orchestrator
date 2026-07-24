@@ -19,6 +19,14 @@ param(
   [ValidateNotNullOrEmpty()]
   [string]$ResumeRunId,
 
+  [Parameter(Mandatory = $true, ParameterSetName = "RecoverFailedRun")]
+  [ValidateNotNullOrEmpty()]
+  [string]$RecoverFailedRunId,
+
+  [Parameter(Mandatory = $true, ParameterSetName = "RecoverFailedRun")]
+  [ValidatePattern("^[0-9a-f]{64}$")]
+  [string]$ExpectedDecisionRecoverySha256,
+
   [string]$LogPath,
 
   [ValidateSet("EconomySafe", "EconomyMax", "Android", "Strict")]
@@ -54,7 +62,11 @@ $LastForgeExitCode = 1
 $TranscriptStarted = $false
 $ResolvedLogPath = $null
 $MonitorOpened = $false
-$IsResume = $PSCmdlet.ParameterSetName -in @("ResumeLatest", "ResumeRunId")
+$IsResume = $PSCmdlet.ParameterSetName -in @(
+  "ResumeLatest",
+  "ResumeRunId",
+  "RecoverFailedRun"
+)
 $StrictWslDistribution = "Ubuntu-24.04"
 $StrictWslUser = "forge"
 $StrictWslForgeRoot = "/home/forge/GPT-Claude-Forge"
@@ -472,7 +484,8 @@ function Assert-ResumeEligibility {
     [Parameter(Mandatory = $true)][object]$Python,
     [Parameter(Mandatory = $true)][string]$Project,
     [Parameter(Mandatory = $true)][string]$RequestedRunId,
-    [Parameter(Mandatory = $true)][string]$SupervisorConfig
+    [Parameter(Mandatory = $true)][string]$SupervisorConfig,
+    [string]$ExpectedDecisionRecoverySha256
   )
 
   $Executable = [string]$Python.File
@@ -489,6 +502,15 @@ function Assert-ResumeEligibility {
     "--run-id", $RequestedRunId,
     "--config", $SupervisorConfig
   )
+  if (-not [string]::IsNullOrWhiteSpace($ExpectedDecisionRecoverySha256)) {
+    if ($RequestedRunId -eq "latest") {
+      throw "Decision recovery vyzaduje presny ResumeRunId; ResumeLatest je zakazany."
+    }
+    $Arguments += @(
+      "--expected-decision-recovery-sha256",
+      $ExpectedDecisionRecoverySha256
+    )
+  }
   $PreviousErrorActionPreference = $ErrorActionPreference
   try {
     # The command is model-free and non-mutating. Keep native stderr
@@ -539,7 +561,10 @@ function Assert-ResumeEligibility {
     "action",
     "state_mutated",
     "model_calls_made",
-    "supervisor_config_enforced"
+    "supervisor_config_enforced",
+    "post_worker_decision_recovery_eligible",
+    "bounded_packet_recovery_eligible",
+    "budget_tranche_extension_eligible"
   )) {
     if ($null -eq $Eligibility.PSObject.Properties[$RequiredProperty]) {
       throw "Forge resume-eligibility verdiktu chyba povinne pole '$RequiredProperty'."
@@ -550,7 +575,10 @@ function Assert-ResumeEligibility {
     -not (Test-JsonInteger $Eligibility.model_calls_made) -or
     -not (Test-JsonBoolean $Eligibility.source_automatic_resume_allowed) -or
     -not (Test-JsonBoolean $Eligibility.state_mutated) -or
-    -not (Test-JsonBoolean $Eligibility.supervisor_config_enforced)
+    -not (Test-JsonBoolean $Eligibility.supervisor_config_enforced) -or
+    -not (Test-JsonBoolean $Eligibility.post_worker_decision_recovery_eligible) -or
+    -not (Test-JsonBoolean $Eligibility.bounded_packet_recovery_eligible) -or
+    -not (Test-JsonBoolean $Eligibility.budget_tranche_extension_eligible)
   ) {
     throw "Forge resume-eligibility verdikt obsahuje neplatne JSON typy."
   }
@@ -580,6 +608,7 @@ function Assert-ResumeEligibility {
   $AllowedActions = @(
     "bounded_final_review_recovery",
     "extend_chain_budget_one_tranche",
+    "validated_post_worker_decision_recovery",
     "validated_exact_resume"
   )
   if (
@@ -612,9 +641,58 @@ function Assert-ResumeEligibility {
     throw "Chain-budget resume nema platne povolenie na jeden kumulativny budget tranche."
   }
   if (
+    [string]$Eligibility.source_stop_reason_code -eq "technical_failure" -and
+    (
+      [string]$Eligibility.action -ne "validated_post_worker_decision_recovery" -or
+      $Eligibility.source_automatic_resume_allowed -ne $false -or
+      $Eligibility.post_worker_decision_recovery_eligible -ne $true -or
+      $Eligibility.bounded_packet_recovery_eligible -ne $false -or
+      $Eligibility.budget_tranche_extension_eligible -ne $false -or
+      [string]::IsNullOrWhiteSpace($ExpectedDecisionRecoverySha256) -or
+      $null -eq $Eligibility.post_worker_decision_recovery -or
+      [string]$Eligibility.post_worker_decision_recovery.raw_decision_sha256 -cne $ExpectedDecisionRecoverySha256
+    )
+  ) {
+    throw "Technical-failure resume nema platnu auditovanu post-worker decision recovery autorizaciu."
+  }
+  if (
+    [string]$Eligibility.action -ne "validated_post_worker_decision_recovery" -and
+    $Eligibility.post_worker_decision_recovery_eligible -ne $false
+  ) {
+    throw "Non-recovery resume nesmie niest post-worker decision recovery autorizaciu."
+  }
+  if (
+    [string]$Eligibility.action -eq "bounded_final_review_recovery" -and
+    (
+      $Eligibility.bounded_packet_recovery_eligible -ne $true -or
+      $Eligibility.budget_tranche_extension_eligible -ne $false
+    )
+  ) {
+    throw "Bounded packet recovery ma nekonzistentne akcne priznaky."
+  }
+  if (
+    [string]$Eligibility.action -eq "extend_chain_budget_one_tranche" -and
+    (
+      $Eligibility.bounded_packet_recovery_eligible -ne $false -or
+      $Eligibility.budget_tranche_extension_eligible -ne $true
+    )
+  ) {
+    throw "Budget-tranche recovery ma nekonzistentne akcne priznaky."
+  }
+  if (
+    [string]$Eligibility.action -eq "validated_exact_resume" -and
+    (
+      $Eligibility.bounded_packet_recovery_eligible -ne $false -or
+      $Eligibility.budget_tranche_extension_eligible -ne $false
+    )
+  ) {
+    throw "Exact resume nesmie niest recovery alebo budget autorizaciu."
+  }
+  if (
     [string]$Eligibility.source_stop_reason_code -notin @(
       "packet_attempts_exhausted",
-      "chain_budget_exhausted"
+      "chain_budget_exhausted",
+      "technical_failure"
     ) -and
     [string]$Eligibility.action -ne "validated_exact_resume"
   ) {
@@ -838,6 +916,9 @@ try {
     $SelectedResumeRunId = if ($PSCmdlet.ParameterSetName -eq "ResumeLatest") {
       "latest"
     }
+    elseif ($PSCmdlet.ParameterSetName -eq "RecoverFailedRun") {
+      $RecoverFailedRunId.Trim()
+    }
     else {
       $ResumeRunId.Trim()
     }
@@ -871,7 +952,8 @@ try {
       -Python $Python `
       -Project $RuntimeProjectPath `
       -RequestedRunId $SelectedResumeRunId `
-      -SupervisorConfig $RuntimeConfigPath
+      -SupervisorConfig $RuntimeConfigPath `
+      -ExpectedDecisionRecoverySha256 $ExpectedDecisionRecoverySha256
   }
   Write-Host "Forge: $ForgeRoot"
   Write-Host "Projekt: $ResolvedProjectPath"
@@ -930,12 +1012,19 @@ try {
     Write-Host ""
     Write-Host "=== FORGE AUTONOMOUS RUN ==="
     if ($IsResume) {
-      Invoke-ForgePython -Python $Python -Arguments @(
+      $ResumeArguments = @(
         "run-chain",
         "--project", $RuntimeProjectPath,
         "--resume-run-id", $SelectedResumeRunId,
         "--config", $RuntimeConfigPath
       )
+      if (-not [string]::IsNullOrWhiteSpace($ExpectedDecisionRecoverySha256)) {
+        $ResumeArguments += @(
+          "--expected-decision-recovery-sha256",
+          $ExpectedDecisionRecoverySha256
+        )
+      }
+      Invoke-ForgePython -Python $Python -Arguments $ResumeArguments
     }
     else {
       Invoke-ForgePython -Python $Python -Arguments @(

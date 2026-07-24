@@ -1146,6 +1146,7 @@ class WrapperContinuationTests(unittest.TestCase):
                                     "effective_security_profile": "strict",
                                     "bounded_packet_recovery_eligible": False,
                                     "budget_tranche_extension_eligible": True,
+                                    "post_worker_decision_recovery_eligible": False,
                                 }
                             )
                         )

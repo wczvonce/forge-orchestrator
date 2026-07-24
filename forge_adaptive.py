@@ -315,6 +315,7 @@ class CheckDefinition(StrictModel):
     required_before_done: bool = False
     test_count_pattern: str | None = None
     report_path: str | None = None
+    report_glob: str | None = None
     report_validation: Literal["none", "exists", "nonempty", "json"] = "none"
     check_kind: Literal[
         "auto", "test", "build", "lint", "typecheck", "security", "other"
@@ -347,6 +348,16 @@ class CheckDefinition(StrictModel):
             f"{self.check_id} {self.command}"
         ):
             raise ValueError("Security and vulnerability checks are never cacheable.")
+        if self.report_glob is not None:
+            normalized = self.report_glob.replace("\\", "/").strip()
+            if (
+                not normalized
+                or "\x00" in normalized
+                or normalized.startswith("/")
+                or re.match(r"^[A-Za-z]:", normalized)
+                or any(part == ".." for part in normalized.split("/"))
+            ):
+                raise ValueError("report_glob must be a safe project-relative pattern.")
         return self
 
 
@@ -908,6 +919,22 @@ def validate_check_report(project: Path, definition: CheckDefinition) -> bool:
     try:
         report.relative_to(project.resolve())
     except ValueError:
+        return False
+    if report.is_dir():
+        pattern = definition.report_glob or "*"
+        try:
+            matches = []
+            for candidate in report.glob(pattern):
+                resolved = candidate.resolve()
+                resolved.relative_to(project.resolve())
+                if resolved.is_file():
+                    matches.append(resolved)
+        except (OSError, ValueError):
+            return False
+        if definition.report_validation == "exists":
+            return bool(matches)
+        if definition.report_validation == "nonempty":
+            return bool(matches) and all(path.stat().st_size > 0 for path in matches)
         return False
     if not report.is_file():
         return False

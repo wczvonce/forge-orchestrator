@@ -87,6 +87,8 @@ class CheckResult(BaseModel):
     tests_failed: int | None = None
     tests_skipped: int | None = None
     report_path: str | None = None
+    report_files: list[str] = Field(default_factory=list)
+    report_file_count: int = 0
     report_format: str | None = None
     report_failure_reason: str | None = None
     report_valid: bool = True
@@ -1680,6 +1682,8 @@ def run_checks(
                     tests_failed=test_metrics.failed,
                     tests_skipped=test_metrics.skipped,
                     report_path=test_metrics.report_path,
+                    report_files=test_metrics.report_files,
+                    report_file_count=test_metrics.report_file_count,
                     report_format=test_metrics.report_format,
                     report_failure_reason=test_metrics.failure_reason,
                     report_valid=report_valid,

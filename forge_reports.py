@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 import re
 import xml.etree.ElementTree as ET
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class TestMetrics(BaseModel):
@@ -16,6 +16,8 @@ class TestMetrics(BaseModel):
     failed: int | None = None
     skipped: int | None = None
     report_path: str | None = None
+    report_files: list[str] = Field(default_factory=list)
+    report_file_count: int = 0
     report_format: str | None = None
     report_valid: bool = True
     failure_reason: str | None = None
@@ -261,6 +263,107 @@ def _safe_report_path(project: Path, report_path: str) -> Path:
     return candidate
 
 
+def _safe_report_glob(report_glob: str) -> str:
+    normalized = report_glob.replace("\\", "/").strip()
+    path = PurePosixPath(normalized)
+    if (
+        not normalized
+        or "\x00" in normalized
+        or normalized.startswith("/")
+        or re.match(r"^[A-Za-z]:", normalized)
+        or any(part == ".." for part in path.parts)
+    ):
+        raise ValueError("Test report glob must be a safe project-relative pattern.")
+    return normalized
+
+
+def _infer_report_format(path: Path, report_format: str) -> str:
+    if report_format != "auto":
+        return report_format
+    lower_name = path.name.casefold()
+    if path.suffix.casefold() == ".trx":
+        return "trx"
+    if path.suffix.casefold() == ".xml":
+        return (
+            "gradle-junit"
+            if "gradle" in lower_name or "android" in lower_name
+            else "junit-xml"
+        )
+    if "playwright" in lower_name:
+        return "playwright-json"
+    if "vitest" in lower_name:
+        return "vitest-json"
+    if path.suffix.casefold() == ".json":
+        return "jest-json"
+    return "text"
+
+
+def _parse_report(path: Path, report_format: str) -> TestMetrics:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    inferred = _infer_report_format(path, report_format)
+    try:
+        if inferred in {"junit-xml", "gradle-junit", "android-junit"}:
+            metrics = _junit_metrics(ET.fromstring(text), inferred)
+        elif inferred == "trx":
+            metrics = _trx_metrics(ET.fromstring(text))
+        elif inferred in {"jest-json", "vitest-json", "playwright-json"}:
+            metrics = _json_metrics(json.loads(text), inferred)
+        elif inferred == "flutter-json":
+            metrics = _flutter_metrics(text)
+        else:
+            metrics = _text_metrics(text)
+    except (ET.ParseError, json.JSONDecodeError) as exc:
+        metrics = TestMetrics(
+            report_format=inferred,
+            report_valid=False,
+            failure_reason=f"Malformed test report: {exc}",
+        )
+    metrics.report_path = str(path)
+    metrics.report_files = [str(path)]
+    metrics.report_file_count = 1
+    return metrics
+
+
+def _aggregate_report_metrics(
+    report_root: Path,
+    report_files: list[Path],
+    report_format: str,
+) -> TestMetrics:
+    parsed = [_parse_report(path, report_format) for path in report_files]
+    invalid = next((metrics for metrics in parsed if not metrics.report_valid), None)
+    if invalid is not None:
+        return TestMetrics(
+            report_path=str(report_root),
+            report_files=[str(path) for path in report_files],
+            report_file_count=len(report_files),
+            report_format=report_format,
+            report_valid=False,
+            failure_reason=(
+                f"Invalid test report {invalid.report_path}: "
+                f"{invalid.failure_reason or 'unknown validation failure'}"
+            ),
+        )
+
+    def total(field: str) -> int | None:
+        values = [getattr(metrics, field) for metrics in parsed]
+        if any(value is None for value in values):
+            return None
+        return sum(int(value) for value in values if value is not None)
+
+    return TestMetrics(
+        discovered=total("discovered"),
+        executed=total("executed"),
+        passed=total("passed"),
+        failed=total("failed"),
+        skipped=total("skipped"),
+        report_path=str(report_root),
+        report_files=[str(path) for path in report_files],
+        report_file_count=len(report_files),
+        report_format=report_format,
+        report_valid=True,
+    )
+
+
 def evaluate_test_evidence(
     project: Path,
     definition: Any,
@@ -308,59 +411,88 @@ def evaluate_test_evidence(
                 report_valid=False,
                 failure_reason=str(exc),
             )
-        if not path.is_file():
+        if not path.exists():
             return TestMetrics(
                 report_path=str(path),
                 report_format=report_format,
                 report_valid=False,
                 failure_reason="Expected test report does not exist.",
             )
+        if path.is_dir():
+            raw_report_glob = getattr(definition, "report_glob", None)
+            default_glob = (
+                "TEST-*.xml"
+                if report_format in {
+                    "auto",
+                    "junit-xml",
+                    "gradle-junit",
+                    "android-junit",
+                }
+                else "*"
+            )
+            try:
+                report_glob = _safe_report_glob(
+                    str(raw_report_glob or default_glob)
+                )
+                candidates = sorted(
+                    candidate
+                    for candidate in path.glob(report_glob)
+                    if candidate.is_file()
+                )
+                safe_candidates: list[Path] = []
+                project_root = project.resolve()
+                for candidate in candidates:
+                    resolved = candidate.resolve()
+                    resolved.relative_to(project_root)
+                    safe_candidates.append(resolved)
+            except (OSError, ValueError) as exc:
+                return TestMetrics(
+                    report_path=str(path),
+                    report_format=report_format,
+                    report_valid=False,
+                    failure_reason=f"Unsafe test report match: {exc}",
+                )
+            if not safe_candidates:
+                return TestMetrics(
+                    report_path=str(path),
+                    report_format=report_format,
+                    report_valid=False,
+                    failure_reason="No test report files matched the configured pattern.",
+                )
+            fresh_candidates = [
+                candidate
+                for candidate in safe_candidates
+                if candidate.stat().st_mtime >= started_wall_time - 2.0
+            ]
+            if not fresh_candidates:
+                return TestMetrics(
+                    report_path=str(path),
+                    report_files=[str(candidate) for candidate in safe_candidates],
+                    report_file_count=0,
+                    report_format=report_format,
+                    report_valid=False,
+                    failure_reason="All matching test reports are stale.",
+                )
+            metrics = _aggregate_report_metrics(
+                path, fresh_candidates, report_format
+            )
+        elif not path.is_file():
+            return TestMetrics(
+                report_path=str(path),
+                report_format=report_format,
+                report_valid=False,
+                failure_reason="Expected test report is not a regular file or directory.",
+            )
         # Filesystems with coarse timestamps need a small tolerance.
-        if path.stat().st_mtime < started_wall_time - 2.0:
+        elif path.stat().st_mtime < started_wall_time - 2.0:
             return TestMetrics(
                 report_path=str(path),
                 report_format=report_format,
                 report_valid=False,
                 failure_reason="Test report is stale and predates this check.",
             )
-        text = path.read_text(encoding="utf-8", errors="replace")
-        inferred = report_format
-        if inferred == "auto":
-            lower_name = path.name.casefold()
-            if path.suffix.casefold() == ".trx":
-                inferred = "trx"
-            elif path.suffix.casefold() == ".xml":
-                inferred = (
-                    "gradle-junit"
-                    if "gradle" in lower_name or "android" in lower_name
-                    else "junit-xml"
-                )
-            elif "playwright" in lower_name:
-                inferred = "playwright-json"
-            elif "vitest" in lower_name:
-                inferred = "vitest-json"
-            elif path.suffix.casefold() == ".json":
-                inferred = "jest-json"
-            else:
-                inferred = "text"
-        try:
-            if inferred in {"junit-xml", "gradle-junit", "android-junit"}:
-                metrics = _junit_metrics(ET.fromstring(text), inferred)
-            elif inferred == "trx":
-                metrics = _trx_metrics(ET.fromstring(text))
-            elif inferred in {"jest-json", "vitest-json", "playwright-json"}:
-                metrics = _json_metrics(json.loads(text), inferred)
-            elif inferred == "flutter-json":
-                metrics = _flutter_metrics(text)
-            else:
-                metrics = _text_metrics(text)
-        except (ET.ParseError, json.JSONDecodeError) as exc:
-            metrics = TestMetrics(
-                report_format=inferred,
-                report_valid=False,
-                failure_reason=f"Malformed test report: {exc}",
-            )
-        metrics.report_path = str(path)
+        else:
+            metrics = _parse_report(path, report_format)
 
     if metrics.executed is None or metrics.executed <= 0:
         metrics.report_valid = False

@@ -119,7 +119,8 @@
       "stacks": ["android"],
       "cacheable": false,
       "required_before_done": true,
-      "report_validation": "none"
+      "report_validation": "none",
+      "check_kind": "lint"
     },
     {
       "check_id": "android-compile",
@@ -129,7 +130,8 @@
       "stacks": ["android"],
       "cacheable": false,
       "required_before_done": true,
-      "report_validation": "none"
+      "report_validation": "none",
+      "check_kind": "build"
     },
     {
       "check_id": "android-unit",
@@ -139,7 +141,12 @@
       "stacks": ["android"],
       "cacheable": false,
       "required_before_done": true,
-      "report_validation": "none"
+      "report_path": ".",
+      "report_glob": "**/build/test-results/testDebugUnitTest/TEST-*.xml",
+      "report_validation": "none",
+      "check_kind": "test",
+      "report_format": "gradle-junit",
+      "require_test_execution": true
     },
     {
       "check_id": "android-e2e",
@@ -149,7 +156,12 @@
       "stacks": ["android"],
       "cacheable": false,
       "required_before_done": true,
-      "report_validation": "none"
+      "report_path": ".",
+      "report_glob": "**/build/outputs/androidTest-results/connected/**/TEST-*.xml",
+      "report_validation": "none",
+      "check_kind": "test",
+      "report_format": "android-junit",
+      "require_test_execution": true
     },
     {
       "check_id": "android-release-build",
@@ -159,7 +171,8 @@
       "stacks": ["android"],
       "cacheable": false,
       "required_before_done": true,
-      "report_validation": "none"
+      "report_validation": "none",
+      "check_kind": "build"
     }
   ],
   "check_cache_enabled": false,

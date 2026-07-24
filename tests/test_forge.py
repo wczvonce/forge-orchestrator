@@ -159,6 +159,28 @@ class StatusAndPromptTests(unittest.TestCase):
 
 
 class OrchestratorTests(unittest.TestCase):
+    def test_codex_output_schema_requires_every_declared_property(self):
+        objects_with_properties = []
+
+        def visit(value):
+            if isinstance(value, dict):
+                properties = value.get("properties")
+                if isinstance(properties, dict):
+                    objects_with_properties.append(value)
+                for item in value.values():
+                    visit(item)
+            elif isinstance(value, list):
+                for item in value:
+                    visit(item)
+
+        visit(forge.DECISION_SCHEMA)
+        self.assertTrue(objects_with_properties)
+        for schema_object in objects_with_properties:
+            self.assertEqual(
+                schema_object["required"],
+                list(schema_object["properties"]),
+            )
+
     def test_large_codex_prompt_is_passed_via_stdin(self):
         with tempfile.TemporaryDirectory() as temp:
             project = Path(temp)

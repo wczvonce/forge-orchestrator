@@ -2244,7 +2244,33 @@ def build_consistency_review_prompt(
     ).strip()
 
 
-DECISION_SCHEMA = Decision.model_json_schema()
+def normalize_codex_output_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Return a Codex-compatible strict JSON schema.
+
+    Codex structured outputs require every declared object property to appear
+    in that object's ``required`` array. Pydantic omits fields with defaults
+    from ``required`` even when their value schema already permits ``null``.
+    Requiring every declared property preserves the Pydantic value contract
+    while satisfying the stricter transport-level schema validator.
+    """
+    normalized = json.loads(json.dumps(schema))
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            properties = value.get("properties")
+            if isinstance(properties, dict):
+                value["required"] = list(properties)
+            for item in value.values():
+                visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    visit(normalized)
+    return normalized
+
+
+DECISION_SCHEMA = normalize_codex_output_schema(Decision.model_json_schema())
 
 
 def subscription_only_env() -> dict[str, str]:

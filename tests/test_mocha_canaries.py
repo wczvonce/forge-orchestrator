@@ -1,3 +1,4 @@
+import os
 import shutil
 import tempfile
 import time
@@ -99,10 +100,14 @@ class ModelFreeCanaryTests(unittest.TestCase):
             started_wall_time=time.time() - 0.2,
         )
 
-    def evaluate_report(self, relative, report_format):
+    def copy_report(self, relative):
         source = self.fixtures / relative
         destination = self.project / source.name
         destination.write_bytes(source.read_bytes())
+        return destination
+
+    def evaluate_report(self, relative, report_format):
+        destination = self.copy_report(relative)
         definition = adaptive.CheckDefinition(
             check_id=report_format,
             command="run model-free canary",
@@ -141,6 +146,32 @@ class ModelFreeCanaryTests(unittest.TestCase):
         )
         self.assertFalse(metrics.report_valid)
 
+    def test_vitest_zero_and_stale_canaries_block_gate(self):
+        zero = self.evaluate_report(
+            "typescript/vitest-zero.json", "vitest-json"
+        )
+        stale_path = self.copy_report("typescript/vitest-stale.json")
+        old = time.time() - 120
+        os.utime(stale_path, (old, old))
+        definition = adaptive.CheckDefinition(
+            check_id="vitest-stale",
+            command="run model-free stale canary",
+            check_kind="test",
+            require_test_execution=True,
+            report_path=stale_path.name,
+            report_format="vitest-json",
+        )
+        stale = evaluate_test_evidence(
+            self.project,
+            definition,
+            "",
+            started_wall_time=time.time(),
+        )
+        self.assertFalse(zero.report_valid)
+        self.assertIn("zero tests", zero.failure_reason)
+        self.assertFalse(stale.report_valid)
+        self.assertIn("stale", stale.failure_reason)
+
     def test_playwright_main_flow_canary(self):
         passing = self.evaluate_report(
             "playwright/main-flow-passing.json", "playwright-json"
@@ -150,6 +181,24 @@ class ModelFreeCanaryTests(unittest.TestCase):
         )
         self.assertTrue(passing.report_valid)
         self.assertFalse(failing.report_valid)
+
+    def test_playwright_skipped_and_flaky_canaries(self):
+        skipped = self.evaluate_report(
+            "playwright/main-flow-skipped.json", "playwright-json"
+        )
+        flaky = self.evaluate_report(
+            "playwright/main-flow-flaky.json", "playwright-json"
+        )
+        self.assertTrue(skipped.report_valid)
+        self.assertEqual(
+            (skipped.discovered, skipped.executed, skipped.skipped),
+            (3, 1, 2),
+        )
+        self.assertTrue(flaky.report_valid)
+        self.assertEqual(
+            (flaky.discovered, flaky.executed, flaky.passed),
+            (2, 2, 2),
+        )
 
     def test_android_multimodule_canary_passes_release_gate(self):
         source = self.fixtures / "android"

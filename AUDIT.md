@@ -35,7 +35,7 @@ Forge nebol spustený autonómne nad vlastnou inštaláciou.
    tajomstvá, deploy ani publish.
 9. Model-free canaries pokrývajú pytest, Vitest, Playwright a multi-module
    Android unit reporty. Instrumentation s emulátorom zostáva manuálne.
-10. Lokálna sada po implementácii obsahuje 186 testov a prešla bez reálnych
+10. Lokálna sada po implementácii obsahuje 188 testov a prešla bez reálnych
     Codex/Claude requestov. GitHub CI a presný nasadený `main` SHA sa overujú
     až v release postupe; tento odsek ich vopred netvrdí.
 

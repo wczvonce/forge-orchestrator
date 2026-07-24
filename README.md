@@ -289,7 +289,7 @@ python -m py_compile .\forge.py
 python -m unittest discover -s .\tests -v
 ```
 
-Testy používajú falošné Codex a Claude CLI procesy. Aktuálna sada obsahuje 186
+Testy používajú falošné Codex a Claude CLI procesy. Aktuálna sada obsahuje 188
 unit, integračných, bezpečnostných, reportových a canary scenárov.
 Multi-packet fake E2E simuluje odmietnutý economy model, bezpečný
 fallback, economy aj complex packet, reportované test counts, automatické

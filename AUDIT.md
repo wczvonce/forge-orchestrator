@@ -2,6 +2,43 @@
 
 Dátum auditu: 22. júl 2026
 
+## Check safety, Android reports a structured supervisor — 24. júl 2026
+
+Údržba vyšla z čistého `main` commit SHA
+`15342ee2be5c034e094b4291fbe7fc9f520a6c46`. Pred úpravou nebežal aktívny
+Forge run a vznikla úplná externá záloha 1 390 súborov so SHA-256 manifestom.
+Forge nebol spustený autonómne nad vlastnou inštaláciou.
+
+1. Schema 4 pridáva strict `ResultTermination`. Aktuálny supervisor používa
+   iba `stop_reason_code` a `automatic_resume_allowed`; ľudský text nemá vplyv
+   na routing. Schema 1–3 zostáva čitateľná v oddelenej legacy vetve.
+2. Android unit/instrumentation report directories bezpečne agregujú čerstvé
+   JUnit XML zo všetkých modulov. Stale, empty, zero-test, malformed, failed a
+   mimoprojektové/symlink reporty blokujú gate.
+3. Check child environment nemá SSH agent ani askpass kanály, používa prázdny
+   global Git config, zakázaný system config, non-interactive credentials a
+   vypnuté hooks. Drift `.git/config`, `.git/hooks` a `.gitmodules` blokuje gate.
+4. `unattended_requires_sandbox=true` je predvolené vo všetkých profiloch.
+   `run-chain` bez úspešného `srt --version` skončí pred prvým workerom.
+   Manuálny nesandboxovaný `run` ostáva možný iba s výrazným varovaním.
+5. Forge-owned `CheckContract` má kanonický hash, strict definitions, source,
+   stacky, timestamp, justification a indirect source hashes. npm scripts,
+   lockfiles, runner configy a Gradle build vstupy sa nedajú zmeniť potichu.
+   Hash sa prenáša v pláne aj continuation a pri resume sa overuje.
+6. Codex môže navrhnúť iba štruktúrovaný runner template; ľubovoľný shell
+   string nie je povoleným návrhom. Required check a test-execution požiadavka
+   sa nesmú oslabiť.
+7. Mocha adapter podporuje JSON aj textové passing/failing/pending. Nula testov
+   a malformed evidence zostávajú neplatné.
+8. GitHub Actions používajú immutable SHA pre checkout v5.0.1 a setup-python
+   v6.2.0; Dependabot sleduje GitHub Actions. Workflow nemá modelové/API volania,
+   tajomstvá, deploy ani publish.
+9. Model-free canaries pokrývajú pytest, Vitest, Playwright a multi-module
+   Android unit reporty. Instrumentation s emulátorom zostáva manuálne.
+10. Lokálna sada po implementácii obsahuje 186 testov a prešla bez reálnych
+    Codex/Claude requestov. GitHub CI a presný nasadený `main` SHA sa overujú
+    až v release postupe; tento odsek ich vopred netvrdí.
+
 ## Runtime routing, fallback a verification hardening — 24. júl 2026
 
 Údržba prebehla priamo maintainerom na izolovanej Git vetve; Forge nebol

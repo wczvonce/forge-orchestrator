@@ -621,6 +621,7 @@ DEFAULT_CONFIG = {
     "claude_bare_mode": False,
     "claude_safe_mode": True,
     "claude_strict_mcp": True,
+    "claude_outer_srt_on_wsl": True,
     "claude_tools": "Bash,Read,Edit,Write,Glob,Grep",
     "security_profile": "balanced",
     "final_review_after_last_worker": True,
@@ -1719,8 +1720,7 @@ def check_contract_runtime_error(
 
 def build_srt_settings(project: Path, config: dict) -> Path:
     home = str(Path.home().resolve())
-    temp_dir = project / ".forge" / "check-tmp"
-    temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_dir = project_runtime_temp_dir(project, "checks")
     allowed_domains = [
         str(x).strip() for x in config.get("check_network_domains", []) if str(x).strip()
     ]
@@ -1786,7 +1786,7 @@ def build_check_environment(project: Path) -> dict[str, str]:
     """Build a secret-scrubbed, non-interactive environment for project checks."""
     env = subscription_only_env()
     check_home = project / ".forge" / "check-home"
-    check_tmp = project / ".forge" / "check-tmp"
+    check_tmp = project_runtime_temp_dir(project, "checks")
     disabled_hooks = project / ".forge" / "git-hooks-disabled"
     check_home.mkdir(parents=True, exist_ok=True)
     check_tmp.mkdir(parents=True, exist_ok=True)
@@ -2298,6 +2298,67 @@ def subscription_only_env() -> dict[str, str]:
     return env
 
 
+def running_in_wsl() -> bool:
+    """Return whether Forge is executing inside WSL rather than native Linux."""
+    if os.name != "posix":
+        return False
+    if os.getenv("WSL_DISTRO_NAME"):
+        return True
+    try:
+        return "microsoft" in platform.release().lower()
+    except OSError:
+        return False
+
+
+def project_runtime_temp_dir(project: Path, purpose: str) -> Path:
+    """Return a private runtime directory on a socket-capable filesystem.
+
+    DrvFS paths below /mnt/* do not support the Unix sockets used by Sandbox
+    Runtime and Claude Code. Keep durable run state in the project while placing
+    only disposable transport files on native WSL storage.
+    """
+    safe_purpose = re.sub(r"[^A-Za-z0-9_.-]+", "-", purpose).strip("-") or "runtime"
+    project_key = hashlib.sha256(str(project.resolve()).encode("utf-8")).hexdigest()[:16]
+    if running_in_wsl():
+        root = Path("/tmp") / "gpt-claude-forge"
+    elif os.name == "nt":
+        root = project / ".forge" / "runtime-tmp"
+    else:
+        root = Path(tempfile.gettempdir()) / "gpt-claude-forge"
+    path = root / project_key / safe_purpose
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name == "posix":
+        path.chmod(0o700)
+    return path
+
+
+def claude_subprocess_env(project: Path) -> dict[str, str]:
+    """Build the scrubbed Claude environment with WSL-safe runtime paths."""
+    env = subscription_only_env()
+    if not running_in_wsl():
+        return env
+
+    runtime_dir = project_runtime_temp_dir(project, "claude")
+    env.update(
+        {
+            "TMPDIR": str(runtime_dir),
+            "TEMP": str(runtime_dir),
+            "TMP": str(runtime_dir),
+        }
+    )
+    return env
+
+
+def use_outer_claude_srt(config: dict) -> bool:
+    """Use one OS sandbox around Claude on WSL to avoid nested-bwrap defects."""
+    return (
+        running_in_wsl()
+        and bool(config.get("claude_outer_srt_on_wsl", True))
+        and str(config.get("security_profile", "")).lower() == "strict"
+        and shutil.which("srt") is not None
+    )
+
+
 def codex_auth_status() -> tuple[bool, str]:
     codex = find_cli("codex")
     if not codex:
@@ -2574,35 +2635,118 @@ def build_claude_settings(project: Path, config: dict) -> Path:
         "Bash(npm publish *)", "Bash(pnpm publish *)", "Bash(yarn npm publish *)",
         "Bash(docker push *)", "Bash(kubectl *)", "Bash(terraform apply *)",
         "Bash(terraform destroy *)", "Bash(aws *)", "Bash(az *)", "Bash(gcloud *)",
+        "Read(~/.claude/.credentials.json)", "Edit(~/.claude/.credentials.json)",
+        "Write(~/.claude/.credentials.json)",
     ]
+    if use_outer_claude_srt(config):
+        deny.extend(
+            [
+                "Read(~/.claude/**)",
+                "Edit(~/.claude/**)",
+                "Write(~/.claude/**)",
+            ]
+        )
     payload: dict = {"permissions": {"deny": deny}}
     is_native_windows = os.name == "nt" and not os.getenv("WSL_DISTRO_NAME")
     if not is_native_windows:
-        payload["sandbox"] = {
-            "enabled": True,
-            "failIfUnavailable": config.get("security_profile") == "strict",
-            "allowUnsandboxedCommands": False,
-            "credentials": {
-                "files": [
-                    {"path": "~/.ssh", "mode": "deny"},
-                    {"path": "~/.aws", "mode": "deny"},
-                    {"path": "~/.kube", "mode": "deny"},
-                ],
-                "envVars": [
-                    {"name": name, "mode": "deny"}
-                    for name in ["GITHUB_TOKEN", "GH_TOKEN", "NPM_TOKEN", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"]
-                ],
-            },
-            "network": {
-                "allowedDomains": [
-                    "api.anthropic.com", "claude.ai", "*.claude.ai",
-                    "github.com", "*.github.com", "registry.npmjs.org", "*.npmjs.org",
-                    "pypi.org", "files.pythonhosted.org", "crates.io", "index.crates.io",
-                    "proxy.golang.org", "sum.golang.org",
-                ]
-            },
-        }
+        if use_outer_claude_srt(config):
+            payload["sandbox"] = {"enabled": False}
+        else:
+            payload["sandbox"] = {
+                "enabled": True,
+                "failIfUnavailable": config.get("security_profile") == "strict",
+                "allowUnsandboxedCommands": False,
+                "credentials": {
+                    "files": [
+                        {"path": "~/.ssh", "mode": "deny"},
+                        {"path": "~/.aws", "mode": "deny"},
+                        {"path": "~/.kube", "mode": "deny"},
+                    ],
+                    "envVars": [
+                        {"name": name, "mode": "deny"}
+                        for name in ["GITHUB_TOKEN", "GH_TOKEN", "NPM_TOKEN", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"]
+                    ],
+                },
+                "network": {
+                    "allowedDomains": [
+                        "api.anthropic.com", "claude.ai", "*.claude.ai",
+                        "github.com", "*.github.com", "registry.npmjs.org", "*.npmjs.org",
+                        "pypi.org", "files.pythonhosted.org", "crates.io", "index.crates.io",
+                        "proxy.golang.org", "sum.golang.org",
+                    ]
+                },
+            }
     path = project / ".forge" / "claude-settings.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def build_claude_srt_settings(project: Path, config: dict) -> Path:
+    """Create the WSL outer-sandbox policy for the whole Claude worker."""
+    home = Path.home().resolve()
+    runtime_dir = project_runtime_temp_dir(project, "claude")
+    runtime_credential = home / ".claude" / ".credentials.json"
+    claude_state_writes = [
+        home / ".claude" / "session-env",
+        home / ".claude" / "backups",
+        home / ".claude" / "sessions",
+        home / ".claude" / "shell-snapshots",
+        home / ".claude" / ".last-cleanup",
+    ]
+    claude_temp_dirs = [Path("/tmp/claude"), Path(f"/tmp/claude-{getattr(os, 'getuid', lambda: 1000)()}")]
+    if os.name == "posix":
+        for temp_dir in claude_temp_dirs:
+            temp_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            temp_dir.chmod(0o700)
+    payload = {
+        "network": {
+            "allowedDomains": [
+                "api.anthropic.com", "claude.ai", "*.claude.ai",
+                "github.com", "*.github.com", "registry.npmjs.org", "*.npmjs.org",
+                "pypi.org", "files.pythonhosted.org", "crates.io", "index.crates.io",
+                "proxy.golang.org", "sum.golang.org",
+            ],
+            "deniedDomains": [],
+            "strictAllowlist": True,
+            "allowLocalBinding": True,
+            "tlsTerminate": {},
+        },
+        "filesystem": {
+            "denyRead": [
+                str(home / ".ssh"),
+                str(home / ".aws"),
+                str(home / ".kube"),
+                str(home / ".config" / "gcloud"),
+                str(home / ".claude"),
+                str(home / ".codex"),
+                "/mnt/c/Users",
+            ],
+            "allowRead": [".", str(runtime_credential)],
+            "allowWrite": [
+                ".", str(runtime_dir),
+                *(str(path) for path in claude_temp_dirs),
+                *(str(path) for path in claude_state_writes),
+            ],
+            "denyWrite": [
+                ".env", ".git/config", ".git/hooks", str(runtime_credential),
+            ],
+        },
+        "credentials": {
+            "files": [
+                {
+                    "path": str(runtime_credential),
+                    "mode": "mask",
+                    "extract": r'"(?:accessToken|refreshToken)"\s*:\s*"([^"]+)"',
+                    "onExtractNoMatch": "error",
+                    "injectHosts": [
+                        "api.anthropic.com", "claude.ai", "*.claude.ai",
+                    ],
+                }
+            ]
+        },
+    }
+    path = project / ".forge" / "claude-srt-settings.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
@@ -2722,6 +2866,7 @@ def run_claude(
         "--append-system-prompt", WORKER_BOUNDARIES,
         "--settings", str(settings_path),
         "--tools", str(config.get("claude_tools") or "Bash,Read,Edit,Write,Glob,Grep"),
+        "--allowedTools", str(config.get("claude_tools") or "Bash,Read,Edit,Write,Glob,Grep"),
         "--output-format", "stream-json",
         "--verbose",
         "--include-partial-messages",
@@ -2735,6 +2880,15 @@ def run_claude(
         cmd.extend(["--model", selected_model])
     if config.get("claude_supports_effort", True) and selected_effort:
         cmd.extend(["--effort", selected_effort])
+    if use_outer_claude_srt(config):
+        srt = shutil.which("srt")
+        if not srt:
+            raise RuntimeError("Strict WSL Claude sandbox vyžaduje dostupný príkaz srt.")
+        srt_settings = build_claude_srt_settings(project, config)
+        cmd = [
+            srt, "--settings", str(srt_settings), "--",
+            "/usr/bin/env", "-u", "SANDBOX_RUNTIME", *cmd,
+        ]
     started = time.monotonic()
     timeout_seconds = int(
         effective_timeout_override or config["claude_timeout_seconds"]
@@ -2750,6 +2904,13 @@ def run_claude(
         processor = ClaudeStreamProcessor(raw_handle, live_handle, status)
         # The prompt remains on stdin because --tools accepts a variable number
         # of values and could consume a trailing positional prompt.
+        outer_srt = use_outer_claude_srt(config)
+        worker_env = claude_subprocess_env(project)
+        if outer_srt:
+            # Forge already scrubbed provider/API secrets and SRT masks the
+            # OAuth file. Disable Claude's subprocess-host heuristic so the
+            # deliberately disabled nested sandbox is not forced back on.
+            worker_env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] = "0"
         process = subprocess.Popen(
             cmd,
             cwd=str(project),
@@ -2760,7 +2921,7 @@ def run_claude(
             encoding="utf-8",
             errors="replace",
             bufsize=1,
-            env=subscription_only_env(),
+            env=worker_env,
             creationflags=(
                 subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
             ),
@@ -2823,7 +2984,6 @@ def run_claude(
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 _terminate_process(process)
-
         duration = time.monotonic() - started
         raw_output = truncate(
             processor.combined_output(), int(config.get("max_worker_raw_chars", 60000))

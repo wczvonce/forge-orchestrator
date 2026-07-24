@@ -563,6 +563,7 @@ function Assert-ResumeEligibility {
     "model_calls_made",
     "supervisor_config_enforced",
     "post_worker_decision_recovery_eligible",
+    "recovery_attempt_budget_normalization_eligible",
     "bounded_packet_recovery_eligible",
     "budget_tranche_extension_eligible"
   )) {
@@ -577,6 +578,7 @@ function Assert-ResumeEligibility {
     -not (Test-JsonBoolean $Eligibility.state_mutated) -or
     -not (Test-JsonBoolean $Eligibility.supervisor_config_enforced) -or
     -not (Test-JsonBoolean $Eligibility.post_worker_decision_recovery_eligible) -or
+    -not (Test-JsonBoolean $Eligibility.recovery_attempt_budget_normalization_eligible) -or
     -not (Test-JsonBoolean $Eligibility.bounded_packet_recovery_eligible) -or
     -not (Test-JsonBoolean $Eligibility.budget_tranche_extension_eligible)
   ) {
@@ -609,6 +611,7 @@ function Assert-ResumeEligibility {
     "bounded_final_review_recovery",
     "extend_chain_budget_one_tranche",
     "validated_post_worker_decision_recovery",
+    "validated_recovery_attempt_budget_normalization",
     "validated_exact_resume"
   )
   if (
@@ -623,12 +626,22 @@ function Assert-ResumeEligibility {
   if (
     [string]$Eligibility.source_stop_reason_code -eq "packet_attempts_exhausted" -and
     (
-      [string]$Eligibility.action -ne "bounded_final_review_recovery" -or
-      -not (Test-JsonBoolean $Eligibility.bounded_packet_recovery_eligible) -or
-      $Eligibility.bounded_packet_recovery_eligible -ne $true
+      -not (
+        (
+          [string]$Eligibility.action -eq "bounded_final_review_recovery" -and
+          $Eligibility.bounded_packet_recovery_eligible -eq $true -and
+          $Eligibility.recovery_attempt_budget_normalization_eligible -eq $false
+        ) -or
+        (
+          [string]$Eligibility.action -eq "validated_recovery_attempt_budget_normalization" -and
+          $Eligibility.bounded_packet_recovery_eligible -eq $false -and
+          $Eligibility.recovery_attempt_budget_normalization_eligible -eq $true -and
+          $RequestedRunId -ne "latest"
+        )
+      )
     )
   ) {
-    throw "Packet-attempt resume nema platnu jednorazovu final-review recovery autorizaciu."
+    throw "Packet-attempt resume nema platnu bounded recovery alebo presnu recovery-attempt normalizaciu."
   }
   if (
     [string]$Eligibility.source_stop_reason_code -eq "chain_budget_exhausted" -and
@@ -646,6 +659,7 @@ function Assert-ResumeEligibility {
       [string]$Eligibility.action -ne "validated_post_worker_decision_recovery" -or
       $Eligibility.source_automatic_resume_allowed -ne $false -or
       $Eligibility.post_worker_decision_recovery_eligible -ne $true -or
+      $Eligibility.recovery_attempt_budget_normalization_eligible -ne $false -or
       $Eligibility.bounded_packet_recovery_eligible -ne $false -or
       $Eligibility.budget_tranche_extension_eligible -ne $false -or
       [string]::IsNullOrWhiteSpace($ExpectedDecisionRecoverySha256) -or
@@ -662,9 +676,30 @@ function Assert-ResumeEligibility {
     throw "Non-recovery resume nesmie niest post-worker decision recovery autorizaciu."
   }
   if (
+    [string]$Eligibility.action -ne "validated_recovery_attempt_budget_normalization" -and
+    $Eligibility.recovery_attempt_budget_normalization_eligible -ne $false
+  ) {
+    throw "Ina resume akcia nesmie niest recovery-attempt budget normalization autorizaciu."
+  }
+  if (
+    [string]$Eligibility.action -eq "validated_recovery_attempt_budget_normalization" -and
+    (
+      $Eligibility.recovery_attempt_budget_normalization_eligible -ne $true -or
+      $Eligibility.post_worker_decision_recovery_eligible -ne $false -or
+      $Eligibility.bounded_packet_recovery_eligible -ne $false -or
+      $Eligibility.budget_tranche_extension_eligible -ne $false -or
+      $Eligibility.source_automatic_resume_allowed -ne $false -or
+      $RequestedRunId -eq "latest" -or
+      $null -eq $Eligibility.recovery_attempt_budget_normalization
+    )
+  ) {
+    throw "Recovery-attempt budget normalization nema platnu presnu jednorazovu autorizaciu."
+  }
+  if (
     [string]$Eligibility.action -eq "bounded_final_review_recovery" -and
     (
       $Eligibility.bounded_packet_recovery_eligible -ne $true -or
+      $Eligibility.recovery_attempt_budget_normalization_eligible -ne $false -or
       $Eligibility.budget_tranche_extension_eligible -ne $false
     )
   ) {
@@ -674,6 +709,7 @@ function Assert-ResumeEligibility {
     [string]$Eligibility.action -eq "extend_chain_budget_one_tranche" -and
     (
       $Eligibility.bounded_packet_recovery_eligible -ne $false -or
+      $Eligibility.recovery_attempt_budget_normalization_eligible -ne $false -or
       $Eligibility.budget_tranche_extension_eligible -ne $true
     )
   ) {
@@ -683,6 +719,7 @@ function Assert-ResumeEligibility {
     [string]$Eligibility.action -eq "validated_exact_resume" -and
     (
       $Eligibility.bounded_packet_recovery_eligible -ne $false -or
+      $Eligibility.recovery_attempt_budget_normalization_eligible -ne $false -or
       $Eligibility.budget_tranche_extension_eligible -ne $false
     )
   ) {

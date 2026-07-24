@@ -1945,6 +1945,9 @@ def load_verified_adaptive_resume_state(
 POST_WORKER_DECISION_RECOVERY_ACTION = (
     "validated_post_worker_decision_recovery"
 )
+RECOVERY_ATTEMPT_BUDGET_NORMALIZATION_ACTION = (
+    "validated_recovery_attempt_budget_normalization"
+)
 MAX_PROJECT_WORK_PACKETS = 12
 
 
@@ -2066,6 +2069,75 @@ def _mark_decision_recovery_child_started(
     updated["child_run_id"] = _safe_run_id(child_run_id)
     atomic_json(
         _decision_recovery_journal_path(project, source_run_id),
+        updated,
+    )
+
+
+def _recovery_attempt_budget_normalization_journal_path(
+    project: Path, source_run_id: str
+) -> Path:
+    return (
+        project
+        / ".forge"
+        / "recovery-attempt-budget-normalization-journals"
+        / f"{_safe_run_id(source_run_id)}.json"
+    )
+
+
+def _load_recovery_attempt_budget_normalization_journal(
+    project: Path, source_run_id: str
+) -> dict[str, Any] | None:
+    path = _recovery_attempt_budget_normalization_journal_path(
+        project, source_run_id
+    )
+    parent = path.parent
+    if not parent.exists():
+        return None
+    if not parent.is_dir() or parent.is_symlink():
+        raise RuntimeError(
+            "Recovery-attempt normalization journal directory is not a direct "
+            "Forge-owned directory."
+        )
+    if not path.exists():
+        return None
+    if (
+        not path.is_file()
+        or path.is_symlink()
+        or path.resolve().parent != parent.resolve()
+    ):
+        raise RuntimeError(
+            "Recovery-attempt normalization journal is not a direct Forge-owned "
+            "regular file."
+        )
+    return load_json_object(
+        path, "Recovery-attempt normalization journal"
+    )
+
+
+def _mark_recovery_attempt_budget_normalization_child_started(
+    project: Path,
+    source_run_id: str,
+    child_run_id: str,
+) -> None:
+    journal = _load_recovery_attempt_budget_normalization_journal(
+        project, source_run_id
+    )
+    if (
+        journal is None
+        or journal.get("phase") != "prepared"
+        or journal.get("child_run_id") is not None
+    ):
+        raise RuntimeError(
+            "Recovery-attempt normalization journal cannot authorize another "
+            "child run."
+        )
+    updated = dict(journal)
+    updated["phase"] = "child_started"
+    updated["child_run_id"] = _safe_run_id(child_run_id)
+    atomic_json(
+        _recovery_attempt_budget_normalization_journal_path(
+            project, source_run_id
+        ),
         updated,
     )
 
@@ -3060,6 +3132,931 @@ def _load_post_worker_decision_recovery_context(
     }
 
 
+def _direct_run_artifact(
+    run_directory: Path,
+    relative_name: str,
+    label: str,
+) -> Path:
+    path = run_directory / relative_name
+    if (
+        not path.is_file()
+        or path.is_symlink()
+        or path.resolve().parent != path.parent.resolve()
+        or not _path_inside(path, run_directory)
+    ):
+        raise RuntimeError(
+            f"{label} is not a direct immutable run-scoped regular file."
+        )
+    return path
+
+
+def _load_recovery_attempt_budget_normalization_context(
+    project: Path,
+    source_directory: Path,
+    source_run: dict[str, Any],
+    source_result: dict[str, Any],
+    continuation: ContinuationPayload,
+    *,
+    source_run_id: str,
+    goal: str,
+    merged_config: dict[str, Any],
+    source_config_hash: str | None,
+    resume_kind: ResumeKind,
+    requested_latest: bool,
+) -> dict[str, Any] | None:
+    """Validate the one historical one-shot replacement defect, if present."""
+
+    legacy_source_id = source_result.get("parent_run_id")
+    if (
+        not isinstance(legacy_source_id, str)
+        or not legacy_source_id.strip()
+    ):
+        return None
+    legacy_source_id = _safe_run_id(legacy_source_id)
+    legacy_journal = _load_decision_recovery_journal(
+        project, legacy_source_id
+    )
+    if legacy_journal is None:
+        return None
+
+    active_packet_id = continuation.active_packet_id
+    journal_child_id = legacy_journal.get("child_run_id")
+    journal_packet_id = legacy_journal.get("replacement_packet_id")
+    candidate = (
+        journal_child_id == source_run_id
+        or (
+            journal_packet_id == active_packet_id
+            and legacy_journal.get("phase") == "child_started"
+        )
+    )
+    if not candidate:
+        return None
+    if (
+        legacy_journal.get("schema_version") != SCHEMA_VERSION
+        or legacy_journal.get("action")
+        != POST_WORKER_DECISION_RECOVERY_ACTION
+        or legacy_journal.get("phase") != "child_started"
+        or journal_child_id != source_run_id
+    ):
+        raise RuntimeError(
+            "Decision-recovery journal cannot authenticate this exact source "
+            "child."
+        )
+    try:
+        candidate_target = ProjectPlan.model_validate(
+            legacy_journal["target_plan"]
+        )
+        candidate_packet = next(
+            packet
+            for packet in candidate_target.work_packets
+            if packet.packet_id == journal_packet_id
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Decision-recovery child journal has an invalid target packet."
+        ) from exc
+    candidate_maximum = int(
+        merged_config.get("max_packet_attempts", 3)
+    )
+    legacy_signature = (
+        candidate_packet.attempts == candidate_maximum
+        and candidate_packet.final_review_recovery_authorized
+        and not candidate_packet.final_review_recovery_used
+    )
+    current_signature = (
+        candidate_packet.attempts == 0
+        and not candidate_packet.final_review_recovery_authorized
+        and not candidate_packet.final_review_recovery_used
+    )
+    if current_signature:
+        # New decision-recovery packets already receive the normal bounded
+        # budget. They must use the ordinary packet recovery policy, never this
+        # compatibility migration.
+        return None
+    if not legacy_signature:
+        raise RuntimeError(
+            "Decision-recovery child journal matches neither the historical "
+            "one-shot target nor the current normal-budget target."
+        )
+    if requested_latest:
+        raise RuntimeError(
+            "Recovery-attempt budget normalization requires an exact source "
+            "run ID; 'latest' is forbidden."
+        )
+    if resume_kind != "explicit_human":
+        raise RuntimeError(
+            "Recovery-attempt budget normalization is allowed only through an "
+            "explicit human supervised resume."
+        )
+    if (
+        int(source_result.get("schema_version") or 0) != SCHEMA_VERSION
+        or continuation.schema_version != SCHEMA_VERSION
+        or source_result.get("final_status") != "needs_continuation"
+        or source_result.get("stop_reason_code")
+        != "packet_attempts_exhausted"
+        or source_result.get("automatic_resume_allowed") is not False
+    ):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization requires the exact schema-4 "
+            "packet_attempts_exhausted termination."
+        )
+    if (
+        source_run.get("run_id") != source_run_id
+        or source_run.get("parent_run_id") != legacy_source_id
+        or source_result.get("parent_run_id") != legacy_source_id
+        or source_run.get("continuation_chain_id")
+        != continuation.continuation_chain_id
+        or source_result.get("continuation_chain_id")
+        != continuation.continuation_chain_id
+    ):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization source lineage is "
+            "inconsistent."
+        )
+    if not bool(merged_config.get("adaptive_orchestration", False)):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization requires adaptive "
+            "orchestration."
+        )
+    if not isinstance(source_config_hash, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", source_config_hash
+    ):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization requires a canonical source "
+            "config snapshot."
+        )
+    maximum_attempts = int(merged_config.get("max_packet_attempts", 3))
+    if maximum_attempts < 2:
+        raise RuntimeError(
+            "Recovery-attempt budget normalization requires at least two normal "
+            "packet attempts."
+        )
+
+    expected_legacy_journal_fields = {
+        "schema_version",
+        "action",
+        "source_run_id",
+        "source_packet_id",
+        "replacement_packet_id",
+        "raw_decision_sha256",
+        "source_plan_hash",
+        "source_contract_hash",
+        "source_repository_fingerprint",
+        "source_config_hash",
+        "prepared_by_run_id",
+        "created_at",
+        "phase",
+        "child_run_id",
+        "target_plan_hash",
+        "target_plan",
+    }
+    if set(legacy_journal) != expected_legacy_journal_fields:
+        raise RuntimeError(
+            "Legacy decision-recovery journal fields are incomplete or "
+            "unexpected."
+        )
+    if (
+        legacy_journal.get("schema_version") != SCHEMA_VERSION
+        or legacy_journal.get("action")
+        != POST_WORKER_DECISION_RECOVERY_ACTION
+        or legacy_journal.get("source_run_id") != legacy_source_id
+        or legacy_journal.get("phase") != "child_started"
+        or legacy_journal.get("child_run_id") != source_run_id
+        or legacy_journal.get("prepared_by_run_id") != source_run_id
+        or not isinstance(legacy_journal.get("created_at"), str)
+        or not str(legacy_journal.get("created_at")).strip()
+        or legacy_journal.get("source_config_hash")
+        != source_config_hash
+    ):
+        raise RuntimeError(
+            "Legacy decision-recovery journal does not authorize this exact "
+            "source child."
+        )
+    replacement_packet_id = _safe_run_id(
+        str(legacy_journal.get("replacement_packet_id") or "")
+    )
+    if active_packet_id != replacement_packet_id:
+        raise RuntimeError(
+            "Recovery-attempt budget normalization active packet does not match "
+            "the legacy recovery journal."
+        )
+
+    try:
+        legacy_target = ProjectPlan.model_validate(
+            legacy_journal["target_plan"]
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Legacy decision-recovery target plan is invalid."
+        ) from exc
+    legacy_target_hash = plan_hash(legacy_target)
+    if (
+        legacy_journal.get("target_plan_hash") != legacy_target_hash
+        or not re.fullmatch(r"[0-9a-f]{64}", legacy_target_hash)
+        or legacy_target.active_packet_id != replacement_packet_id
+    ):
+        raise RuntimeError(
+            "Legacy decision-recovery target plan hash or packet identity is "
+            "invalid."
+        )
+    legacy_target_packet = active_plan_packet(legacy_target)
+    if (
+        legacy_target_packet is None
+        or legacy_target_packet.status not in {"in_progress", "verification"}
+        or legacy_target_packet.attempts != maximum_attempts
+        or not legacy_target_packet.final_review_recovery_authorized
+        or legacy_target_packet.final_review_recovery_used
+    ):
+        raise RuntimeError(
+            "Legacy decision-recovery target is not the exact max-attempt "
+            "one-shot packet."
+        )
+
+    runs_directory = (project / ".forge" / "runs").resolve()
+    if (
+        source_directory.is_symlink()
+        or source_directory.resolve().parent != runs_directory
+    ):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization source run is not a direct "
+            "run-scoped directory."
+        )
+    source_plan_path = _direct_run_artifact(
+        source_directory,
+        "project-plan.result.json",
+        "Source result plan snapshot",
+    )
+    initial_plan_path = _direct_run_artifact(
+        source_directory,
+        "project-plan.initial.json",
+        "Source initial plan snapshot",
+    )
+    pre_worker_plan_path = _direct_run_artifact(
+        source_directory,
+        "project-plan.pre-worker-01.json",
+        "Source pre-worker plan snapshot",
+    )
+    recovery_record_path = _direct_run_artifact(
+        source_directory,
+        "decision-recovery.json",
+        "Source decision-recovery record",
+    )
+    contract_snapshot_path = _direct_run_artifact(
+        source_directory,
+        "check-contract.snapshot.json",
+        "Source check-contract snapshot",
+    )
+    telemetry_path = _direct_run_artifact(
+        source_directory,
+        "telemetry.json",
+        "Source telemetry",
+    )
+    try:
+        source_plan = ProjectPlan.model_validate_json(
+            source_plan_path.read_text(encoding="utf-8")
+        )
+        initial_plan = ProjectPlan.model_validate_json(
+            initial_plan_path.read_text(encoding="utf-8")
+        )
+        pre_worker_plan = ProjectPlan.model_validate_json(
+            pre_worker_plan_path.read_text(encoding="utf-8")
+        )
+        recovery_record = load_json_object(
+            recovery_record_path, "Source decision-recovery record"
+        )
+        source_contract_snapshot = CheckContract.model_validate_json(
+            contract_snapshot_path.read_text(encoding="utf-8")
+        )
+        telemetry = load_json_object(telemetry_path, "Source telemetry")
+    except Exception as exc:
+        raise RuntimeError(
+            "Recovery-attempt budget normalization source artifacts are invalid."
+        ) from exc
+
+    source_plan_hash = plan_hash(source_plan)
+    required_identity = {
+        "project_id": continuation.project_id,
+        "plan_id": continuation.plan_id,
+        "plan_hash": continuation.plan_hash,
+        "check_contract_hash": continuation.check_contract_hash,
+    }
+    if any(
+        not isinstance(value, str) or not value
+        for value in required_identity.values()
+    ):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization continuation identity is "
+            "incomplete."
+        )
+    identity = stable_project_identity(project, create_if_missing=False)
+    expected_goal_hash = hashlib.sha256(goal.encode("utf-8")).hexdigest()
+    if (
+        continuation.project_id != identity["project_id"]
+        or source_plan.project_id != identity["project_id"]
+        or source_plan.plan_id != continuation.plan_id
+        or source_plan.goal_hash != expected_goal_hash
+        or source_plan_hash != continuation.plan_hash
+        or source_result.get("plan_hash") != source_plan_hash
+        or source_result.get("project_id") != continuation.project_id
+        or source_result.get("plan_id") != continuation.plan_id
+        or source_result.get("active_packet_id") != replacement_packet_id
+        or source_plan.active_packet_id != replacement_packet_id
+    ):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization source plan identity changed."
+        )
+    source_packet = active_plan_packet(source_plan)
+    if (
+        source_packet is None
+        or source_packet.status not in {"in_progress", "verification"}
+        or source_packet.attempts != maximum_attempts + 1
+        or source_packet.final_review_recovery_authorized
+        or not source_packet.final_review_recovery_used
+    ):
+        raise RuntimeError(
+            "Source result packet is not the exact consumed legacy one-shot "
+            "state."
+        )
+    if (
+        initial_plan.model_dump(mode="json")
+        != legacy_target.model_dump(mode="json")
+    ):
+        raise RuntimeError(
+            "Source child initial plan is not the exact legacy journal target."
+        )
+    expected_pre_worker = ProjectPlan.model_validate(
+        legacy_target.model_dump(mode="json")
+    )
+    expected_pre_worker.updated_at = pre_worker_plan.updated_at
+    expected_pre_worker.last_validated_at = pre_worker_plan.last_validated_at
+    pre_worker_packet = active_plan_packet(expected_pre_worker)
+    assert pre_worker_packet is not None
+    pre_worker_packet.attempts = maximum_attempts + 1
+    pre_worker_packet.final_review_recovery_authorized = False
+    pre_worker_packet.final_review_recovery_used = True
+    expected_pre_worker = ProjectPlan.model_validate(
+        expected_pre_worker.model_dump(mode="json")
+    )
+    if (
+        pre_worker_plan.model_dump(mode="json")
+        != expected_pre_worker.model_dump(mode="json")
+    ):
+        raise RuntimeError(
+            "Source child does not contain exactly one consumed legacy "
+            "pre-worker transition."
+        )
+
+    expected_recovery_record_fields = {
+        "action",
+        "source_run_id",
+        "source_packet_id",
+        "replacement_packet_id",
+        "raw_decision_file",
+        "raw_decision_sha256",
+        "raw_decision_iteration",
+        "source_plan_hash",
+        "source_contract_hash",
+        "source_repository_fingerprint",
+        "normalized_decision",
+        "journal_state",
+        "journal_target_plan_hash",
+        "recovered_plan_hash",
+        "source_packet_attempts_preserved",
+        "replacement_packet_attempts_at_replan",
+        "replacement_recovery_authorized_at_replan",
+        "replacement_recovery_used_at_replan",
+    }
+    if (
+        set(recovery_record) != expected_recovery_record_fields
+        or recovery_record.get("action")
+        != POST_WORKER_DECISION_RECOVERY_ACTION
+        or recovery_record.get("source_run_id") != legacy_source_id
+        or recovery_record.get("source_packet_id")
+        != legacy_journal.get("source_packet_id")
+        or recovery_record.get("replacement_packet_id")
+        != replacement_packet_id
+        or recovery_record.get("raw_decision_sha256")
+        != legacy_journal.get("raw_decision_sha256")
+        or recovery_record.get("source_plan_hash")
+        != legacy_journal.get("source_plan_hash")
+        or recovery_record.get("source_contract_hash")
+        != legacy_journal.get("source_contract_hash")
+        or recovery_record.get("source_repository_fingerprint")
+        != legacy_journal.get("source_repository_fingerprint")
+        or recovery_record.get("journal_state") != "target_applied"
+        or recovery_record.get("journal_target_plan_hash")
+        != legacy_target_hash
+        or recovery_record.get("recovered_plan_hash")
+        != legacy_target_hash
+        or recovery_record.get("source_packet_attempts_preserved") is not True
+        or recovery_record.get("replacement_packet_attempts_at_replan")
+        != maximum_attempts
+        or recovery_record.get(
+            "replacement_recovery_authorized_at_replan"
+        )
+        is not True
+        or recovery_record.get("replacement_recovery_used_at_replan")
+        is not False
+    ):
+        raise RuntimeError(
+            "Source child decision-recovery record is not the exact legacy "
+            "one-shot provenance."
+        )
+    run_resume = source_run.get("resume")
+    run_recovery = (
+        run_resume.get("post_worker_decision_recovery")
+        if isinstance(run_resume, dict)
+        else None
+    )
+    if (
+        not isinstance(run_recovery, dict)
+        or run_resume.get("source_run_id") != legacy_source_id
+        or run_resume.get("source_config_hash") != source_config_hash
+        or run_recovery
+        != {
+            "action": POST_WORKER_DECISION_RECOVERY_ACTION,
+            "source_packet_id": legacy_journal.get("source_packet_id"),
+            "replacement_packet_id": replacement_packet_id,
+            "raw_decision_sha256": legacy_journal.get(
+                "raw_decision_sha256"
+            ),
+        }
+    ):
+        raise RuntimeError(
+            "Source child run metadata does not match the legacy recovery "
+            "journal."
+        )
+
+    contract_path = project / ".forge" / "check-contract.json"
+    plan_path = project / ".forge" / "project-plan.json"
+    if (
+        not contract_path.is_file()
+        or contract_path.is_symlink()
+        or not plan_path.is_file()
+        or plan_path.is_symlink()
+    ):
+        raise RuntimeError(
+            "Persistent plan or Forge-owned check contract is unsafe."
+        )
+    try:
+        current_contract = CheckContract.model_validate_json(
+            contract_path.read_text(encoding="utf-8")
+        )
+        current_plan = ProjectPlan.model_validate_json(
+            plan_path.read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Persistent recovery-attempt normalization state is invalid."
+        ) from exc
+    if (
+        source_contract_snapshot.model_dump(mode="json")
+        != current_contract.model_dump(mode="json")
+        or current_contract.contract_hash
+        != continuation.check_contract_hash
+        or source_result.get("check_contract_hash")
+        != current_contract.contract_hash
+        or source_plan.check_contract_hash != current_contract.contract_hash
+        or legacy_target.check_contract_hash != current_contract.contract_hash
+        or legacy_journal.get("source_contract_hash")
+        != current_contract.contract_hash
+    ):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization check-contract identity "
+            "changed."
+        )
+
+    raw_checks = source_result.get("checks")
+    if (
+        source_result.get("checks_passed") is not True
+        or not isinstance(raw_checks, list)
+    ):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization requires persisted green "
+            "checks."
+        )
+    try:
+        source_checks = [
+            CheckResult.model_validate(item) for item in raw_checks
+        ]
+    except Exception as exc:
+        raise RuntimeError(
+            "Recovery-attempt budget normalization checks are invalid."
+        ) from exc
+    if (
+        not checks_passed(source_checks)
+        or [item.model_dump(mode="json") for item in source_checks]
+        != [
+            item.model_dump(mode="json")
+            for item in continuation.last_check_results
+        ]
+    ):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization check evidence is not exact."
+        )
+    logs = source_directory / "logs"
+    if (
+        not logs.is_dir()
+        or logs.is_symlink()
+        or logs.resolve().parent != source_directory.resolve()
+    ):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization logs directory is unsafe."
+        )
+    worker_paths = sorted(
+        path
+        for path in logs.iterdir()
+        if re.fullmatch(r"\d{2}-worker\.json", path.name)
+    )
+    if len(worker_paths) != 1:
+        raise RuntimeError(
+            "Recovery-attempt budget normalization requires exactly one direct "
+            "worker artifact."
+        )
+    worker_path = worker_paths[0]
+    if (
+        not worker_path.is_file()
+        or worker_path.is_symlink()
+        or worker_path.resolve().parent != logs.resolve()
+    ):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization worker artifact is unsafe."
+        )
+    stem = worker_path.name[:2]
+    checks_path = _direct_run_artifact(
+        source_directory,
+        f"logs/{stem}-checks.json",
+        "Source worker checks",
+    )
+    evidence_path = _direct_run_artifact(
+        source_directory,
+        f"logs/{stem}-post-worker-evidence-index.json",
+        "Source post-worker evidence",
+    )
+    try:
+        source_worker = WorkerResult.model_validate(
+            load_json_object(worker_path, "Source worker")
+        )
+        direct_checks = json.loads(checks_path.read_text(encoding="utf-8"))
+        direct_evidence = load_json_object(
+            evidence_path, "Source post-worker evidence"
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "Recovery-attempt budget normalization worker evidence is invalid."
+        ) from exc
+    if (
+        not source_worker.valid_worker_outcome
+        or direct_checks != raw_checks
+        or direct_evidence.get("repository_fingerprint")
+        != source_packet.last_fingerprint
+        or not isinstance(source_packet.last_fingerprint, str)
+        or not source_packet.last_fingerprint
+    ):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization lacks one valid green worker "
+            "transition."
+        )
+    try:
+        source_decision = Decision.model_validate(
+            source_result.get("final_decision")
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Recovery-attempt budget normalization final decision is invalid."
+        ) from exc
+    if (
+        source_decision.status != "continue"
+        or source_decision.decision_kind
+        not in {"implement_packet", "repair_packet", "verify_packet"}
+        or source_decision.active_packet_id != replacement_packet_id
+        or not (source_decision.next_prompt or "").strip()
+        or source_decision.next_prompt != continuation.next_prompt
+        or source_decision.acceptance_criteria
+        != continuation.acceptance_criteria
+        or source_decision.risks != continuation.risks
+    ):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization has no exact validated "
+            "next_prompt."
+        )
+    matching_decisions = 0
+    for candidate in logs.iterdir():
+        if not re.fullmatch(r"\d{2}-decision\.json", candidate.name):
+            continue
+        if (
+            not candidate.is_file()
+            or candidate.is_symlink()
+            or candidate.resolve().parent != logs.resolve()
+        ):
+            raise RuntimeError(
+                "Recovery-attempt budget normalization decision artifact is "
+                "unsafe."
+            )
+        if load_json_object(candidate, "Source decision") == source_result.get(
+            "final_decision"
+        ):
+            matching_decisions += 1
+    if matching_decisions != 1:
+        raise RuntimeError(
+            "Recovery-attempt budget normalization requires one exact persisted "
+            "final decision."
+        )
+
+    current_manifest = repo_manifest(project)
+    current_fingerprint = repo_fingerprint(project)
+    if (
+        current_manifest != continuation.repository_manifest
+        or current_fingerprint != continuation.repository_fingerprint
+        or source_result.get("repository_fingerprint")
+        != current_fingerprint
+    ):
+        raise RuntimeError(
+            "Repository changed after the legacy recovery child; "
+            "normalization stopped before worker execution."
+        )
+
+    legacy_directory = (
+        project / ".forge" / "runs" / legacy_source_id
+    )
+    if (
+        not legacy_directory.is_dir()
+        or legacy_directory.is_symlink()
+        or legacy_directory.resolve().parent != runs_directory
+    ):
+        raise RuntimeError(
+            "Legacy recovery source is not a direct immutable run directory."
+        )
+    legacy_run = load_json_object(
+        _direct_run_artifact(
+            legacy_directory, "run.json", "Legacy recovery source run"
+        ),
+        "Legacy recovery source run",
+    )
+    legacy_result = read_result_compat(
+        _direct_run_artifact(
+            legacy_directory,
+            "result.json",
+            "Legacy recovery source result",
+        )
+    )
+    if (
+        legacy_run.get("run_id") != legacy_source_id
+        or legacy_result.get("run_id") != legacy_source_id
+        or legacy_run.get("continuation_chain_id")
+        != continuation.continuation_chain_id
+        or legacy_result.get("continuation_chain_id")
+        != continuation.continuation_chain_id
+        or legacy_result.get("final_status") != "failed"
+        or legacy_result.get("stop_reason_code") != "technical_failure"
+        or legacy_result.get("automatic_resume_allowed") is not False
+    ):
+        raise RuntimeError(
+            "Legacy recovery parent is not the exact technical-failure source."
+        )
+    counter_fields = (
+        ("chain_child_runs", False),
+        ("chain_codex_calls", False),
+        ("chain_worker_calls", False),
+        ("chain_elapsed_seconds", True),
+        ("chain_full_check_suites", False),
+        ("chain_premium_escalations", False),
+        ("chain_no_progress_events", False),
+        ("chain_model_fallbacks", False),
+    )
+    source_counters: dict[str, int | float] = {}
+    legacy_counters: dict[str, int | float] = {}
+    for field, floating in counter_fields:
+        source_counters[field] = _strict_nonnegative_counter(
+            source_result, field, floating=floating
+        )
+        legacy_counters[field] = _strict_nonnegative_counter(
+            legacy_result, field, floating=floating
+        )
+    continuation_counter_values = {
+        "chain_child_runs": continuation.chain_child_runs,
+        "chain_codex_calls": continuation.chain_codex_calls,
+        "chain_worker_calls": continuation.chain_worker_calls,
+        "chain_elapsed_seconds": continuation.chain_elapsed_seconds,
+        "chain_full_check_suites": continuation.chain_full_check_suites,
+        "chain_premium_escalations": (
+            continuation.chain_premium_escalations
+        ),
+        "chain_no_progress_events": continuation.chain_no_progress_events,
+        "chain_model_fallbacks": continuation.chain_model_fallbacks,
+    }
+    if any(
+        source_counters[field] != value
+        for field, value in continuation_counter_values.items()
+    ):
+        raise RuntimeError(
+            "Source result and continuation chain counters differ."
+        )
+    worker_call_delta = int(source_counters["chain_worker_calls"]) - int(
+        legacy_counters["chain_worker_calls"]
+    )
+    if (
+        int(source_counters["chain_child_runs"])
+        != int(legacy_counters["chain_child_runs"]) + 1
+        or worker_call_delta != 1
+        or int(source_counters["chain_codex_calls"])
+        != int(legacy_counters["chain_codex_calls"]) + 1
+        or source_counters["chain_elapsed_seconds"]
+        < legacy_counters["chain_elapsed_seconds"]
+        or any(
+            source_counters[field] != legacy_counters[field]
+            for field in (
+                "chain_full_check_suites",
+                "chain_premium_escalations",
+                "chain_no_progress_events",
+                "chain_model_fallbacks",
+            )
+        )
+    ):
+        raise RuntimeError(
+            "Legacy recovery child counters do not represent exactly one worker "
+            "dispatch with monotonic chain lineage."
+        )
+    if (
+        telemetry.get("schema_version") != SCHEMA_VERSION
+        or telemetry.get("run_id") != source_run_id
+        or telemetry.get("parent_run_id") != legacy_source_id
+        or telemetry.get("continuation_chain_id")
+        != continuation.continuation_chain_id
+        or telemetry.get("child_run_index")
+        != continuation.chain_child_runs
+        or telemetry.get("chain_elapsed_seconds")
+        != continuation.chain_elapsed_seconds
+        or int(telemetry.get("chain_model_fallbacks") or 0)
+        != continuation.chain_model_fallbacks
+        or int(telemetry.get("premium_escalations") or 0)
+        != continuation.chain_premium_escalations
+    ):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization telemetry lineage is "
+            "inconsistent."
+        )
+
+    legacy_journal_path = _decision_recovery_journal_path(
+        project, legacy_source_id
+    )
+    legacy_journal_sha256 = hashlib.sha256(
+        legacy_journal_path.read_bytes()
+    ).hexdigest()
+    normalization = {
+        "action": RECOVERY_ATTEMPT_BUDGET_NORMALIZATION_ACTION,
+        "source_run_id": source_run_id,
+        "legacy_recovery_source_run_id": legacy_source_id,
+        "replacement_packet_id": replacement_packet_id,
+        "source_plan_hash": source_plan_hash,
+        "source_contract_hash": current_contract.contract_hash,
+        "source_repository_fingerprint": current_fingerprint,
+        "source_config_hash": source_config_hash,
+        "legacy_decision_recovery_journal_sha256": (
+            legacy_journal_sha256
+        ),
+        "legacy_target_plan_hash": legacy_target_hash,
+        "legacy_parent_chain_worker_calls": int(
+            legacy_counters["chain_worker_calls"]
+        ),
+        "source_chain_worker_calls": int(
+            source_counters["chain_worker_calls"]
+        ),
+        "worker_call_delta": worker_call_delta,
+        "journal_state": "none",
+        "journal_target_plan_hash": None,
+    }
+    normalization_journal = (
+        _load_recovery_attempt_budget_normalization_journal(
+            project, source_run_id
+        )
+    )
+    source_plan_payload = source_plan.model_dump(mode="json")
+    if normalization_journal is None:
+        if current_plan.model_dump(mode="json") != source_plan_payload:
+            raise RuntimeError(
+                "Current plan is neither the exact packet-exhausted source plan "
+                "nor a journal-authenticated normalization target."
+            )
+    else:
+        expected_fields = {
+            "schema_version",
+            "action",
+            "source_run_id",
+            "legacy_recovery_source_run_id",
+            "replacement_packet_id",
+            "source_plan_hash",
+            "source_contract_hash",
+            "source_repository_fingerprint",
+            "source_config_hash",
+            "legacy_decision_recovery_journal_sha256",
+            "legacy_target_plan_hash",
+            "legacy_parent_chain_worker_calls",
+            "source_chain_worker_calls",
+            "worker_call_delta",
+            "prepared_by_run_id",
+            "created_at",
+            "phase",
+            "child_run_id",
+            "target_plan_hash",
+            "target_plan",
+        }
+        if set(normalization_journal) != expected_fields:
+            raise RuntimeError(
+                "Recovery-attempt normalization journal fields are incomplete "
+                "or unexpected."
+            )
+        exact_values = {
+            key: value
+            for key, value in normalization.items()
+            if key not in {"journal_state", "journal_target_plan_hash"}
+        }
+        if any(
+            normalization_journal.get(field) != value
+            for field, value in exact_values.items()
+        ):
+            raise RuntimeError(
+                "Recovery-attempt normalization journal provenance changed."
+            )
+        if (
+            normalization_journal.get("phase") != "prepared"
+            or normalization_journal.get("child_run_id") is not None
+        ):
+            raise RuntimeError(
+                "Recovery-attempt normalization child already started; replay "
+                "is forbidden."
+            )
+        try:
+            _safe_run_id(
+                str(normalization_journal.get("prepared_by_run_id") or "")
+            )
+            if (
+                not isinstance(
+                    normalization_journal.get("created_at"), str
+                )
+                or not str(
+                    normalization_journal.get("created_at")
+                ).strip()
+            ):
+                raise ValueError("created_at")
+            target_plan = ProjectPlan.model_validate(
+                normalization_journal["target_plan"]
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Recovery-attempt normalization journal target is invalid."
+            ) from exc
+        target_hash = plan_hash(target_plan)
+        if normalization_journal.get("target_plan_hash") != target_hash:
+            raise RuntimeError(
+                "Recovery-attempt normalization journal target hash changed."
+            )
+        derived_target = apply_recovery_attempt_budget_normalization_plan(
+            source_plan,
+            normalization,
+            merged_config,
+        )
+        derived_target.updated_at = target_plan.updated_at
+        derived_target.last_validated_at = target_plan.last_validated_at
+        derived_target.last_validation_summary = (
+            target_plan.last_validation_summary
+        )
+        derived_target = ProjectPlan.model_validate(
+            derived_target.model_dump(mode="json")
+        )
+        if (
+            derived_target.model_dump(mode="json")
+            != target_plan.model_dump(mode="json")
+        ):
+            raise RuntimeError(
+                "Recovery-attempt normalization target is not the deterministic "
+                "source-plan transform."
+            )
+        current_payload = current_plan.model_dump(mode="json")
+        target_payload = target_plan.model_dump(mode="json")
+        if current_payload == source_plan_payload:
+            normalization["journal_state"] = "intent_only"
+        elif current_payload == target_payload:
+            normalization["journal_state"] = "target_applied"
+            continuation_payload = continuation.model_dump(mode="json")
+            continuation_payload["plan_hash"] = target_hash
+            continuation = ContinuationPayload.model_validate(
+                continuation_payload
+            )
+        else:
+            raise RuntimeError(
+                "Current plan differs from both states authorized by the "
+                "recovery-attempt normalization journal."
+            )
+        normalization["journal_target_plan_hash"] = target_hash
+
+    _assert_no_existing_recovery_child(project, source_run_id)
+    return {
+        "continuation": continuation,
+        "normalization": normalization,
+    }
+
+
 def load_resume_context(
     project: Path,
     requested_run_id: str,
@@ -3069,11 +4066,12 @@ def load_resume_context(
     expected_decision_recovery_sha256: str | None = None,
 ) -> dict[str, Any]:
     resume_kind = _validate_resume_kind(resume_kind)
+    requested_latest = str(requested_run_id).strip().lower() == "latest"
     if expected_decision_recovery_sha256 is not None:
         _validated_decision_recovery_sha256(
             expected_decision_recovery_sha256
         )
-        if str(requested_run_id).strip().lower() == "latest":
+        if requested_latest:
             raise RuntimeError(
                 "Post-worker decision recovery requires an exact source run ID; "
                 "'latest' is forbidden."
@@ -3182,6 +4180,7 @@ def load_resume_context(
     source_config_preview = source_run.get("config")
     recovery_authorized_from_run_id: str | None = None
     bounded_packet_recovery_eligible = False
+    recovery_attempt_budget_normalization: dict[str, Any] | None = None
     if (
         int(source_result.get("schema_version") or 1) >= ADAPTIVE_SCHEMA_VERSION
         and isinstance(source_config_preview, dict)
@@ -3206,128 +4205,169 @@ def load_resume_context(
                 "Adaptive continuation payload is incomplete; missing: "
                 + ", ".join(adaptive_missing)
             )
-        _, current_plan, _ = load_verified_adaptive_resume_state(
-            project,
-            continuation,
-            goal=goal,
-        )
         if source_stop_reason == "packet_attempts_exhausted":
+            normalization_context = (
+                _load_recovery_attempt_budget_normalization_context(
+                    project,
+                    source_directory,
+                    source_run,
+                    source_result,
+                    continuation,
+                    source_run_id=source_run_id,
+                    goal=goal,
+                    merged_config=merged_config,
+                    source_config_hash=source_config_hash,
+                    resume_kind=resume_kind,
+                    requested_latest=requested_latest,
+                )
+            )
+            if normalization_context is not None:
+                continuation = normalization_context["continuation"]
+                recovery_attempt_budget_normalization = (
+                    normalization_context["normalization"]
+                )
+            else:
+                _, current_plan, _ = load_verified_adaptive_resume_state(
+                    project,
+                    continuation,
+                    goal=goal,
+                )
             if resume_kind == "internal_automatic":
                 raise RuntimeError(
                     "Packet-attempt recovery requires an explicit human resume; "
                     "automatic child resume is forbidden."
                 )
-            candidate_results: list[dict[str, Any]] = [source_result]
-            parent_id = source_result.get("parent_run_id")
-            if isinstance(parent_id, str) and parent_id.strip():
-                parent_directory = (
-                    project / ".forge" / "runs" / _safe_run_id(parent_id)
-                )
-                if parent_directory.is_dir():
-                    parent_result = read_result_compat(
-                        parent_directory / "result.json"
+            if recovery_attempt_budget_normalization is None:
+                candidate_results: list[dict[str, Any]] = [source_result]
+                parent_id = source_result.get("parent_run_id")
+                if isinstance(parent_id, str) and parent_id.strip():
+                    parent_directory = (
+                        project / ".forge" / "runs" / _safe_run_id(parent_id)
                     )
-                    if (
-                        parent_result.get("continuation_chain_id")
-                        == source_result.get("continuation_chain_id")
-                    ):
-                        candidate_results.append(parent_result)
+                    if parent_directory.is_dir():
+                        parent_result = read_result_compat(
+                            parent_directory / "result.json"
+                        )
+                        if (
+                            parent_result.get("continuation_chain_id")
+                            == source_result.get("continuation_chain_id")
+                        ):
+                            candidate_results.append(parent_result)
 
-            counters = ChainCounters(
-                child_runs=continuation.chain_child_runs,
-                codex_calls=continuation.chain_codex_calls,
-                worker_calls=continuation.chain_worker_calls,
-                elapsed_seconds=continuation.chain_elapsed_seconds,
-                full_check_suites=continuation.chain_full_check_suites,
-                premium_escalations=continuation.chain_premium_escalations,
-                no_progress_events=continuation.chain_no_progress_events,
-            )
-            recovery_budgets = ChainBudgets.model_validate(
-                merged_config.get("chain_budgets", {})
-            )
-            budget_reason = next(
-                (
-                    f"Continuation chain budget exhausted: {label}={current}, "
-                    f"limit={maximum}."
-                    for label, current, maximum in (
-                        (
-                            "child runs",
-                            counters.child_runs,
-                            recovery_budgets.max_child_runs,
-                        ),
-                        (
-                            "Codex calls",
-                            counters.codex_calls,
-                            recovery_budgets.max_codex_calls,
-                        ),
-                        (
-                            "worker calls",
-                            counters.worker_calls,
-                            recovery_budgets.max_worker_calls,
-                        ),
-                        (
-                            "elapsed seconds",
-                            counters.elapsed_seconds,
-                            recovery_budgets.max_elapsed_seconds,
-                        ),
-                        (
-                            "full check suites",
-                            counters.full_check_suites,
-                            recovery_budgets.max_full_check_suites,
-                        ),
-                        (
-                            "no-progress events",
-                            counters.no_progress_events,
-                            recovery_budgets.max_no_progress_events,
-                        ),
-                    )
-                    if current >= maximum
-                ),
-                None,
-            )
-            for candidate in candidate_results:
-                raw_decision = candidate.get("final_decision")
-                raw_checks = candidate.get("checks")
-                if not isinstance(raw_decision, dict) or not isinstance(
-                    raw_checks, list
-                ):
-                    continue
-                try:
-                    candidate_decision = Decision.model_validate(raw_decision)
-                    candidate_checks = [
-                        CheckResult.model_validate(item) for item in raw_checks
-                    ]
-                except Exception:
-                    continue
-                if candidate_decision.next_prompt != continuation.next_prompt:
-                    continue
-                current_plan, authorized = maybe_authorize_final_review_recovery(
-                    current_plan,
-                    candidate_decision,
-                    candidate_checks,
-                    config=merged_config,
-                    last_check_tier=str(
-                        candidate.get("last_check_tier") or ""
+                counters = ChainCounters(
+                    child_runs=continuation.chain_child_runs,
+                    codex_calls=continuation.chain_codex_calls,
+                    worker_calls=continuation.chain_worker_calls,
+                    elapsed_seconds=continuation.chain_elapsed_seconds,
+                    full_check_suites=continuation.chain_full_check_suites,
+                    premium_escalations=(
+                        continuation.chain_premium_escalations
                     ),
-                    no_progress_count=continuation.no_progress_count,
-                    failed_iterations=continuation.failed_iterations,
-                    budget_reason=budget_reason,
+                    no_progress_events=(
+                        continuation.chain_no_progress_events
+                    ),
                 )
-                if authorized:
-                    bounded_packet_recovery_eligible = True
-                    recovery_authorized_from_run_id = str(
-                        candidate.get("run_id") or source_run_id
+                recovery_budgets = ChainBudgets.model_validate(
+                    merged_config.get("chain_budgets", {})
+                )
+                budget_reason = next(
+                    (
+                        f"Continuation chain budget exhausted: {label}={current}, "
+                        f"limit={maximum}."
+                        for label, current, maximum in (
+                            (
+                                "child runs",
+                                counters.child_runs,
+                                recovery_budgets.max_child_runs,
+                            ),
+                            (
+                                "Codex calls",
+                                counters.codex_calls,
+                                recovery_budgets.max_codex_calls,
+                            ),
+                            (
+                                "worker calls",
+                                counters.worker_calls,
+                                recovery_budgets.max_worker_calls,
+                            ),
+                            (
+                                "elapsed seconds",
+                                counters.elapsed_seconds,
+                                recovery_budgets.max_elapsed_seconds,
+                            ),
+                            (
+                                "full check suites",
+                                counters.full_check_suites,
+                                recovery_budgets.max_full_check_suites,
+                            ),
+                            (
+                                "no-progress events",
+                                counters.no_progress_events,
+                                recovery_budgets.max_no_progress_events,
+                            ),
+                        )
+                        if current >= maximum
+                    ),
+                    None,
+                )
+                for candidate in candidate_results:
+                    raw_decision = candidate.get("final_decision")
+                    raw_checks = candidate.get("checks")
+                    if not isinstance(raw_decision, dict) or not isinstance(
+                        raw_checks, list
+                    ):
+                        continue
+                    try:
+                        candidate_decision = Decision.model_validate(
+                            raw_decision
+                        )
+                        candidate_checks = [
+                            CheckResult.model_validate(item)
+                            for item in raw_checks
+                        ]
+                    except Exception:
+                        continue
+                    if (
+                        candidate_decision.next_prompt
+                        != continuation.next_prompt
+                    ):
+                        continue
+                    (
+                        current_plan,
+                        authorized,
+                    ) = maybe_authorize_final_review_recovery(
+                        current_plan,
+                        candidate_decision,
+                        candidate_checks,
+                        config=merged_config,
+                        last_check_tier=str(
+                            candidate.get("last_check_tier") or ""
+                        ),
+                        no_progress_count=continuation.no_progress_count,
+                        failed_iterations=continuation.failed_iterations,
+                        budget_reason=budget_reason,
                     )
-                    if authorize_packet_recovery:
-                        save_plan(project, current_plan)
-                        continuation.plan_hash = plan_hash(current_plan)
-                    break
-            if recovery_authorized_from_run_id is None:
-                raise RuntimeError(
-                    f"Run {source_run_id} exhausted packet attempts and has no "
-                    "eligible bounded final-review recovery. Manual resume would "
-                    "repeat the same stop; human replanning is required."
-                )
+                    if authorized:
+                        bounded_packet_recovery_eligible = True
+                        recovery_authorized_from_run_id = str(
+                            candidate.get("run_id") or source_run_id
+                        )
+                        if authorize_packet_recovery:
+                            save_plan(project, current_plan)
+                            continuation.plan_hash = plan_hash(current_plan)
+                        break
+                if recovery_authorized_from_run_id is None:
+                    raise RuntimeError(
+                        f"Run {source_run_id} exhausted packet attempts and has "
+                        "no eligible bounded final-review recovery. Manual resume "
+                        "would repeat the same stop; human replanning is required."
+                    )
+        else:
+            load_verified_adaptive_resume_state(
+                project,
+                continuation,
+                goal=goal,
+            )
 
     return {
         "source_run_id": source_run_id,
@@ -3349,6 +4389,12 @@ def load_resume_context(
         "budget_extended": budget_extended,
         "bounded_packet_recovery_eligible": bounded_packet_recovery_eligible,
         "recovery_authorized_from_run_id": recovery_authorized_from_run_id,
+        "recovery_attempt_budget_normalization_eligible": (
+            recovery_attempt_budget_normalization is not None
+        ),
+        "recovery_attempt_budget_normalization": (
+            recovery_attempt_budget_normalization
+        ),
     }
 
 
@@ -6621,6 +7667,91 @@ def active_plan_packet(plan: ProjectPlan | None) -> WorkPacket | None:
     )
 
 
+def apply_recovery_attempt_budget_normalization_plan(
+    plan: ProjectPlan,
+    normalization: dict[str, Any],
+    config: dict[str, Any],
+) -> ProjectPlan:
+    """Reinterpret the sole legacy recovery dispatch as one normal attempt."""
+
+    if not isinstance(normalization, dict):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization provenance is missing."
+        )
+    required_strings = (
+        "source_run_id",
+        "legacy_recovery_source_run_id",
+        "replacement_packet_id",
+        "source_plan_hash",
+        "source_contract_hash",
+        "source_repository_fingerprint",
+        "source_config_hash",
+        "legacy_decision_recovery_journal_sha256",
+        "legacy_target_plan_hash",
+    )
+    for field in required_strings:
+        if not isinstance(normalization.get(field), str) or not normalization[
+            field
+        ]:
+            raise RuntimeError(
+                "Recovery-attempt budget normalization provenance is missing "
+                f"{field}."
+            )
+    if (
+        normalization.get("action")
+        != RECOVERY_ATTEMPT_BUDGET_NORMALIZATION_ACTION
+    ):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization action is invalid."
+        )
+    worker_call_delta = normalization.get("worker_call_delta")
+    if type(worker_call_delta) is not int or worker_call_delta != 1:
+        raise RuntimeError(
+            "Recovery-attempt budget normalization requires exactly one "
+            "historical worker dispatch."
+        )
+    maximum_attempts = int(config.get("max_packet_attempts", 3))
+    if maximum_attempts < 2:
+        raise RuntimeError(
+            "Recovery-attempt budget normalization requires a bounded normal "
+            "packet budget greater than the historical worker-call delta."
+        )
+    if plan_hash(plan) != normalization["source_plan_hash"]:
+        raise RuntimeError(
+            "Persistent plan changed before recovery-attempt budget "
+            "normalization."
+        )
+    if plan.check_contract_hash != normalization["source_contract_hash"]:
+        raise RuntimeError(
+            "Recovery-attempt budget normalization plan/contract identity "
+            "changed."
+        )
+
+    updated = ProjectPlan.model_validate(plan.model_dump(mode="json"))
+    if updated.active_packet_id != normalization["replacement_packet_id"]:
+        raise RuntimeError(
+            "Recovery-attempt budget normalization active packet changed."
+        )
+    packet = active_plan_packet(updated)
+    if (
+        packet is None
+        or packet.status not in {"in_progress", "verification"}
+        or packet.attempts != maximum_attempts + worker_call_delta
+        or packet.final_review_recovery_authorized
+        or not packet.final_review_recovery_used
+    ):
+        raise RuntimeError(
+            "Current packet is not the exact consumed legacy one-shot "
+            "replacement."
+        )
+
+    packet.attempts = worker_call_delta
+    packet.final_review_recovery_authorized = False
+    packet.final_review_recovery_used = False
+    updated.updated_at = utc_now()
+    return ProjectPlan.model_validate(updated.model_dump(mode="json"))
+
+
 def apply_post_worker_decision_recovery_plan(
     plan: ProjectPlan,
     recovery: dict[str, Any],
@@ -6733,12 +7864,11 @@ def apply_post_worker_decision_recovery_plan(
         max_worker_turns=decision.recommended_worker_max_turns,
         expected_paths=list(source.expected_paths),
         forbidden_scope=list(source.forbidden_scope),
-        # This is a one-shot human-authorized recovery packet. It starts at the
-        # normal limit with exactly one recovery attempt authorized. A valid
-        # dispatch consumes that slot; a transport failure can use the existing
-        # precise recovery refund without creating another logical attempt.
-        attempts=maximum_attempts,
-        final_review_recovery_authorized=True,
+        # The replacement is a new bounded packet. The exhausted source keeps
+        # its historical attempts, while this packet receives the normal
+        # configured attempt budget from zero.
+        attempts=0,
+        final_review_recovery_authorized=False,
         final_review_recovery_used=False,
         last_fingerprint=None,
         last_failure_signature=None,
@@ -7024,6 +8154,7 @@ def _run_forge_locked(
     baseline_snapshot: dict[str, Any] | None = None
     post_worker_recovery: dict[str, Any] | None = None
     post_worker_recovery_decision: Decision | None = None
+    attempt_budget_normalization: dict[str, Any] | None = None
     if resume_context is not None:
         candidate_recovery = resume_context.get(
             "post_worker_decision_recovery"
@@ -7034,9 +8165,30 @@ def _run_forge_locked(
                     "Post-worker decision recovery provenance is malformed."
                 )
             post_worker_recovery = candidate_recovery
-    if post_worker_recovery is not None and not adaptive_enabled:
+        candidate_normalization = resume_context.get(
+            "recovery_attempt_budget_normalization"
+        )
+        if candidate_normalization is not None:
+            if not isinstance(candidate_normalization, dict):
+                raise RuntimeError(
+                    "Recovery-attempt budget normalization provenance is "
+                    "malformed."
+                )
+            attempt_budget_normalization = candidate_normalization
+    if (
+        post_worker_recovery is not None
+        and attempt_budget_normalization is not None
+    ):
         raise RuntimeError(
-            "Post-worker decision recovery requires adaptive orchestration."
+            "A resume cannot combine post-worker decision recovery with "
+            "recovery-attempt budget normalization."
+        )
+    if (
+        post_worker_recovery is not None
+        or attempt_budget_normalization is not None
+    ) and not adaptive_enabled:
+        raise RuntimeError(
+            "Special recovery migration requires adaptive orchestration."
         )
     if adaptive_enabled:
         inherited_adaptive_values = (
@@ -7229,13 +8381,183 @@ def _run_forge_locked(
                     raise RuntimeError(
                         "Decision-recovery journal state is invalid."
                     )
-        if post_worker_recovery is None:
+            elif attempt_budget_normalization is not None:
+                # Eligibility is read-only. Revalidate every immutable source,
+                # lineage, counter, repository, config, contract, and journal
+                # invariant while the project writer lock is still held.
+                fresh_context = load_resume_context(
+                    project,
+                    str(resume_context["source_run_id"]),
+                    resume_kind="explicit_human",
+                    authorize_packet_recovery=False,
+                )
+                fresh_normalization = fresh_context.get(
+                    "recovery_attempt_budget_normalization"
+                )
+                if (
+                    fresh_normalization != attempt_budget_normalization
+                    or fresh_context.get("continuation")
+                    != resume_context.get("continuation")
+                    or fresh_context.get("source_config_hash")
+                    != resume_context.get("source_config_hash")
+                    or fresh_context.get("base_chain_budgets")
+                    != resume_context.get("base_chain_budgets")
+                    or fresh_context.get("effective_chain_budgets")
+                    != resume_context.get("effective_chain_budgets")
+                    or fresh_context.get("budget_extension_count")
+                    != resume_context.get("budget_extension_count")
+                ):
+                    raise RuntimeError(
+                        "Recovery-attempt budget normalization provenance "
+                        "changed between eligibility and the locked transform."
+                    )
+                if not isinstance(fresh_normalization, dict):
+                    raise RuntimeError(
+                        "Recovery-attempt budget normalization disappeared "
+                        "before the locked transform."
+                    )
+                attempt_budget_normalization = fresh_normalization
+                journal_state = str(
+                    attempt_budget_normalization.get("journal_state") or ""
+                )
+                if journal_state == "none":
+                    transformed_plan = (
+                        apply_recovery_attempt_budget_normalization_plan(
+                            project_plan,
+                            attempt_budget_normalization,
+                            config,
+                        )
+                    )
+                    target_plan = _prepare_recovery_plan_for_persistence(
+                        transformed_plan
+                    )
+                    target_plan_hash = plan_hash(target_plan)
+                    journal_payload = {
+                        "schema_version": SCHEMA_VERSION,
+                        "action": (
+                            RECOVERY_ATTEMPT_BUDGET_NORMALIZATION_ACTION
+                        ),
+                        "source_run_id": attempt_budget_normalization[
+                            "source_run_id"
+                        ],
+                        "legacy_recovery_source_run_id": (
+                            attempt_budget_normalization[
+                                "legacy_recovery_source_run_id"
+                            ]
+                        ),
+                        "replacement_packet_id": (
+                            attempt_budget_normalization[
+                                "replacement_packet_id"
+                            ]
+                        ),
+                        "source_plan_hash": attempt_budget_normalization[
+                            "source_plan_hash"
+                        ],
+                        "source_contract_hash": (
+                            attempt_budget_normalization[
+                                "source_contract_hash"
+                            ]
+                        ),
+                        "source_repository_fingerprint": (
+                            attempt_budget_normalization[
+                                "source_repository_fingerprint"
+                            ]
+                        ),
+                        "source_config_hash": attempt_budget_normalization[
+                            "source_config_hash"
+                        ],
+                        "legacy_decision_recovery_journal_sha256": (
+                            attempt_budget_normalization[
+                                "legacy_decision_recovery_journal_sha256"
+                            ]
+                        ),
+                        "legacy_target_plan_hash": (
+                            attempt_budget_normalization[
+                                "legacy_target_plan_hash"
+                            ]
+                        ),
+                        "legacy_parent_chain_worker_calls": (
+                            attempt_budget_normalization[
+                                "legacy_parent_chain_worker_calls"
+                            ]
+                        ),
+                        "source_chain_worker_calls": (
+                            attempt_budget_normalization[
+                                "source_chain_worker_calls"
+                            ]
+                        ),
+                        "worker_call_delta": attempt_budget_normalization[
+                            "worker_call_delta"
+                        ],
+                        "prepared_by_run_id": run_id,
+                        "created_at": utc_now(),
+                        "phase": "prepared",
+                        "child_run_id": None,
+                        "target_plan_hash": target_plan_hash,
+                        "target_plan": target_plan.model_dump(mode="json"),
+                    }
+                    # This WAL is durable before the persistent plan can move
+                    # from the exact source state to the exact normalized target.
+                    atomic_json(
+                        _recovery_attempt_budget_normalization_journal_path(
+                            project,
+                            str(resume_context["source_run_id"]),
+                        ),
+                        journal_payload,
+                    )
+                    attempt_budget_normalization[
+                        "journal_state"
+                    ] = "intent_only"
+                    attempt_budget_normalization[
+                        "journal_target_plan_hash"
+                    ] = target_plan_hash
+                    project_plan = target_plan
+                elif journal_state in {"intent_only", "target_applied"}:
+                    journal_payload = (
+                        _load_recovery_attempt_budget_normalization_journal(
+                            project,
+                            str(resume_context["source_run_id"]),
+                        )
+                    )
+                    if journal_payload is None:
+                        raise RuntimeError(
+                            "Validated recovery-attempt normalization journal "
+                            "disappeared before plan persistence."
+                        )
+                    target_plan = ProjectPlan.model_validate(
+                        journal_payload["target_plan"]
+                    )
+                    if (
+                        plan_hash(target_plan)
+                        != attempt_budget_normalization[
+                            "journal_target_plan_hash"
+                        ]
+                    ):
+                        raise RuntimeError(
+                            "Recovery-attempt normalization journal target "
+                            "changed before persistence."
+                        )
+                    project_plan = target_plan
+                else:
+                    raise RuntimeError(
+                        "Recovery-attempt normalization journal state is "
+                        "invalid."
+                    )
+                assert inherited_continuation is not None
+                inherited_continuation.plan_hash = plan_hash(project_plan)
+                inherited_continuation.active_packet_id = (
+                    attempt_budget_normalization["replacement_packet_id"]
+                )
+        if (
+            post_worker_recovery is None
+            and attempt_budget_normalization is None
+        ):
             save_plan(
                 project,
                 project_plan,
                 snapshot_path=run_directory / "project-plan.initial.json",
             )
-        else:
+        elif post_worker_recovery is not None:
             # Exact target bytes are already authenticated by the write-ahead
             # journal. Persist them atomically without a second timestamp change.
             atomic_json(
@@ -7250,12 +8572,10 @@ def _run_forge_locked(
             recovery_record = dict(post_worker_recovery)
             recovery_record["recovered_plan_hash"] = plan_hash(project_plan)
             recovery_record["source_packet_attempts_preserved"] = True
-            recovery_record["replacement_packet_attempts_at_replan"] = (
-                int(config.get("max_packet_attempts", 3))
-            )
+            recovery_record["replacement_packet_attempts_at_replan"] = 0
             recovery_record[
                 "replacement_recovery_authorized_at_replan"
-            ] = True
+            ] = False
             recovery_record["replacement_recovery_used_at_replan"] = False
             save_json(
                 run_directory / "decision-recovery.json",
@@ -7265,10 +8585,53 @@ def _run_forge_locked(
                 run_directory / "project-plan.decision-recovery.json",
                 project_plan.model_dump(mode="json"),
             )
+        else:
+            # The exact target is authenticated by the dedicated write-ahead
+            # journal. Persist only that target and a run-scoped audit record.
+            atomic_json(
+                forge_dir / "project-plan.json",
+                project_plan.model_dump(mode="json"),
+            )
+            atomic_json(
+                run_directory / "project-plan.initial.json",
+                project_plan.model_dump(mode="json"),
+            )
+            attempt_budget_normalization[
+                "journal_state"
+            ] = "target_applied"
+            normalization_record = dict(attempt_budget_normalization)
+            normalization_record["normalized_plan_hash"] = plan_hash(
+                project_plan
+            )
+            normalization_record["normalized_packet_attempts"] = int(
+                attempt_budget_normalization["worker_call_delta"]
+            )
+            normalization_record[
+                "normalized_recovery_authorized"
+            ] = False
+            normalization_record["normalized_recovery_used"] = False
+            save_json(
+                run_directory
+                / "recovery-attempt-budget-normalization.json",
+                normalization_record,
+            )
+            atomic_json(
+                run_directory
+                / "project-plan.recovery-attempt-budget-normalization.json",
+                project_plan.model_dump(mode="json"),
+            )
     if post_worker_recovery is not None:
         # Consume the one-shot authorization before the child becomes visible
         # or any model can be dispatched. A crash after this point fails closed.
         _mark_decision_recovery_child_started(
+            project,
+            str(resume_context["source_run_id"]),
+            run_id,
+        )
+    if attempt_budget_normalization is not None:
+        # The compatibility migration is also one-shot. Mark its exact child
+        # durably before status/run visibility or any model dispatch.
+        _mark_recovery_attempt_budget_normalization_child_started(
             project,
             str(resume_context["source_run_id"]),
             run_id,
@@ -7344,6 +8707,28 @@ def _run_forge_locked(
                         ],
                     }
                     if post_worker_recovery is not None
+                    else None
+                ),
+                "recovery_attempt_budget_normalization": (
+                    {
+                        "action": attempt_budget_normalization["action"],
+                        "legacy_recovery_source_run_id": (
+                            attempt_budget_normalization[
+                                "legacy_recovery_source_run_id"
+                            ]
+                        ),
+                        "replacement_packet_id": (
+                            attempt_budget_normalization[
+                                "replacement_packet_id"
+                            ]
+                        ),
+                        "worker_call_delta": (
+                            attempt_budget_normalization[
+                                "worker_call_delta"
+                            ]
+                        ),
+                    }
+                    if attempt_budget_normalization is not None
                     else None
                 ),
             }
@@ -10008,6 +11393,7 @@ def resume_eligibility(
             "bounded_packet_recovery_eligible": False,
             "budget_tranche_extension_eligible": False,
             "post_worker_decision_recovery_eligible": False,
+            "recovery_attempt_budget_normalization_eligible": False,
             "model_calls_made": 0,
             "state_mutated": False,
             "supervisor_config_enforced": supervisor_config is not None,
@@ -10016,7 +11402,14 @@ def resume_eligibility(
     post_worker_recovery = bool(
         context.get("post_worker_decision_recovery_eligible", False)
     )
-    if post_worker_recovery and supervisor_config is None:
+    attempt_budget_normalization = bool(
+        context.get(
+            "recovery_attempt_budget_normalization_eligible", False
+        )
+    )
+    if (
+        post_worker_recovery or attempt_budget_normalization
+    ) and supervisor_config is None:
         return {
             "schema_version": SCHEMA_VERSION,
             "eligible": False,
@@ -10037,6 +11430,7 @@ def resume_eligibility(
             "bounded_packet_recovery_eligible": False,
             "budget_tranche_extension_eligible": False,
             "post_worker_decision_recovery_eligible": False,
+            "recovery_attempt_budget_normalization_eligible": False,
             "model_calls_made": 0,
             "state_mutated": False,
             "supervisor_config_enforced": False,
@@ -10045,6 +11439,8 @@ def resume_eligibility(
     budget_extension = bool(context["budget_extended"])
     if post_worker_recovery:
         action = POST_WORKER_DECISION_RECOVERY_ACTION
+    elif attempt_budget_normalization:
+        action = RECOVERY_ATTEMPT_BUDGET_NORMALIZATION_ACTION
     elif packet_recovery:
         action = "bounded_final_review_recovery"
     elif budget_extension:
@@ -10068,6 +11464,14 @@ def resume_eligibility(
         "post_worker_decision_recovery": (
             context.get("post_worker_decision_recovery")
             if post_worker_recovery
+            else None
+        ),
+        "recovery_attempt_budget_normalization_eligible": (
+            attempt_budget_normalization
+        ),
+        "recovery_attempt_budget_normalization": (
+            context.get("recovery_attempt_budget_normalization")
+            if attempt_budget_normalization
             else None
         ),
         "recovery_authorized_from_run_id": context[
@@ -10143,12 +11547,19 @@ def resume_forge(
                     ),
                 )
             if (
-                resume_context.get("post_worker_decision_recovery_eligible")
+                (
+                    resume_context.get(
+                        "post_worker_decision_recovery_eligible"
+                    )
+                    or resume_context.get(
+                        "recovery_attempt_budget_normalization_eligible"
+                    )
+                )
                 and supervisor_config is None
             ):
                 raise RuntimeError(
-                    "Post-worker decision recovery requires an explicit "
-                    "supervised run-chain configuration."
+                    "Special recovery migration requires an explicit supervised "
+                    "run-chain configuration."
                 )
         except Exception as exc:
             print(

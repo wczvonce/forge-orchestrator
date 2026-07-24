@@ -820,6 +820,9 @@ class WrapperSafetyContractTests(unittest.TestCase):
         self.assertIn('"resume-eligibility"', text)
         self.assertIn('"bounded_final_review_recovery"', text)
         self.assertIn('"extend_chain_budget_one_tranche"', text)
+        self.assertIn(
+            '"validated_recovery_attempt_budget_normalization"', text
+        )
         self.assertIn("$Eligibility.state_mutated -ne $false", text)
         self.assertIn("[int]$Eligibility.model_calls_made -ne 0", text)
         self.assertIn("$SelectedResumeRunId = Assert-ResumeEligibility", text)
@@ -840,6 +843,7 @@ class WrapperSafetyContractTests(unittest.TestCase):
             "supervisor_config_enforced": True,
             "effective_security_profile": "strict",
             "post_worker_decision_recovery_eligible": False,
+            "recovery_attempt_budget_normalization_eligible": False,
             "bounded_packet_recovery_eligible": False,
             "budget_tranche_extension_eligible": False,
         }
@@ -859,6 +863,7 @@ class WrapperSafetyContractTests(unittest.TestCase):
             ("model_calls_made", "0"),
             ("supervisor_config_enforced", 1),
             ("post_worker_decision_recovery_eligible", 1),
+            ("recovery_attempt_budget_normalization_eligible", 1),
             ("bounded_packet_recovery_eligible", 1),
             ("budget_tranche_extension_eligible", 1),
         ):
@@ -894,6 +899,7 @@ class WrapperSafetyContractTests(unittest.TestCase):
             "supervisor_config_enforced": True,
             "effective_security_profile": "strict",
             "post_worker_decision_recovery_eligible": True,
+            "recovery_attempt_budget_normalization_eligible": False,
             "bounded_packet_recovery_eligible": False,
             "budget_tranche_extension_eligible": False,
             "post_worker_decision_recovery": {
@@ -935,6 +941,64 @@ class WrapperSafetyContractTests(unittest.TestCase):
             expected_decision_recovery_sha256="b" * 64,
         )
         self.assertNotEqual(wrong_sha.returncode, 0)
+
+    @unittest.skipUnless(os.name == "nt", "PowerShell JSON contract tests are Windows-only")
+    def test_attempt_budget_normalization_requires_exact_run_and_bijective_flags(
+        self,
+    ) -> None:
+        normalization = {
+            "schema_version": 4,
+            "eligible": True,
+            "source_run_id": "legacy-child",
+            "source_stop_reason_code": "packet_attempts_exhausted",
+            "source_automatic_resume_allowed": False,
+            "action": "validated_recovery_attempt_budget_normalization",
+            "state_mutated": False,
+            "model_calls_made": 0,
+            "supervisor_config_enforced": True,
+            "effective_security_profile": "strict",
+            "post_worker_decision_recovery_eligible": False,
+            "recovery_attempt_budget_normalization_eligible": True,
+            "bounded_packet_recovery_eligible": False,
+            "budget_tranche_extension_eligible": False,
+            "recovery_attempt_budget_normalization": {
+                "worker_call_delta": 1,
+            },
+        }
+        accepted = self.run_resume_eligibility_function(
+            normalization,
+            exit_code=0,
+            requested_run_id="legacy-child",
+        )
+        self.assertEqual(
+            accepted.returncode,
+            0,
+            msg=accepted.stdout + accepted.stderr,
+        )
+
+        latest = self.run_resume_eligibility_function(
+            normalization,
+            exit_code=0,
+            requested_run_id="latest",
+        )
+        self.assertNotEqual(latest.returncode, 0)
+
+        for field, value in (
+            ("post_worker_decision_recovery_eligible", True),
+            ("recovery_attempt_budget_normalization_eligible", False),
+            ("bounded_packet_recovery_eligible", True),
+            ("budget_tranche_extension_eligible", True),
+            ("source_automatic_resume_allowed", True),
+        ):
+            with self.subTest(field=field):
+                contradictory = dict(normalization)
+                contradictory[field] = value
+                rejected = self.run_resume_eligibility_function(
+                    contradictory,
+                    exit_code=0,
+                    requested_run_id="legacy-child",
+                )
+                self.assertNotEqual(rejected.returncode, 0)
 
     @unittest.skipUnless(os.name == "nt", "PowerShell JSON contract tests are Windows-only")
     def test_rejected_eligibility_preserves_reason_without_success_fields(self) -> None:

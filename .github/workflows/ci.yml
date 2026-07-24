@@ -1,0 +1,85 @@
+name: Forge CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - "fix/**"
+
+permissions:
+  contents: read
+
+jobs:
+  fake-cli-validation:
+    name: Fake CLI validation
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      OPENAI_API_KEY: ""
+      ANTHROPIC_API_KEY: ""
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install test dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check --requirement requirements.txt
+
+      - name: Compile Python sources
+        shell: pwsh
+        run: |
+          python -m py_compile forge.py forge_adaptive.py forge_reports.py
+
+      - name: Validate JSON files
+        shell: pwsh
+        run: |
+          @'
+          import json
+          from pathlib import Path
+
+          files = sorted(Path(".").glob("*.json"))
+          if not files:
+              raise SystemExit("No root JSON files found.")
+          for path in files:
+              with path.open("r", encoding="utf-8-sig") as handle:
+                  json.load(handle)
+              print(f"valid JSON: {path}")
+          '@ | python -
+
+      - name: Parse PowerShell scripts
+        shell: pwsh
+        run: |
+          $failed = $false
+          foreach ($path in @("Start-ForgeAutonomous.ps1", "Watch-Forge.ps1")) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Join-Path $PWD $path),
+              [ref]$tokens,
+              [ref]$errors
+            )
+            if ($errors.Count -gt 0) {
+              $failed = $true
+              $errors | ForEach-Object { Write-Error "$path`: $($_.Message)" }
+            }
+            else {
+              Write-Host "valid PowerShell: $path"
+            }
+          }
+          if ($failed) {
+            exit 1
+          }
+
+      - name: Run complete fake-CLI test suite
+        shell: pwsh
+        run: |
+          python -m unittest discover -s tests -v

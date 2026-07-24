@@ -455,9 +455,11 @@ class AdaptiveRuntimeTests(unittest.TestCase):
         (run / "result.json").write_text(
             json.dumps(
                 {
-                    "schema_version": 3,
+                    "schema_version": forge.SCHEMA_VERSION,
                     "run_id": "source-run",
                     "final_status": "needs_continuation",
+                    "stop_reason_code": "reviewer_continue",
+                    "automatic_resume_allowed": True,
                     "goal": "Safe goal",
                     "continuation": continuation.model_dump(mode="json"),
                 }
@@ -503,23 +505,32 @@ class SupervisorTerminalTests(unittest.TestCase):
         return result, resume
 
     def _write_needs_result(
-        self, *, message: str = "Continue safely", continuation: object = None
+        self,
+        *,
+        message: str = "Continue safely",
+        continuation: object = None,
+        schema_version: int = 3,
+        stop_reason_code: str | None = None,
+        automatic_resume_allowed: bool | None = None,
     ) -> None:
         forge_dir = self.project / ".forge"
         forge_dir.mkdir(parents=True, exist_ok=True)
         if continuation is None:
             continuation = {"next_prompt": "Exact inherited packet."}
+        payload = {
+            "schema_version": schema_version,
+            "run_id": "source-run",
+            "final_status": "needs_continuation",
+            "final_message": message,
+            "continuation": continuation,
+            "chain_child_runs": 1,
+        }
+        if stop_reason_code is not None:
+            payload["stop_reason_code"] = stop_reason_code
+        if automatic_resume_allowed is not None:
+            payload["automatic_resume_allowed"] = automatic_resume_allowed
         (forge_dir / "result.json").write_text(
-            json.dumps(
-                {
-                    "schema_version": 3,
-                    "run_id": "source-run",
-                    "final_status": "needs_continuation",
-                    "final_message": message,
-                    "continuation": continuation,
-                    "chain_child_runs": 1,
-                }
-            ),
+            json.dumps(payload),
             encoding="utf-8",
         )
 
@@ -552,6 +563,112 @@ class SupervisorTerminalTests(unittest.TestCase):
                 Path(forge.__file__).with_name("forge.config.json"),
             )
         self.assertEqual(result, forge.EXIT_NEEDS_CONTINUATION)
+        resume.assert_not_called()
+
+    def test_structured_budget_exhaustion_stops_without_text_dependency(self):
+        self._write_needs_result(
+            schema_version=forge.SCHEMA_VERSION,
+            message="Any localized human message.",
+            stop_reason_code="chain_budget_exhausted",
+            automatic_resume_allowed=False,
+        )
+        resume = mock.Mock()
+        with mock.patch.object(
+            forge, "run_forge", return_value=forge.EXIT_NEEDS_CONTINUATION
+        ), mock.patch.object(forge, "resume_forge", resume):
+            result = forge.run_chain(
+                self.project,
+                "Goal",
+                Path(forge.__file__).with_name("forge.config.json"),
+            )
+        self.assertEqual(result, forge.EXIT_NEEDS_CONTINUATION)
+        resume.assert_not_called()
+
+    def test_current_result_ignores_budget_words_in_human_message(self):
+        self._write_needs_result(
+            schema_version=forge.SCHEMA_VERSION,
+            message="Budget exhausted is merely human prose here.",
+            stop_reason_code="next_packet_ready",
+            automatic_resume_allowed=True,
+        )
+        with mock.patch.object(
+            forge, "run_forge", return_value=forge.EXIT_NEEDS_CONTINUATION
+        ), mock.patch.object(
+            forge, "resume_forge", return_value=forge.EXIT_DONE
+        ) as resume:
+            result = forge.run_chain(
+                self.project,
+                "Goal",
+                Path(forge.__file__).with_name("forge.config.json"),
+            )
+        self.assertEqual(result, forge.EXIT_DONE)
+        resume.assert_called_once_with(self.project.resolve(), "source-run")
+
+    def test_next_packet_and_reviewer_continue_are_resumable(self):
+        for reason in ("next_packet_ready", "reviewer_continue"):
+            with self.subTest(reason=reason):
+                if (self.project / ".forge").exists():
+                    shutil.rmtree(self.project / ".forge")
+                self._write_needs_result(
+                    schema_version=forge.SCHEMA_VERSION,
+                    stop_reason_code=reason,
+                    automatic_resume_allowed=True,
+                )
+                with mock.patch.object(
+                    forge, "run_forge", return_value=forge.EXIT_NEEDS_CONTINUATION
+                ), mock.patch.object(
+                    forge, "resume_forge", return_value=forge.EXIT_DONE
+                ) as resume:
+                    result = forge.run_chain(
+                        self.project,
+                        "Goal",
+                        Path(forge.__file__).with_name("forge.config.json"),
+                    )
+                self.assertEqual(result, forge.EXIT_DONE)
+                resume.assert_called_once()
+
+    def test_automatic_resume_false_stops_even_with_valid_prompt(self):
+        self._write_needs_result(
+            schema_version=forge.SCHEMA_VERSION,
+            stop_reason_code="packet_attempts_exhausted",
+            automatic_resume_allowed=False,
+        )
+        resume = mock.Mock()
+        with mock.patch.object(
+            forge, "run_forge", return_value=forge.EXIT_NEEDS_CONTINUATION
+        ), mock.patch.object(forge, "resume_forge", resume):
+            result = forge.run_chain(
+                self.project,
+                "Goal",
+                Path(forge.__file__).with_name("forge.config.json"),
+            )
+        self.assertEqual(result, forge.EXIT_NEEDS_CONTINUATION)
+        resume.assert_not_called()
+
+    def test_invalid_status_reason_combination_is_rejected(self):
+        with self.assertRaises(ValueError):
+            forge.ResultTermination(
+                final_status="done",
+                stop_reason_code="reviewer_continue",
+                automatic_resume_allowed=True,
+            )
+
+    def test_ambiguous_legacy_result_stops_safely(self):
+        self._write_needs_result(
+            schema_version=3,
+            message="Unclear legacy continuation.",
+            continuation={"next_prompt": ""},
+        )
+        resume = mock.Mock()
+        with mock.patch.object(
+            forge, "run_forge", return_value=forge.EXIT_NEEDS_CONTINUATION
+        ), mock.patch.object(forge, "resume_forge", resume):
+            result = forge.run_chain(
+                self.project,
+                "Goal",
+                Path(forge.__file__).with_name("forge.config.json"),
+            )
+        self.assertEqual(result, forge.EXIT_FAILED)
         resume.assert_not_called()
 
     def test_corrupted_continuation_is_not_executed(self):

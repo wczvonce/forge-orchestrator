@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, TextIO
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from forge_adaptive import (
     ADAPTIVE_SCHEMA_VERSION,
@@ -146,6 +146,64 @@ class ContinuationPayload(BaseModel):
     last_release_check_run_id: str | None = None
     unavailable_models: dict[str, str] = Field(default_factory=dict)
     chain_model_fallbacks: int = 0
+
+
+StopReasonCode = Literal[
+    "chain_budget_exhausted",
+    "packet_attempts_exhausted",
+    "reviewer_continue",
+    "iterations_exhausted",
+    "next_packet_ready",
+    "external_change_review_required",
+    "blocked",
+    "subscription_limit",
+    "technical_failure",
+    "completed",
+]
+
+
+class ResultTermination(BaseModel):
+    """Strict machine-readable termination contract for current result files."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    final_status: Literal[
+        "done", "blocked", "subscription_limit", "failed", "needs_continuation"
+    ]
+    stop_reason_code: StopReasonCode
+    automatic_resume_allowed: bool
+
+    @model_validator(mode="after")
+    def validate_combination(self) -> "ResultTermination":
+        allowed_status = {
+            "chain_budget_exhausted": "needs_continuation",
+            "packet_attempts_exhausted": "needs_continuation",
+            "reviewer_continue": "needs_continuation",
+            "iterations_exhausted": "needs_continuation",
+            "next_packet_ready": "needs_continuation",
+            "external_change_review_required": "needs_continuation",
+            "blocked": "blocked",
+            "subscription_limit": "subscription_limit",
+            "technical_failure": "failed",
+            "completed": "done",
+        }[self.stop_reason_code]
+        resumable = {
+            "reviewer_continue",
+            "iterations_exhausted",
+            "next_packet_ready",
+            "external_change_review_required",
+        }
+        expected_resume = self.stop_reason_code in resumable
+        if self.final_status != allowed_status:
+            raise ValueError(
+                f"{self.stop_reason_code} is incompatible with {self.final_status}."
+            )
+        if self.automatic_resume_allowed != expected_resume:
+            raise ValueError(
+                f"{self.stop_reason_code} requires automatic_resume_allowed="
+                f"{str(expected_resume).lower()}."
+            )
+        return self
 
 
 ALLOWED_PHASES = {
@@ -1066,6 +1124,21 @@ def read_result_compat(path: Path) -> dict[str, Any]:
     payload.setdefault("parent_run_id", None)
     payload.setdefault("continuation_chain_id", payload.get("run_id"))
     payload.setdefault("continuation", None)
+    if int(payload.get("schema_version") or 1) >= SCHEMA_VERSION:
+        try:
+            ResultTermination.model_validate(
+                {
+                    "final_status": payload.get("final_status"),
+                    "stop_reason_code": payload.get("stop_reason_code"),
+                    "automatic_resume_allowed": payload.get(
+                        "automatic_resume_allowed"
+                    ),
+                }
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Current Forge result has an invalid structured termination contract."
+            ) from exc
     return payload
 
 
@@ -3406,6 +3479,7 @@ def run_forge(
     final_status = "failed"
     final_message = "Forge sa nedokončil."
     exit_code = EXIT_FAILED
+    stop_reason_code: StopReasonCode | None = None
     error_text: str | None = None
     continuation_payload: ContinuationPayload | None = None
     packet_transition_ready = False
@@ -3483,6 +3557,7 @@ def run_forge(
             if budget_reason:
                 final_status = "needs_continuation"
                 final_message = budget_reason
+                stop_reason_code = "chain_budget_exhausted"
                 exit_code = EXIT_NEEDS_CONTINUATION
                 status.set_phase(
                     "needs_continuation",
@@ -3611,6 +3686,7 @@ def run_forge(
                         if budget_reason:
                             final_status = "needs_continuation"
                             final_message = budget_reason
+                            stop_reason_code = "chain_budget_exhausted"
                             exit_code = EXIT_NEEDS_CONTINUATION
                             break
                         chain_codex_calls += 1
@@ -3735,6 +3811,7 @@ def run_forge(
                     if budget_reason:
                         final_status = "needs_continuation"
                         final_message = budget_reason
+                        stop_reason_code = "chain_budget_exhausted"
                         exit_code = EXIT_NEEDS_CONTINUATION
                         break
                     chain_codex_calls += 1
@@ -4011,6 +4088,7 @@ def run_forge(
                 if budget_reason:
                     final_status = "needs_continuation"
                     final_message = budget_reason
+                    stop_reason_code = "chain_budget_exhausted"
                     exit_code = EXIT_NEEDS_CONTINUATION
                     break
                 packet_for_worker = active_plan_packet(project_plan)
@@ -4019,6 +4097,7 @@ def run_forge(
                 max_packet_attempts = int(config.get("max_packet_attempts", 3))
                 if packet_attempt_budget_exhausted(packet_for_worker, config):
                     final_status = "needs_continuation"
+                    stop_reason_code = "packet_attempts_exhausted"
                     final_message = (
                         f"Packet attempt budget exhausted for "
                         f"{packet_for_worker.packet_id}: "
@@ -4374,6 +4453,7 @@ def run_forge(
                 "Dosiahnutý maximálny počet iterácií; nasleduje povinný "
                 "záverečný Codex review."
             )
+            stop_reason_code = "iterations_exhausted"
             exit_code = EXIT_FAILED
             print(f"[Forge][Result] {final_message}")
 
@@ -4384,6 +4464,7 @@ def run_forge(
             and final_decision.status == "continue"
         ):
             final_status = "needs_continuation"
+            stop_reason_code = "next_packet_ready"
             final_message = (
                 "Verified packet completed. The exact next dependency-ready packet "
                 "is stored for the bounded chain supervisor."
@@ -4409,6 +4490,7 @@ def run_forge(
                 if budget_reason:
                     final_status = "needs_continuation"
                     final_message = budget_reason
+                    stop_reason_code = "chain_budget_exhausted"
                     exit_code = EXIT_NEEDS_CONTINUATION
                     status.set_phase(
                         "needs_continuation",
@@ -4439,6 +4521,7 @@ def run_forge(
                 if budget_reason:
                     final_status = "needs_continuation"
                     final_message = budget_reason
+                    stop_reason_code = "chain_budget_exhausted"
                     exit_code = EXIT_NEEDS_CONTINUATION
                     status.set_phase(
                         "needs_continuation",
@@ -4576,6 +4659,7 @@ def run_forge(
                     final_status="blocked",
                 )
             elif final_decision.status == "continue":
+                stop_reason_code = "reviewer_continue"
                 continuation_payload = ContinuationPayload(
                     source_run_id=run_id,
                     continuation_chain_id=continuation_chain_id,
@@ -4638,6 +4722,7 @@ def run_forge(
                 )
             else:
                 final_status = "failed"
+                stop_reason_code = "technical_failure"
                 final_message = (
                     "Forge nedostal schválenie done alebo povinné kontroly neprešli."
                 )
@@ -4676,6 +4761,7 @@ def run_forge(
             )
             if not (next_prompt or "").strip():
                 final_status = "failed"
+                stop_reason_code = "technical_failure"
                 final_message = (
                     "Chain budget sa vyčerpal pred vytvorením bezpečného next_promptu; "
                     "Forge odmietol vymyslieť pokračovanie."
@@ -4749,6 +4835,7 @@ def run_forge(
             if current_iteration > 0:
                 save_json(logs / f"{current_iteration:02d}-worker.json", worker)
         final_status = "subscription_limit"
+        stop_reason_code = "subscription_limit"
         final_message = redact_text(str(exc))
         error_text = final_message
         exit_code = EXIT_SUBSCRIPTION_LIMIT
@@ -4761,6 +4848,7 @@ def run_forge(
         print(f"[Forge][SubscriptionLimit] {truncate(final_message, 3000)}")
     except Exception as exc:
         final_status = "failed"
+        stop_reason_code = "technical_failure"
         final_message = redact_text(str(exc))
         error_text = final_message
         exit_code = EXIT_FAILED
@@ -4778,6 +4866,27 @@ def run_forge(
     )
     if continuation_payload is not None:
         continuation_payload.chain_elapsed_seconds = chain_elapsed_seconds
+    terminal_reason = {
+        "done": "completed",
+        "blocked": "blocked",
+        "subscription_limit": "subscription_limit",
+        "failed": "technical_failure",
+    }.get(final_status)
+    if terminal_reason is not None:
+        stop_reason_code = terminal_reason
+    elif stop_reason_code is None:
+        stop_reason_code = "iterations_exhausted"
+    automatic_resume_allowed = stop_reason_code in {
+        "reviewer_continue",
+        "iterations_exhausted",
+        "next_packet_ready",
+        "external_change_review_required",
+    }
+    termination = ResultTermination(
+        final_status=final_status,
+        stop_reason_code=stop_reason_code,
+        automatic_resume_allowed=automatic_resume_allowed,
+    )
     final_state = {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
@@ -4786,6 +4895,8 @@ def run_forge(
         "goal": goal,
         "finished_at": utc_now(),
         "final_status": final_status,
+        "stop_reason_code": termination.stop_reason_code,
+        "automatic_resume_allowed": termination.automatic_resume_allowed,
         "final_message": final_message,
         "error": error_text,
         "final_decision": final_decision.model_dump(mode="json") if final_decision else None,
@@ -4992,7 +5103,13 @@ def run_chain(
 
     while exit_code == EXIT_NEEDS_CONTINUATION:
         result_path = project / ".forge" / "result.json"
-        result = read_result_compat(result_path)
+        try:
+            result = read_result_compat(result_path)
+        except RuntimeError as exc:
+            supervisor_state["status"] = "failed"
+            supervisor_state["stop_reason"] = str(exc)
+            exit_code = EXIT_FAILED
+            break
         run_id = _safe_run_id(str(result.get("run_id") or ""))
         supervisor_state["last_run_id"] = run_id
         supervisor_state["last_status"] = result.get("final_status")
@@ -5009,11 +5126,33 @@ def run_chain(
                 result.get("chain_no_progress_events") or 0
             ),
         }
+        schema_version = int(result.get("schema_version") or 1)
         final_message_text = str(result.get("final_message") or "")
-        if "budget exhausted" in final_message_text.lower():
-            supervisor_state["status"] = "needs_continuation"
-            supervisor_state["stop_reason"] = final_message_text
-            break
+        if schema_version >= SCHEMA_VERSION:
+            termination = ResultTermination.model_validate(
+                {
+                    "final_status": result.get("final_status"),
+                    "stop_reason_code": result.get("stop_reason_code"),
+                    "automatic_resume_allowed": result.get(
+                        "automatic_resume_allowed"
+                    ),
+                }
+            )
+            supervisor_state["stop_reason_code"] = termination.stop_reason_code
+            supervisor_state["automatic_resume_allowed"] = (
+                termination.automatic_resume_allowed
+            )
+            if not termination.automatic_resume_allowed:
+                supervisor_state["status"] = termination.final_status
+                supervisor_state["stop_reason"] = final_message_text
+                break
+        else:
+            # Legacy schema compatibility only. Current results never route by text.
+            if "budget exhausted" in final_message_text.lower():
+                supervisor_state["status"] = "needs_continuation"
+                supervisor_state["stop_reason"] = final_message_text
+                supervisor_state["legacy_stop_detection"] = True
+                break
         continuation = result.get("continuation")
         if not isinstance(continuation, dict) or not str(
             continuation.get("next_prompt") or ""
@@ -5036,11 +5175,17 @@ def run_chain(
         )
         exit_code = resume_forge(project, run_id)
 
-    latest_result = (
-        read_result_compat(project / ".forge" / "result.json")
-        if (project / ".forge" / "result.json").is_file()
-        else {}
-    )
+    try:
+        latest_result = (
+            read_result_compat(project / ".forge" / "result.json")
+            if (project / ".forge" / "result.json").is_file()
+            else {}
+        )
+    except RuntimeError as exc:
+        latest_result = {}
+        supervisor_state["status"] = "failed"
+        supervisor_state["stop_reason"] = str(exc)
+        exit_code = EXIT_FAILED
     supervisor_state["status"] = str(
         latest_result.get("final_status")
         or supervisor_state.get("status")

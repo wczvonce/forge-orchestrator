@@ -13,7 +13,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
-ADAPTIVE_SCHEMA_VERSION = 3
+ADAPTIVE_SCHEMA_VERSION = 4
 PACKET_STATUSES = {
     "pending",
     "in_progress",

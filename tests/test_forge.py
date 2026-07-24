@@ -159,6 +159,54 @@ class StatusAndPromptTests(unittest.TestCase):
 
 
 class OrchestratorTests(unittest.TestCase):
+    def test_codex_plan_patch_cannot_increment_worker_attempt_counter(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp)
+            goal = "Product goal"
+            plan = forge.load_or_create_plan(project, goal)
+            plan = forge.apply_plan_patch(
+                plan,
+                forge.PlanPatch(
+                    add_packets=[
+                        forge.WorkPacket(
+                            packet_id="WP-01",
+                            title="Initial packet",
+                            objective="Build the local foundation.",
+                            acceptance_criteria=["Foundation is verified."],
+                        )
+                    ],
+                    active_packet_id="WP-01",
+                    explanation="Create the test plan.",
+                ),
+                checks_passed=False,
+            )
+            decision = forge.Decision(
+                status="continue",
+                decision_kind="repair_packet",
+                assessment="Repair remains.",
+                active_packet_id="WP-01",
+                next_prompt="Repair the packet.",
+                plan_patch=forge.PlanPatch(
+                    update_packets=[
+                        forge.PacketUpdate(
+                            packet_id="WP-01",
+                            attempts_increment=1,
+                            justification="Codex must not own this counter.",
+                        )
+                    ],
+                    explanation="Review patch.",
+                ),
+            )
+            updated = forge.update_plan_from_decision(
+                project,
+                plan,
+                decision,
+                checks_are_green=False,
+                snapshot_path=project / ".forge" / "snapshot.json",
+                goal=goal,
+            )
+        self.assertEqual(updated.work_packets[0].attempts, 0)
+
     def test_codex_output_schema_requires_every_declared_property(self):
         objects_with_properties = []
 

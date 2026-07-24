@@ -3552,8 +3552,16 @@ def update_plan_from_decision(
     goal: str,
 ) -> ProjectPlan:
     if decision.plan_patch is not None:
+        # Packet attempts are an execution counter owned by Forge. Codex may
+        # update packet status and evidence, but it must not increment the
+        # counter in a review/final-review plan patch and thereby double-count
+        # a worker attempt that Forge records immediately before routing it.
+        patch_payload = decision.plan_patch.model_dump(mode="json")
+        for update in patch_payload.get("update_packets", []):
+            update["attempts_increment"] = 0
+        codex_plan_patch = PlanPatch.model_validate(patch_payload)
         plan = apply_plan_patch(
-            plan, decision.plan_patch, checks_passed=checks_are_green
+            plan, codex_plan_patch, checks_passed=checks_are_green
         )
     if not plan.work_packets and decision.status == "continue":
         packet = bootstrap_packet(decision, goal)
@@ -5603,6 +5611,30 @@ def run_chain(
     save_json(supervisor_path, supervisor_state)
     supervisor_config = load_config(config_path)
     validate_config(supervisor_config)
+    if (
+        supervisor_config.get("unattended_requires_sandbox", True)
+        and running_in_wsl()
+        and str(supervisor_config.get("security_profile", "")).lower() != "strict"
+    ):
+        message = (
+            "Bezobslužný run-chain vo WSL2 vyžaduje security_profile=strict. "
+            "Forge sa zastavil pred prvým workerom, aby sa Claude vnútorný "
+            "sandbox nemohol spustiť nad DrvFS projektom."
+        )
+        supervisor_state.update(
+            {
+                "status": "failed",
+                "stop_reason": message,
+                "stop_reason_code": "technical_failure",
+                "automatic_resume_allowed": False,
+                "exit_code": EXIT_FAILED,
+                "finished_at": utc_now(),
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+            }
+        )
+        save_json(supervisor_path, supervisor_state)
+        print(f"[Forge][SupervisorSafety] {message}", file=sys.stderr)
+        return EXIT_FAILED
     if (
         supervisor_config.get("unattended_requires_sandbox", True)
         and not sandbox_runtime_available()

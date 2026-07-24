@@ -323,6 +323,8 @@ class AdaptiveRuntimeTests(unittest.TestCase):
             forge, "WORKER_BOUNDARIES", "TEST BOUNDARIES"
         ), mock.patch.object(
             forge, "sandbox_runtime_available", return_value=True
+        ), mock.patch.object(
+            forge, "running_in_wsl", return_value=False
         ):
             exit_code = forge.run_chain(
                 self.project, "Build a four-packet fake application", config_path
@@ -493,6 +495,9 @@ class SupervisorTerminalTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.project = Path(self.temp.name) / "project"
         self.project.mkdir()
+        self.strict_config = Path(forge.__file__).with_name(
+            "forge.strict.config.json"
+        )
         self.sandbox = mock.patch.object(
             forge, "sandbox_runtime_available", return_value=True
         )
@@ -510,7 +515,7 @@ class SupervisorTerminalTests(unittest.TestCase):
             result = forge.run_chain(
                 self.project,
                 "Goal",
-                Path(forge.__file__).with_name("forge.config.json"),
+                self.strict_config,
             )
         return result, resume
 
@@ -567,7 +572,7 @@ class SupervisorTerminalTests(unittest.TestCase):
             result = forge.run_chain(
                 self.project,
                 "Goal",
-                Path(forge.__file__).with_name("forge.config.json"),
+                self.strict_config,
             )
         self.assertEqual(result, forge.EXIT_FAILED)
         run.assert_not_called()
@@ -577,6 +582,25 @@ class SupervisorTerminalTests(unittest.TestCase):
             )
         )
         self.assertEqual(state["stop_reason_code"], "technical_failure")
+
+    def test_unattended_chain_on_wsl_requires_strict_profile(self):
+        run = mock.Mock(return_value=forge.EXIT_DONE)
+        config_path = Path(forge.__file__).with_name("forge.config.json")
+        with mock.patch.object(
+            forge, "running_in_wsl", return_value=True
+        ), mock.patch.object(
+            forge, "sandbox_runtime_available", return_value=True
+        ), mock.patch.object(forge, "run_forge", run):
+            result = forge.run_chain(self.project, "Goal", config_path)
+        self.assertEqual(result, forge.EXIT_FAILED)
+        run.assert_not_called()
+        state = json.loads(
+            (self.project / ".forge" / "chain-supervisor.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(state["stop_reason_code"], "technical_failure")
+        self.assertIn("security_profile=strict", state["stop_reason"])
 
     def test_budget_exhaustion_stops_without_another_child(self):
         self._write_needs_result(
@@ -589,7 +613,7 @@ class SupervisorTerminalTests(unittest.TestCase):
             result = forge.run_chain(
                 self.project,
                 "Goal",
-                Path(forge.__file__).with_name("forge.config.json"),
+                self.strict_config,
             )
         self.assertEqual(result, forge.EXIT_NEEDS_CONTINUATION)
         resume.assert_not_called()
@@ -608,7 +632,7 @@ class SupervisorTerminalTests(unittest.TestCase):
             result = forge.run_chain(
                 self.project,
                 "Goal",
-                Path(forge.__file__).with_name("forge.config.json"),
+                self.strict_config,
             )
         self.assertEqual(result, forge.EXIT_NEEDS_CONTINUATION)
         resume.assert_not_called()
@@ -628,7 +652,7 @@ class SupervisorTerminalTests(unittest.TestCase):
             result = forge.run_chain(
                 self.project,
                 "Goal",
-                Path(forge.__file__).with_name("forge.config.json"),
+                self.strict_config,
             )
         self.assertEqual(result, forge.EXIT_DONE)
         resume.assert_called_once_with(self.project.resolve(), "source-run")
@@ -651,7 +675,7 @@ class SupervisorTerminalTests(unittest.TestCase):
                     result = forge.run_chain(
                         self.project,
                         "Goal",
-                        Path(forge.__file__).with_name("forge.config.json"),
+                        self.strict_config,
                     )
                 self.assertEqual(result, forge.EXIT_DONE)
                 resume.assert_called_once()
@@ -669,7 +693,7 @@ class SupervisorTerminalTests(unittest.TestCase):
             result = forge.run_chain(
                 self.project,
                 "Goal",
-                Path(forge.__file__).with_name("forge.config.json"),
+                self.strict_config,
             )
         self.assertEqual(result, forge.EXIT_NEEDS_CONTINUATION)
         resume.assert_not_called()
@@ -695,7 +719,7 @@ class SupervisorTerminalTests(unittest.TestCase):
             result = forge.run_chain(
                 self.project,
                 "Goal",
-                Path(forge.__file__).with_name("forge.config.json"),
+                self.strict_config,
             )
         self.assertEqual(result, forge.EXIT_FAILED)
         resume.assert_not_called()
@@ -709,7 +733,7 @@ class SupervisorTerminalTests(unittest.TestCase):
             result = forge.run_chain(
                 self.project,
                 "Goal",
-                Path(forge.__file__).with_name("forge.config.json"),
+                self.strict_config,
             )
         self.assertEqual(result, forge.EXIT_FAILED)
         resume.assert_not_called()
@@ -724,7 +748,7 @@ class SupervisorTerminalTests(unittest.TestCase):
             result = forge.run_chain(
                 self.project,
                 "Generic goal that must not be restarted",
-                Path(forge.__file__).with_name("forge.config.json"),
+                self.strict_config,
             )
         self.assertEqual(result, forge.EXIT_DONE)
         resume.assert_called_once_with(self.project.resolve(), "source-run")

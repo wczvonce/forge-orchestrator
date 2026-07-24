@@ -2,6 +2,23 @@
 
 Dátum auditu: 22. júl 2026
 
+## Strict Windows wrapper používa auditovaný WSL2 runtime — 24. júl 2026
+
+1. `Start-ForgeAutonomous.ps1 -Mode Strict` už na Windows nevyberá natívny
+   Python bez plného Claude Bash sandboxu.
+2. Wrapper používa WSL distribúciu `Ubuntu-24.04`, používateľa `forge` a
+   izolovaný Forge runtime v `/home/forge/GPT-Claude-Forge`.
+3. Pred doctorom overuje SHA-256 zhodu `forge.py` a strict konfigurácie medzi
+   Windows zdrojom a WSL mirrorom, Python 3.11+ s `pydantic` a funkčný
+   Sandbox Runtime cez `srt --version`.
+4. Windows cestu projektu prekladá iba z validnej lokálnej cesty s písmenom
+   disku a existenciu cieľa overí vo WSL. UNC a nejednoznačné cesty bezpečne
+   odmietne.
+5. Wrapper následne spustí jeden WSL `run-chain`; Live Monitor zostáva
+   read-only Windows proces nad rovnakým `.forge` stavom.
+6. Pri chybe preflightu neexistuje fallback na natívny Windows worker,
+   nesandboxovaný `run`, API billing ani generický reštart.
+
 ## Check safety, Android reports a structured supervisor — 24. júl 2026
 
 Údržba vyšla z čistého `main` commit SHA

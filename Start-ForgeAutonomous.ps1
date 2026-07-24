@@ -49,6 +49,10 @@ $TranscriptStarted = $false
 $ResolvedLogPath = $null
 $MonitorOpened = $false
 $IsResume = $PSCmdlet.ParameterSetName -in @("ResumeLatest", "ResumeRunId")
+$StrictWslDistribution = "Ubuntu-24.04"
+$StrictWslUser = "forge"
+$StrictWslForgeRoot = "/home/forge/GPT-Claude-Forge"
+$StrictWslPath = "/home/forge/.local/bin:/usr/local/bin:/usr/bin:/bin"
 
 function Test-PythonCandidate {
   param(
@@ -97,6 +101,152 @@ function Find-ForgePython {
   }
 
   throw "Nenasiel sa Python 3.11+ s balikom pydantic. Oprav Forge .venv alebo znovu spusti install_windows.ps1."
+}
+
+function Get-StrictWslCommand {
+  $WslCommand = Get-Command wsl.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($null -eq $WslCommand) {
+    throw "Rezim Strict vyzaduje auditovany WSL2 runtime, ale wsl.exe sa nenasiel."
+  }
+  return $WslCommand.Source
+}
+
+function Invoke-StrictWslProbe {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$WslExecutable,
+
+    [Parameter(Mandatory = $true)]
+    [string[]]$Arguments
+  )
+
+  $ProbeOutput = & $WslExecutable @(
+    "-d", $StrictWslDistribution,
+    "-u", $StrictWslUser,
+    "--",
+    "/usr/bin/env", "PATH=$StrictWslPath"
+  ) @Arguments
+  return [int]$LASTEXITCODE
+}
+
+function Get-StrictWslSha256 {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$WslExecutable,
+
+    [Parameter(Mandatory = $true)]
+    [string]$Path
+  )
+
+  $Output = & $WslExecutable @(
+    "-d", $StrictWslDistribution,
+    "-u", $StrictWslUser,
+    "--",
+    "/usr/bin/sha256sum", $Path
+  )
+  if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$Output)) {
+    throw "Nepodarilo sa overit SHA-256 WSL suboru: $Path"
+  }
+  $Hash = ([string]$Output -split "\s+")[0].Trim().ToLowerInvariant()
+  if ($Hash -notmatch "^[0-9a-f]{64}$") {
+    throw "WSL vratil neplatny SHA-256 pre subor: $Path"
+  }
+  return $Hash
+}
+
+function Assert-StrictWslMirror {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$WslExecutable,
+
+    [Parameter(Mandatory = $true)]
+    [string]$WindowsPath,
+
+    [Parameter(Mandatory = $true)]
+    [string]$WslPath
+  )
+
+  $WindowsHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $WindowsPath).Hash.ToLowerInvariant()
+  $WslHash = Get-StrictWslSha256 -WslExecutable $WslExecutable -Path $WslPath
+  if ($WindowsHash -ne $WslHash) {
+    throw "Auditovany WSL Forge mirror sa nezhoduje s Windows zdrojom: $WindowsPath"
+  }
+}
+
+function Convert-ToStrictWslPath {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$WslExecutable,
+
+    [Parameter(Mandatory = $true)]
+    [string]$WindowsPath
+  )
+
+  $FullPath = [System.IO.Path]::GetFullPath($WindowsPath)
+  if ($FullPath -notmatch "^([A-Za-z]):\\(.*)$") {
+    throw "Rezim Strict podporuje iba lokalnu Windows cestu s pismenom disku: $WindowsPath"
+  }
+  $Drive = $Matches[1].ToLowerInvariant()
+  $RelativePath = $Matches[2].Replace("\", "/")
+  $TranslatedPath = if ([string]::IsNullOrWhiteSpace($RelativePath)) {
+    "/mnt/$Drive"
+  }
+  else {
+    "/mnt/$Drive/$RelativePath"
+  }
+
+  $ProbeOutput = & $WslExecutable @(
+    "-d", $StrictWslDistribution,
+    "-u", $StrictWslUser,
+    "--",
+    "/usr/bin/test", "-d", $TranslatedPath
+  )
+  if ($LASTEXITCODE -ne 0) {
+    throw "Nepodarilo sa bezpecne prelozit Windows cestu do WSL: $WindowsPath"
+  }
+  return $TranslatedPath
+}
+
+function Find-StrictWslPython {
+  $WslExecutable = Get-StrictWslCommand
+  $WslForgeScript = "$StrictWslForgeRoot/forge.py"
+  $WslConfigPath = "$StrictWslForgeRoot/forge.strict.config.json"
+  $WslPython = "$StrictWslForgeRoot/.venv/bin/python"
+  $WslSrt = "/home/forge/.local/bin/srt"
+
+  Assert-StrictWslMirror -WslExecutable $WslExecutable -WindowsPath $ForgeScript -WslPath $WslForgeScript
+  Assert-StrictWslMirror -WslExecutable $WslExecutable -WindowsPath $ConfigPath -WslPath $WslConfigPath
+
+  $PythonExitCode = Invoke-StrictWslProbe -WslExecutable $WslExecutable -Arguments @(
+    $WslPython,
+    "-c",
+    "import sys, pydantic; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)"
+  )
+  if ($PythonExitCode -ne 0) {
+    throw "Auditovany WSL Forge Python 3.11+ s balikom pydantic nie je dostupny."
+  }
+
+  $SrtExitCode = Invoke-StrictWslProbe -WslExecutable $WslExecutable -Arguments @(
+    $WslSrt,
+    "--version"
+  )
+  if ($SrtExitCode -ne 0) {
+    throw "Rezim Strict sa zastavil pred workerom: overeny WSL Sandbox Runtime (srt) nie je dostupny."
+  }
+
+  return [pscustomobject]@{
+    File = $WslExecutable
+    PrefixArgs = @(
+      "-d", $StrictWslDistribution,
+      "-u", $StrictWslUser,
+      "--",
+      "/usr/bin/env", "PATH=$StrictWslPath",
+      $WslPython
+    )
+    ForgeScript = $WslForgeScript
+    ConfigPath = $WslConfigPath
+    Label = "Forge WSL2 strict .venv"
+  }
 }
 
 function Set-PreferredCodexPath {
@@ -168,7 +318,13 @@ function Invoke-ForgePython {
   )
 
   $Executable = [string]$Python.File
-  $AllArguments = @($Python.PrefixArgs) + @($ForgeScript) + $Arguments
+  $RuntimeForgeScript = if ($Python.PSObject.Properties.Name -contains "ForgeScript") {
+    [string]$Python.ForgeScript
+  }
+  else {
+    $ForgeScript
+  }
+  $AllArguments = @($Python.PrefixArgs) + @($RuntimeForgeScript) + $Arguments
   & $Executable @AllArguments
   $script:LastForgeExitCode = [int]$LASTEXITCODE
 }
@@ -267,9 +423,20 @@ try {
     throw "Zadanie nesmie byt prazdne."
   }
 
-  $PreferredCodex = Set-PreferredCodexPath
-  $PreferredClaude = Set-PreferredClaudePath
-  $Python = Find-ForgePython
+  if ($Mode -eq "Strict") {
+    $PreferredCodex = $null
+    $PreferredClaude = $null
+    $Python = Find-StrictWslPython
+    $RuntimeProjectPath = Convert-ToStrictWslPath -WslExecutable $Python.File -WindowsPath $ResolvedProjectPath
+    $RuntimeConfigPath = [string]$Python.ConfigPath
+  }
+  else {
+    $PreferredCodex = Set-PreferredCodexPath
+    $PreferredClaude = Set-PreferredClaudePath
+    $Python = Find-ForgePython
+    $RuntimeProjectPath = $ResolvedProjectPath
+    $RuntimeConfigPath = $ConfigPath
+  }
   Write-Host "Forge: $ForgeRoot"
   Write-Host "Projekt: $ResolvedProjectPath"
   Write-Host "Rezim: $Mode"
@@ -327,16 +494,16 @@ try {
       }
       Invoke-ForgePython -Python $Python -Arguments @(
         "run-chain",
-        "--project", $ResolvedProjectPath,
+        "--project", $RuntimeProjectPath,
         "--resume-run-id", $SelectedRunId
       )
     }
     else {
       Invoke-ForgePython -Python $Python -Arguments @(
         "run-chain",
-        "--project", $ResolvedProjectPath,
+        "--project", $RuntimeProjectPath,
         "--goal", $GoalText,
-        "--config", $ConfigPath
+        "--config", $RuntimeConfigPath
       )
     }
     $ExitCode = $LastForgeExitCode

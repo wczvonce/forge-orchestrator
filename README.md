@@ -133,7 +133,18 @@ Aktuálne lokálne Claude Code 2.1.205 v `--help` neuvádza `--max-turns`. Forge
   -Mode EconomyMax
 ```
 
-Ďalšie režimy wrappera sú `Android` (povinné Gradle kontroly) a `Strict` (vyžaduje Sandbox Runtime).
+Ďalšie režimy wrappera sú `Android` (povinné Gradle kontroly) a `Strict`.
+Na Windows wrapper spúšťa `Strict` cez auditovaný WSL2 runtime
+`Ubuntu-24.04` pod používateľom `forge`. Pred doctorom aj prvým workerom:
+
+- overí zhodu SHA-256 súborov `forge.py` a `forge.strict.config.json` medzi
+  Windows inštaláciou a WSL mirrorom,
+- overí WSL Python 3.11+ s `pydantic`,
+- overí `srt --version`,
+- bezpečne preloží samostatnú lokálnu Windows cestu projektu na `/mnt/<disk>/...`.
+
+Ak niektorá kontrola zlyhá, wrapper skončí pred modelovým volaním. Natívny
+Windows strict worker sa nepoužije ako tichý fallback.
 
 ## Ako adaptívny cyklus funguje
 

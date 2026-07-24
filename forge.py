@@ -1277,6 +1277,10 @@ def untracked_preview(
     max_file_chars: int = 1500,
     only_paths: set[str] | None = None,
 ) -> str:
+    # Resolve the project once before resolving child paths. On Windows an 8.3
+    # path such as RUNNER~1 can otherwise be compared with its expanded form,
+    # causing safe in-project files to be skipped from evidence.
+    project = project.expanduser().resolve()
     code, out = run_git(project, "ls-files", "--others", "--exclude-standard")
     if code != 0 or not out:
         return "(žiadne)"

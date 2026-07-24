@@ -581,7 +581,7 @@ class SupervisorTerminalTests(unittest.TestCase):
                 Path(forge.__file__).with_name("forge.config.json"),
             )
         self.assertEqual(result, forge.EXIT_DONE)
-        resume.assert_called_once_with(self.project, "source-run")
+        resume.assert_called_once_with(self.project.resolve(), "source-run")
 
 
 if __name__ == "__main__":

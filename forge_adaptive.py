@@ -211,6 +211,47 @@ class ProjectPlan(StrictModel):
                 )
         if not set(self.completed_packet_ids).issubset(known):
             raise ValueError("completed_packet_ids contains an unknown packet.")
+        by_id = {packet.packet_id: packet for packet in self.work_packets}
+        visiting: list[str] = []
+        visited: set[str] = set()
+
+        def visit(packet_id: str) -> None:
+            if packet_id in visiting:
+                start = visiting.index(packet_id)
+                cycle = visiting[start:] + [packet_id]
+                raise ValueError(
+                    "Work packet dependency cycle: " + " -> ".join(cycle)
+                )
+            if packet_id in visited:
+                return
+            visiting.append(packet_id)
+            for dependency in by_id[packet_id].dependencies:
+                visit(dependency)
+            visiting.pop()
+            visited.add(packet_id)
+
+        for packet_id in packet_ids:
+            visit(packet_id)
+
+        unfinished = [
+            packet
+            for packet in self.work_packets
+            if packet.status not in {"completed", "superseded"}
+        ]
+        if unfinished and self.status not in {"done", "blocked"}:
+            ready = [
+                packet
+                for packet in unfinished
+                if packet.status in {"pending", "in_progress", "verification"}
+                and all(
+                    by_id[dependency].status == "completed"
+                    for dependency in packet.dependencies
+                )
+            ]
+            if not ready:
+                raise ValueError(
+                    "Project plan has unfinished work but no dependency-ready packet."
+                )
         return self
 
 
@@ -275,6 +316,24 @@ class CheckDefinition(StrictModel):
     test_count_pattern: str | None = None
     report_path: str | None = None
     report_validation: Literal["none", "exists", "nonempty", "json"] = "none"
+    check_kind: Literal[
+        "auto", "test", "build", "lint", "typecheck", "security", "other"
+    ] = "auto"
+    report_format: Literal[
+        "auto",
+        "text",
+        "pytest-text",
+        "unittest-text",
+        "junit-xml",
+        "jest-json",
+        "vitest-json",
+        "playwright-json",
+        "gradle-junit",
+        "android-junit",
+        "trx",
+        "flutter-json",
+    ] = "auto"
+    require_test_execution: bool = False
 
     @model_validator(mode="after")
     def validate_command(self) -> "CheckDefinition":
@@ -336,6 +395,13 @@ class RoutingRecord(StrictModel):
     max_turns: int
     reason: str
     fallback_from: str | None = None
+    fallback_reason: str | None = None
+    candidate_index: int = 0
+    requested_turn_budget: int
+    cli_turn_limit_enforced: bool
+    effective_timeout: int
+    max_packet_attempts: int
+    max_chain_worker_calls: int
     model_argument_allowed: bool = True
     effort_argument_allowed: bool = True
     max_turns_argument_allowed: bool = False
@@ -607,13 +673,24 @@ def choose_worker_profile(
     return requested, f"Packet difficulty={packet.difficulty}, risk={packet.risk}."
 
 
+def packet_attempt_budget_exhausted(
+    packet: WorkPacket, config: dict[str, Any]
+) -> bool:
+    return packet.attempts >= int(config.get("max_packet_attempts", 3))
+
+
 def resolve_worker_runtime(
     profile: str,
     config: dict[str, Any],
     *,
     unsupported_models: set[str] | None = None,
+    fallback_reasons: dict[str, str] | None = None,
 ) -> RoutingRecord:
     unsupported_models = {item.casefold() for item in (unsupported_models or set())}
+    fallback_reasons = {
+        str(key).casefold(): str(value)
+        for key, value in (fallback_reasons or {}).items()
+    }
     profiles = config.get("adaptive_profiles", {}).get("claude", {})
     profile_config = profiles.get(profile)
     if not isinstance(profile_config, dict):
@@ -626,7 +703,9 @@ def resolve_worker_runtime(
         for item in config.get("confirmed_subscription_models", [])
     }
     fallback_from: str | None = None
+    fallback_reason: str | None = None
     chosen: dict[str, Any] | None = None
+    chosen_index = 0
     for index, candidate in enumerate(candidates):
         if not isinstance(candidate, dict):
             continue
@@ -636,12 +715,17 @@ def resolve_worker_runtime(
         if candidate.get("requires_subscription_confirmation", False) and model.casefold() not in confirmed:
             if fallback_from is None:
                 fallback_from = model
+                fallback_reason = "subscription_not_confirmed"
             continue
         if model.casefold() in unsupported_models:
             if fallback_from is None:
                 fallback_from = model
+                fallback_reason = fallback_reasons.get(
+                    model.casefold(), "runtime_model_unavailable"
+                )
             continue
         chosen = candidate
+        chosen_index = index
         break
     if chosen is None:
         raise RuntimeError(
@@ -651,6 +735,20 @@ def resolve_worker_runtime(
     model = str(chosen["model"])
     effort = str(chosen.get("effort") or profile_config.get("effort") or "medium")
     max_turns = int(profile_config.get("max_turns", 20))
+    cli_turn_limit = bool(config.get("claude_supports_max_turns", False))
+    effective_timeout = int(
+        profile_config.get(
+            "timeout_seconds", config.get("claude_timeout_seconds", 3600)
+        )
+    )
+    max_packet_attempts = int(
+        profile_config.get(
+            "max_packet_attempts", config.get("max_packet_attempts", 3)
+        )
+    )
+    max_chain_worker_calls = int(
+        config.get("chain_budgets", {}).get("max_worker_calls", 16)
+    )
     return RoutingRecord(
         selected_profile=profile,
         selected_model=model,
@@ -658,10 +756,86 @@ def resolve_worker_runtime(
         max_turns=max_turns,
         reason=str(profile_config.get("reason") or f"Allowlisted {profile} profile."),
         fallback_from=fallback_from,
+        fallback_reason=fallback_reason,
+        candidate_index=chosen_index,
+        requested_turn_budget=max_turns,
+        cli_turn_limit_enforced=cli_turn_limit,
+        effective_timeout=effective_timeout,
+        max_packet_attempts=max_packet_attempts,
+        max_chain_worker_calls=max_chain_worker_calls,
         model_argument_allowed=bool(config.get("claude_supports_model", True)),
         effort_argument_allowed=bool(config.get("claude_supports_effort", True)),
-        max_turns_argument_allowed=bool(config.get("claude_supports_max_turns", False)),
+        max_turns_argument_allowed=cli_turn_limit,
     )
+
+
+MODEL_FALLBACK_REASONS = {
+    "model_unavailable",
+    "model_not_included",
+    "usage_credits_required",
+    "api_billing_required",
+    "invalid_model_alias",
+}
+
+
+def classify_worker_termination(
+    output: str,
+    *,
+    exit_code: int,
+    timed_out: bool = False,
+    final_is_error: bool = False,
+) -> str:
+    """Classify a Claude CLI termination without authorizing billing changes."""
+    if timed_out:
+        return "timeout"
+    if exit_code == 0 and not final_is_error:
+        return "success"
+    text = output.casefold()
+    if re.search(
+        r"\b(?:usage credits?|extra usage|purchase credits?|buy credits?|"
+        r"credits? exhausted|credit balance)\b",
+        text,
+    ):
+        return "usage_credits_required"
+    if re.search(r"\b(?:api key required|anthropic_api_key|api billing|console billing)\b", text):
+        return "api_billing_required"
+    if re.search(
+        r"\b(?:not included in (?:your|this) (?:plan|subscription)|"
+        r"model is not included|upgrade your plan)\b",
+        text,
+    ):
+        return "model_not_included"
+    if re.search(
+        r"\b(?:invalid (?:model|model alias)|unknown model|unsupported model alias)\b",
+        text,
+    ):
+        return "invalid_model_alias"
+    if re.search(
+        r"(?:\bmodel\b.{0,80}\b(?:unavailable|not available|not found|unsupported)"
+        r"|could not resolve model|no such model)",
+        text,
+    ):
+        return "model_unavailable"
+    if re.search(
+        r"\b(?:session limit|weekly limit|usage limit|subscription limit|quota exceeded)\b",
+        text,
+    ):
+        return "subscription_limit"
+    if re.search(r"\b(?:rate limit|too many requests|429)\b", text):
+        return "rate_limit"
+    if re.search(
+        r"\b(?:not logged in|authentication failed|unauthorized|"
+        r"please (?:run|use).{0,20}(?:login|auth)|oauth.*(?:expired|failed))\b",
+        text,
+    ):
+        return "auth_failure"
+    if re.search(r"\b(?:sandbox denial|permission denied by sandbox)\b", text):
+        return "sandbox_denial"
+    if re.search(r"\b(?:max turns?|maximum turns?)\b", text):
+        return "max_turns"
+    if re.search(r"\b(?:refus(?:al|ed)|cannot assist)\b", text):
+        return "refusal"
+    return "cli_failure"
 
 
 def normalize_check_definitions(config: dict[str, Any]) -> list[CheckDefinition]:
@@ -891,6 +1065,7 @@ def export_schemas(directory: Path) -> list[Path]:
         "check-definition.schema.json": CheckDefinition,
         "evidence-index.schema.json": EvidenceIndex,
         "chain-budgets.schema.json": ChainBudgets,
+        "routing-record.schema.json": RoutingRecord,
     }
     written: list[Path] = []
     for filename, model in models.items():

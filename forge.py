@@ -36,19 +36,23 @@ from forge_adaptive import (
     build_evidence_index,
     choose_codex_profile,
     choose_worker_profile,
+    classify_worker_termination,
     detect_test_count,
     export_schemas,
     git_baseline,
     load_or_create_plan,
     normalize_check_definitions,
+    packet_attempt_budget_exhausted,
     plan_hash,
     resolve_worker_runtime,
+    MODEL_FALLBACK_REASONS,
     save_plan,
     select_check_definitions,
     stable_project_identity,
     validate_check_report,
     write_assumptions,
 )
+from forge_reports import TestMetrics, evaluate_test_evidence
 
 SCHEMA_VERSION = ADAPTIVE_SCHEMA_VERSION
 EXIT_DONE = 0
@@ -77,6 +81,14 @@ class CheckResult(BaseModel):
     check_id: str = ""
     tier: Literal["smoke", "targeted", "milestone", "release"] = "targeted"
     test_count: int | None = None
+    tests_discovered: int | None = None
+    tests_executed: int | None = None
+    tests_passed: int | None = None
+    tests_failed: int | None = None
+    tests_skipped: int | None = None
+    report_path: str | None = None
+    report_format: str | None = None
+    report_failure_reason: str | None = None
     report_valid: bool = True
     cache_hit: bool = False
 
@@ -89,6 +101,19 @@ class WorkerResult(BaseModel):
     model: str = ""
     effort: str = ""
     escalated: bool = False
+    termination_reason: str = "unknown"
+    requested_turn_budget: int | None = None
+    cli_turn_limit_enforced: bool = False
+    effective_timeout: int | None = None
+
+
+class RoutedWorkerOutcome(BaseModel):
+    worker: WorkerResult
+    routing_records: list[dict[str, Any]] = Field(default_factory=list)
+    worker_calls: int = 0
+    premium_calls: int = 0
+    model_fallbacks: int = 0
+    unavailable_models: dict[str, str] = Field(default_factory=dict)
 
 
 class ContinuationPayload(BaseModel):
@@ -117,6 +142,8 @@ class ContinuationPayload(BaseModel):
     chain_codex_calls: int = 0
     chain_no_progress_events: int = 0
     last_release_check_run_id: str | None = None
+    unavailable_models: dict[str, str] = Field(default_factory=dict)
+    chain_model_fallbacks: int = 0
 
 
 ALLOWED_PHASES = {
@@ -337,6 +364,11 @@ class StatusTracker:
             "codex_assignment": None,
             "worker_profile": None,
             "worker_profile_reason": None,
+            "requested_turn_budget": None,
+            "cli_turn_limit_enforced": False,
+            "effective_timeout": None,
+            "max_packet_attempts": None,
+            "max_chain_worker_calls": None,
             "check_tier": None,
             "last_result": None,
             "next_action": None,
@@ -414,6 +446,11 @@ class StatusTracker:
             "codex_assignment",
             "worker_profile",
             "worker_profile_reason",
+            "requested_turn_budget",
+            "cli_turn_limit_enforced",
+            "effective_timeout",
+            "max_packet_attempts",
+            "max_chain_worker_calls",
             "check_tier",
             "last_result",
             "next_action",
@@ -478,6 +515,7 @@ DEFAULT_CONFIG = {
     "max_iterations": 2,
     "claude_max_turns": 45,
     "claude_timeout_seconds": 3600,
+    "max_packet_attempts": 3,
     "claude_escalation_enabled": True,
     "claude_escalation_model": "opus",
     "claude_escalation_effort": "xhigh",
@@ -1239,6 +1277,10 @@ def untracked_preview(
     max_file_chars: int = 1500,
     only_paths: set[str] | None = None,
 ) -> str:
+    # Resolve the project once before resolving child paths. On Windows an 8.3
+    # path such as RUNNER~1 can otherwise be compared with its expanded form,
+    # causing safe in-project files to be skipped from evidence.
+    project = project.expanduser().resolve()
     code, out = run_git(project, "ls-files", "--others", "--exclude-standard")
     if code != 0 or not out:
         return "(žiadne)"
@@ -1557,6 +1599,7 @@ def run_checks(
                 message=f"Spúšťam kontrolu: {visible_command}",
             )
         started = time.monotonic()
+        started_wall_time = time.time()
         try:
             invocation, use_shell = check_command_args(command, project, config)
             if use_shell and str(config.get("sandbox_checks", "auto")).lower() == "auto" and not warned_unsandboxed:
@@ -1578,9 +1621,38 @@ def run_checks(
             detected_test_count = detect_test_count(
                 raw_check_output, definition
             )
-            report_valid = validate_check_report(project, definition) and (
-                definition.test_count_pattern is None
-                or detected_test_count is not None
+            test_metrics = evaluate_test_evidence(
+                project,
+                definition,
+                raw_check_output,
+                started_wall_time=started_wall_time,
+            )
+            if (
+                detected_test_count is not None
+                and test_metrics.executed is None
+                and definition.test_count_pattern is not None
+            ):
+                test_metrics = TestMetrics(
+                    discovered=detected_test_count,
+                    executed=detected_test_count,
+                    passed=detected_test_count if cp.returncode == 0 else 0,
+                    failed=0 if cp.returncode == 0 else detected_test_count,
+                    skipped=0,
+                    report_format="text-pattern",
+                    report_valid=detected_test_count > 0,
+                    failure_reason=(
+                        None
+                        if detected_test_count > 0
+                        else "Test check executed zero tests."
+                    ),
+                )
+            report_valid = (
+                validate_check_report(project, definition)
+                and test_metrics.report_valid
+                and (
+                    definition.test_count_pattern is None
+                    or detected_test_count is not None
+                )
             )
             output = raw_check_output
             output_limit = int(
@@ -1597,7 +1669,19 @@ def run_checks(
                     output=output or "(bez výstupu)",
                     check_id=definition.check_id,
                     tier=definition.tier,
-                    test_count=detected_test_count,
+                    test_count=(
+                        test_metrics.discovered
+                        if test_metrics.discovered is not None
+                        else detected_test_count
+                    ),
+                    tests_discovered=test_metrics.discovered,
+                    tests_executed=test_metrics.executed,
+                    tests_passed=test_metrics.passed,
+                    tests_failed=test_metrics.failed,
+                    tests_skipped=test_metrics.skipped,
+                    report_path=test_metrics.report_path,
+                    report_format=test_metrics.report_format,
+                    report_failure_reason=test_metrics.failure_reason,
                     report_valid=report_valid,
                 )
             )
@@ -2244,6 +2328,7 @@ def run_claude(
     model_override: str | None = None,
     effort_override: str | None = None,
     max_turns_override: int | None = None,
+    effective_timeout_override: int | None = None,
     escalated: bool = False,
     log_stem: str | None = None,
 ) -> WorkerResult:
@@ -2290,7 +2375,12 @@ def run_claude(
     if config.get("claude_supports_effort", True) and selected_effort:
         cmd.extend(["--effort", selected_effort])
     started = time.monotonic()
-    timeout_seconds = int(config["claude_timeout_seconds"])
+    timeout_seconds = int(
+        effective_timeout_override or config["claude_timeout_seconds"]
+    )
+    cli_turn_limit_enforced = bool(
+        config.get("claude_supports_max_turns", False)
+    )
     output_queue: queue.Queue[tuple[str, str | None]] = queue.Queue()
     timed_out = False
     with raw_path.open("w", encoding="utf-8", newline="") as raw_handle, live_path.open(
@@ -2391,6 +2481,10 @@ def run_claude(
                 model=selected_model,
                 effort=selected_effort,
                 escalated=escalated,
+                termination_reason="timeout",
+                requested_turn_budget=selected_max_turns,
+                cli_turn_limit_enforced=cli_turn_limit_enforced,
+                effective_timeout=timeout_seconds,
             )
 
         return_code = int(process.returncode or 0)
@@ -2403,15 +2497,21 @@ def run_claude(
         final_event_output = json.dumps(
             processor.final_event or {}, ensure_ascii=False
         ).lower()
+        termination_reason = classify_worker_termination(
+            final_event_output if processor.final_event is not None else raw_output,
+            exit_code=return_code,
+            final_is_error=final_is_error,
+        )
         explicit_limit_messages = (
             "you've hit your session limit",
             "you have hit your session limit",
             "claude usage limit reached",
             "weekly limit reached",
         )
-        subscription_limit_detected = any(
-            marker in final_event_output for marker in SUBSCRIPTION_LIMIT_MARKERS
-        ) or any(marker in low_output for marker in explicit_limit_messages)
+        subscription_limit_detected = (
+            termination_reason == "subscription_limit"
+            or any(marker in low_output for marker in explicit_limit_messages)
+        )
         if subscription_limit_detected and (
             return_code != 0 or final_is_error
         ):
@@ -2429,6 +2529,10 @@ def run_claude(
                     model=selected_model,
                     effort=selected_effort,
                     escalated=escalated,
+                    termination_reason="subscription_limit",
+                    requested_turn_budget=selected_max_turns,
+                    cli_turn_limit_enforced=cli_turn_limit_enforced,
+                    effective_timeout=timeout_seconds,
                 ),
             )
 
@@ -2447,6 +2551,14 @@ def run_claude(
                 model=selected_model,
                 effort=selected_effort,
                 escalated=escalated,
+                termination_reason=(
+                    termination_reason
+                    if termination_reason != "success"
+                    else "missing_final_event"
+                ),
+                requested_turn_budget=selected_max_turns,
+                cli_turn_limit_enforced=cli_turn_limit_enforced,
+                effective_timeout=timeout_seconds,
             )
 
         if final_is_error and return_code == 0:
@@ -2465,7 +2577,183 @@ def run_claude(
             model=selected_model,
             effort=selected_effort,
             escalated=escalated,
+            termination_reason=termination_reason,
+            requested_turn_budget=selected_max_turns,
+            cli_turn_limit_enforced=cli_turn_limit_enforced,
+            effective_timeout=timeout_seconds,
         )
+
+
+def run_claude_routed(
+    project: Path,
+    goal: str,
+    decision: Decision,
+    config: dict,
+    *,
+    profile: str,
+    routing_reason: str,
+    iteration: int,
+    logs: Path,
+    status: StatusTracker | None = None,
+    unavailable_models: dict[str, str] | None = None,
+    max_worker_calls_remaining: int,
+    max_premium_calls_remaining: int,
+    log_stem: str | None = None,
+) -> RoutedWorkerOutcome:
+    """Execute one logical packet through the common subscription-safe router."""
+    unavailable = {
+        str(model).casefold(): str(reason)
+        for model, reason in (unavailable_models or {}).items()
+    }
+    routing_records: list[dict[str, Any]] = []
+    worker_calls = 0
+    premium_calls = 0
+    fallbacks = 0
+    last_worker: WorkerResult | None = None
+    premium_aliases = {
+        str(item).casefold()
+        for item in config.get("premium_model_aliases", ["opus", "fable"])
+    }
+    base_stem = log_stem or f"{iteration:02d}"
+
+    while worker_calls < max_worker_calls_remaining:
+        try:
+            routing = resolve_worker_runtime(
+                profile,
+                config,
+                unsupported_models=set(unavailable),
+                fallback_reasons=unavailable,
+            )
+        except RuntimeError:
+            terminal = WorkerResult(
+                exit_code=78,
+                summary=(
+                    "No subscription-included allowlisted Claude model remains. "
+                    "Forge did not enable usage credits or API billing."
+                ),
+                raw_output="",
+                duration_seconds=0.0,
+                model=last_worker.model if last_worker is not None else "",
+                effort=last_worker.effort if last_worker is not None else "",
+                escalated=profile == "rescue",
+                termination_reason="model_unavailable_without_credits",
+                requested_turn_budget=(
+                    last_worker.requested_turn_budget
+                    if last_worker is not None
+                    else None
+                ),
+                cli_turn_limit_enforced=(
+                    last_worker.cli_turn_limit_enforced
+                    if last_worker is not None
+                    else False
+                ),
+                effective_timeout=(
+                    last_worker.effective_timeout
+                    if last_worker is not None
+                    else int(config.get("claude_timeout_seconds", 3600))
+                ),
+            )
+            return RoutedWorkerOutcome(
+                worker=terminal,
+                routing_records=routing_records,
+                worker_calls=worker_calls,
+                premium_calls=premium_calls,
+                model_fallbacks=fallbacks,
+                unavailable_models=unavailable,
+            )
+
+        model_key = routing.selected_model.casefold()
+        if (
+            model_key in premium_aliases
+            and premium_calls >= max_premium_calls_remaining
+        ):
+            unavailable[model_key] = "premium_chain_limit"
+            continue
+
+        routing.reason = f"{routing_reason} {routing.reason}".strip()
+        if status is not None:
+            status.update_monitor_context(
+                worker_profile=profile,
+                worker_profile_reason=routing.reason,
+                requested_turn_budget=routing.requested_turn_budget,
+                cli_turn_limit_enforced=routing.cli_turn_limit_enforced,
+                effective_timeout=routing.effective_timeout,
+                max_packet_attempts=routing.max_packet_attempts,
+                max_chain_worker_calls=routing.max_chain_worker_calls,
+            )
+        attempt_stem = (
+            base_stem if worker_calls == 0 else f"{base_stem}F{worker_calls}"
+        )
+        save_json(logs / f"{attempt_stem}-worker-routing.json", routing)
+        routing_records.append(routing.model_dump(mode="json"))
+        worker_calls += 1
+        if model_key in premium_aliases:
+            premium_calls += 1
+        worker = run_claude(
+            project,
+            goal,
+            decision,
+            config,
+            iteration=iteration,
+            logs=logs,
+            status=status,
+            model_override=routing.selected_model,
+            effort_override=routing.selected_effort,
+            max_turns_override=routing.requested_turn_budget,
+            effective_timeout_override=routing.effective_timeout,
+            escalated=profile == "rescue",
+            log_stem=attempt_stem,
+        )
+        last_worker = worker
+        save_json(logs / f"{attempt_stem}-worker.json", worker)
+        if worker.termination_reason not in MODEL_FALLBACK_REASONS:
+            return RoutedWorkerOutcome(
+                worker=worker,
+                routing_records=routing_records,
+                worker_calls=worker_calls,
+                premium_calls=premium_calls,
+                model_fallbacks=fallbacks,
+                unavailable_models=unavailable,
+            )
+
+        unavailable[model_key] = worker.termination_reason
+        fallbacks += 1
+        if status is not None:
+            status.update_event(
+                current_agent="Forge",
+                message=(
+                    f"Claude model {routing.selected_model} is unavailable "
+                    f"({worker.termination_reason}); trying the next "
+                    "subscription-safe allowlisted candidate."
+                ),
+            )
+
+    terminal = last_worker or WorkerResult(
+        exit_code=78,
+        summary="Worker call chain budget was exhausted before a safe model ran.",
+        raw_output="",
+        duration_seconds=0.0,
+        termination_reason="chain_worker_budget_exhausted",
+    )
+    if terminal.termination_reason in MODEL_FALLBACK_REASONS:
+        terminal = terminal.model_copy(
+            update={
+                "exit_code": 78,
+                "summary": (
+                    "No further model fallback is permitted by the chain worker "
+                    "budget; usage credits and API billing remain disabled."
+                ),
+                "termination_reason": "model_unavailable_without_credits",
+            }
+        )
+    return RoutedWorkerOutcome(
+        worker=terminal,
+        routing_records=routing_records,
+        worker_calls=worker_calls,
+        premium_calls=premium_calls,
+        model_fallbacks=fallbacks,
+        unavailable_models=unavailable,
+    )
 
 
 def save_json(path: Path, data: object) -> None:
@@ -2531,6 +2819,17 @@ def validate_config(config: dict) -> None:
         )
     if config.get("adaptive_orchestration", False):
         ChainBudgets.model_validate(config.get("chain_budgets", {}))
+        if int(config.get("max_packet_attempts", 3)) < 1:
+            raise RuntimeError("max_packet_attempts must be at least 1.")
+        premium_aliases = config.get("premium_model_aliases", ["opus", "fable"])
+        if (
+            not isinstance(premium_aliases, list)
+            or not premium_aliases
+            or not all(
+            isinstance(item, str) and item.strip() for item in premium_aliases
+            )
+        ):
+            raise RuntimeError("premium_model_aliases must be a non-empty string list.")
         profiles = config.get("adaptive_profiles", {})
         if not isinstance(profiles, dict):
             raise RuntimeError("adaptive_profiles musí byť JSON objekt.")
@@ -2981,6 +3280,16 @@ def run_forge(
         if inherited_continuation is not None
         else None
     )
+    unavailable_models: dict[str, str] = (
+        dict(inherited_continuation.unavailable_models)
+        if inherited_continuation is not None
+        else {}
+    )
+    chain_model_fallbacks = (
+        inherited_continuation.chain_model_fallbacks
+        if inherited_continuation is not None
+        else 0
+    )
     last_check_tier = "targeted"
     chain_budgets = ChainBudgets.model_validate(config.get("chain_budgets", {}))
 
@@ -3082,6 +3391,7 @@ def run_forge(
         "release": 0,
     }
     model_fallbacks = 0
+    turn_budget_records: list[dict[str, Any]] = []
 
     def increment_count(mapping: dict[str, int], key: str) -> None:
         mapping[key] = int(mapping.get(key, 0)) + 1
@@ -3155,8 +3465,8 @@ def run_forge(
         print(
             "Claude policy: standard="
             f"{config.get('claude_model')}/{config.get('claude_effort')}, "
-            "escalation="
-            f"{config.get('claude_escalation_model')}/{config.get('claude_escalation_effort')}"
+            "adaptive router=economy|standard|complex|frontier|rescue "
+            "(subscription-only allowlists)"
         )
         if os.name == "nt" and not os.getenv("WSL_DISTRO_NAME"):
             print(
@@ -3689,9 +3999,9 @@ def run_forge(
                 break
 
             final_decision = decision
-            worker_model_override: str | None = None
-            worker_effort_override: str | None = None
-            worker_turns_override: int | None = None
+            logical_worker_profile = "standard"
+            worker_routing_reason = "Legacy-compatible standard worker profile."
+            packet_for_worker: WorkPacket | None = None
             if adaptive_enabled:
                 budget_reason = current_budget_reason()
                 if budget_reason:
@@ -3702,6 +4012,16 @@ def run_forge(
                 packet_for_worker = active_plan_packet(project_plan)
                 if packet_for_worker is None:
                     packet_for_worker = bootstrap_packet(decision, goal)
+                max_packet_attempts = int(config.get("max_packet_attempts", 3))
+                if packet_attempt_budget_exhausted(packet_for_worker, config):
+                    final_status = "needs_continuation"
+                    final_message = (
+                        f"Packet attempt budget exhausted for "
+                        f"{packet_for_worker.packet_id}: "
+                        f"{packet_for_worker.attempts}/{max_packet_attempts}."
+                    )
+                    exit_code = EXIT_NEEDS_CONTINUATION
+                    break
                 logical_worker_profile, worker_routing_reason = choose_worker_profile(
                     packet_for_worker,
                     decision.recommended_worker_profile,
@@ -3709,43 +4029,43 @@ def run_forge(
                     repeated_failure_count=repeated_failure_count,
                     checks_failed=bool(checks) and not checks_passed(checks),
                 )
-                worker_routing = resolve_worker_runtime(
-                    logical_worker_profile, config
-                )
-                premium_models = {"opus", "fable"}
-                if (
-                    worker_routing.selected_model.casefold() in premium_models
-                    and escalations_used >= chain_budgets.max_premium_escalations
-                ):
-                    logical_worker_profile = "complex"
-                    worker_routing = resolve_worker_runtime("complex", config)
-                    worker_routing_reason += (
-                        " Premium chain limit was already used; safe complex fallback selected."
-                    )
-                elif worker_routing.selected_model.casefold() in premium_models:
-                    escalations_used += 1
-                    run_premium_escalations += 1
                 increment_count(worker_profile_counts, logical_worker_profile)
-                if worker_routing.fallback_from:
-                    model_fallbacks += 1
-                worker_routing.reason = (
-                    worker_routing_reason + " " + worker_routing.reason
-                ).strip()
-                save_json(
-                    logs / f"{iteration:02d}-worker-routing.json",
-                    worker_routing,
-                )
+                if (
+                    project_plan is not None
+                    and active_plan_packet(project_plan) is not None
+                ):
+                    project_plan = apply_plan_patch(
+                        project_plan,
+                        PlanPatch(
+                            update_packets=[
+                                PacketUpdate(
+                                    packet_id=packet_for_worker.packet_id,
+                                    attempts_increment=1,
+                                    justification=(
+                                        "A routed Claude worker attempt is starting."
+                                    ),
+                                )
+                            ],
+                            explanation="Record the bounded logical packet attempt.",
+                        ),
+                        checks_passed=checks_passed(checks),
+                    )
+                    save_plan(
+                        project,
+                        project_plan,
+                        snapshot_path=(
+                            run_directory
+                            / f"project-plan.pre-worker-{iteration:02d}.json"
+                        ),
+                    )
                 refresh_monitor_context(
                     worker_profile=logical_worker_profile,
-                    worker_profile_reason=worker_routing.reason,
+                    worker_profile_reason=worker_routing_reason,
                     codex_assignment=decision.next_prompt,
                     check_tier=decision.check_tier,
                     next_action="Claude Code implementuje a potom Forge spustí kontroly.",
                     activity_state="active",
                 )
-                worker_model_override = worker_routing.selected_model
-                worker_effort_override = worker_routing.selected_effort
-                worker_turns_override = worker_routing.max_turns
 
             print(f"\n=== ITERÁCIA {iteration}: CLAUDE CODE IMPLEMENTÁCIA ===")
             status.set_phase(
@@ -3757,20 +4077,50 @@ def run_forge(
             phase_started = time.monotonic()
             before_manifest_worker = repo_manifest(project)
             before = repo_fingerprint(project)
-            chain_worker_calls += 1
-            worker = run_claude(
+            routed_outcome = run_claude_routed(
                 project,
                 compact_goal(goal, iteration, config),
                 decision,
                 config,
+                profile=logical_worker_profile,
+                routing_reason=worker_routing_reason,
                 iteration=iteration,
                 logs=logs,
                 status=status,
-                model_override=worker_model_override,
-                effort_override=worker_effort_override,
-                max_turns_override=worker_turns_override,
+                unavailable_models=unavailable_models,
+                max_worker_calls_remaining=max(
+                    0, chain_budgets.max_worker_calls - chain_worker_calls
+                ),
+                max_premium_calls_remaining=max(
+                    0,
+                    chain_budgets.max_premium_escalations - escalations_used,
+                ),
             )
+            worker = routed_outcome.worker
+            chain_worker_calls += routed_outcome.worker_calls
+            escalations_used += routed_outcome.premium_calls
+            run_premium_escalations += routed_outcome.premium_calls
+            model_fallbacks += routed_outcome.model_fallbacks
+            chain_model_fallbacks += routed_outcome.model_fallbacks
+            unavailable_models = dict(routed_outcome.unavailable_models)
+            turn_budget_records.extend(routed_outcome.routing_records)
             save_json(logs / f"{iteration:02d}-worker.json", worker)
+            if worker.termination_reason == "model_unavailable_without_credits":
+                raise RuntimeError(
+                    "No subscription-included allowlisted Claude model is "
+                    "available. Forge stopped without usage credits or API billing."
+                )
+            if worker.termination_reason == "auth_failure":
+                raise RuntimeError(
+                    "Claude subscription authentication failed. Forge did not "
+                    "attempt a model or API fallback."
+                )
+            if worker.termination_reason == "rate_limit":
+                raise SubscriptionLimitError(
+                    "Claude CLI reported a rate limit. Forge stopped without "
+                    "trying another model or paid API.",
+                    worker,
+                )
             print(
                 f"[Claude][Result] exit {worker.exit_code} ({worker.duration_seconds:.1f}s)",
                 flush=True,
@@ -3882,22 +4232,21 @@ def run_forge(
                 no_progress_count=no_progress_count,
                 progress_made=progress_made,
                 repeated_failure_count=repeated_failure_count,
-                escalations_used=escalations_used,
+                escalations_used=len(escalation_records),
                 config=config,
             )
             if escalation_reasons:
-                escalations_used += 1
-                run_premium_escalations += 1
+                rescue_sequence = len(escalation_records) + 1
                 if adaptive_enabled:
                     increment_count(worker_profile_counts, "rescue")
-                escalation_stem = f"{iteration:02d}E{escalations_used}"
+                escalation_stem = f"{iteration:02d}E{rescue_sequence}"
                 escalation_decision = build_escalation_decision(
                     decision, worker, checks, escalation_reasons, config
                 )
                 save_json(logs / f"{escalation_stem}-decision.json", escalation_decision)
                 print(
                     f"\n=== ITERÁCIA {iteration}: PRÉMIOVÁ CLAUDE ESKALÁCIA "
-                    f"{escalations_used} ==="
+                    f"{rescue_sequence} ==="
                 )
                 print("[Forge][Escalation] " + "; ".join(escalation_reasons))
                 status.set_phase(
@@ -3905,28 +4254,57 @@ def run_forge(
                     iteration=iteration,
                     current_agent="Claude Code",
                     message=(
-                        f"Prémiová eskalácia {escalations_used}: "
+                        f"Riadený rescue pokus {rescue_sequence}: "
                         + "; ".join(escalation_reasons)
                     ),
                 )
                 escalation_before = repo_fingerprint(project)
-                chain_worker_calls += 1
-                escalation_worker = run_claude(
+                rescue_outcome = run_claude_routed(
                     project,
                     compact_goal(goal, max(iteration, 2), config),
                     escalation_decision,
                     config,
+                    profile="rescue",
+                    routing_reason=(
+                        "Controlled rescue after measured stuck evidence: "
+                        + "; ".join(escalation_reasons)
+                    ),
                     iteration=iteration,
                     logs=logs,
                     status=status,
-                    model_override=str(config.get("claude_escalation_model") or "opus"),
-                    effort_override=str(config.get("claude_escalation_effort") or "xhigh"),
-                    max_turns_override=int(config.get("claude_escalation_max_turns", 20)),
-                    escalated=True,
+                    unavailable_models=unavailable_models,
+                    max_worker_calls_remaining=max(
+                        0, chain_budgets.max_worker_calls - chain_worker_calls
+                    ),
+                    max_premium_calls_remaining=max(
+                        0,
+                        chain_budgets.max_premium_escalations - escalations_used,
+                    ),
                     log_stem=escalation_stem,
                 )
-                worker = escalation_worker
+                worker = rescue_outcome.worker
+                chain_worker_calls += rescue_outcome.worker_calls
+                escalations_used += rescue_outcome.premium_calls
+                run_premium_escalations += rescue_outcome.premium_calls
+                model_fallbacks += rescue_outcome.model_fallbacks
+                chain_model_fallbacks += rescue_outcome.model_fallbacks
+                unavailable_models = dict(rescue_outcome.unavailable_models)
+                turn_budget_records.extend(rescue_outcome.routing_records)
                 save_json(logs / f"{escalation_stem}-worker.json", worker)
+                if worker.termination_reason == "model_unavailable_without_credits":
+                    raise RuntimeError(
+                        "Rescue candidates are unavailable without credits. "
+                        "Forge stopped without API billing."
+                    )
+                if worker.termination_reason == "auth_failure":
+                    raise RuntimeError(
+                        "Claude subscription authentication failed during rescue."
+                    )
+                if worker.termination_reason == "rate_limit":
+                    raise SubscriptionLimitError(
+                        "Claude CLI reported a rate limit during rescue.",
+                        worker,
+                    )
                 status.set_phase(
                     "automatic_checks",
                     iteration=iteration,
@@ -3966,11 +4344,14 @@ def run_forge(
                     repeated_failure_count = 1
                 escalation_record = {
                     "iteration": iteration,
-                    "sequence": escalations_used,
+                    "sequence": rescue_sequence,
                     "reasons": escalation_reasons,
                     "model": worker.model,
                     "effort": worker.effort,
-                    "max_turns": int(config.get("claude_escalation_max_turns", 20)),
+                    "requested_turn_budget": worker.requested_turn_budget,
+                    "cli_turn_limit_enforced": worker.cli_turn_limit_enforced,
+                    "effective_timeout": worker.effective_timeout,
+                    "termination_reason": worker.termination_reason,
                     "worker_exit_code": worker.exit_code,
                     "checks_passed": checks_passed(checks),
                 }
@@ -4228,6 +4609,8 @@ def run_forge(
                     chain_codex_calls=chain_codex_calls,
                     chain_no_progress_events=chain_no_progress_events,
                     last_release_check_run_id=last_release_check_run_id,
+                    unavailable_models=unavailable_models,
+                    chain_model_fallbacks=chain_model_fallbacks,
                 )
                 final_status = "needs_continuation"
                 final_message = (
@@ -4346,6 +4729,8 @@ def run_forge(
                     chain_codex_calls=chain_codex_calls,
                     chain_no_progress_events=chain_no_progress_events,
                     last_release_check_run_id=last_release_check_run_id,
+                    unavailable_models=unavailable_models,
+                    chain_model_fallbacks=chain_model_fallbacks,
                 )
                 print(
                     f"[Forge][NeedsContinuation] {final_message}\n"
@@ -4417,6 +4802,8 @@ def run_forge(
         "chain_elapsed_seconds": chain_elapsed_seconds,
         "chain_full_check_suites": chain_full_check_suites,
         "chain_premium_escalations": escalations_used,
+        "chain_model_fallbacks": chain_model_fallbacks,
+        "unavailable_models": unavailable_models,
         "chain_child_runs": chain_child_runs,
         "chain_codex_calls": chain_codex_calls,
         "chain_no_progress_events": chain_no_progress_events,
@@ -4457,7 +4844,7 @@ def run_forge(
         "parent_run_id": parent_run_id,
         "codex_calls_by_profile": codex_profile_counts,
         "claude_calls_by_profile": worker_profile_counts,
-        "worker_turn_counts": None,
+        "turn_budget_records": turn_budget_records,
         "safe_token_counts": safe_token_counts,
         "elapsed_seconds": round(time.monotonic() - chain_started_monotonic, 3),
         "chain_elapsed_seconds": chain_elapsed_seconds,
@@ -4477,6 +4864,8 @@ def run_forge(
         "rescue_uses": int(worker_profile_counts.get("rescue", 0)),
         "frontier_uses": int(worker_profile_counts.get("frontier", 0)),
         "model_fallbacks": model_fallbacks,
+        "chain_model_fallbacks": chain_model_fallbacks,
+        "unavailable_models": unavailable_models,
         "premium_escalations": run_premium_escalations,
         "final_status": final_status,
         "raw_prompts_stored": False,

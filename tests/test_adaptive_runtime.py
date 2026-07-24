@@ -102,10 +102,23 @@ class AdaptiveRuntimeTests(unittest.TestCase):
                 index = int(counter.read_text(encoding="utf-8")) if counter.exists() else 0
                 index += 1
                 counter.write_text(str(index), encoding="utf-8")
+                selected_model = (
+                    args[args.index("--model") + 1]
+                    if "--model" in args
+                    else ""
+                )
+                if selected_model == "fake-cheap":
+                    print(json.dumps({
+                        "type": "result",
+                        "subtype": "error",
+                        "is_error": True,
+                        "result": "model is unavailable",
+                    }), flush=True)
+                    raise SystemExit(4)
                 Path(f"packet-output-{index}.txt").write_text(
                     f"worker-call={index}\\n" + prompt[:200], encoding="utf-8"
                 )
-                print(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": f"Implementing packet {index}"}]}}), flush=True)
+                print(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": f"Implementing packet {index} with {selected_model}"}]}}), flush=True)
                 print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": f"packet {index} implemented"}), flush=True)
                 raise SystemExit(0)
                 """
@@ -125,9 +138,13 @@ class AdaptiveRuntimeTests(unittest.TestCase):
             "dependencies": [] if number == 1 else [f"packet-{number - 1:03d}"],
             "acceptance_criteria": [f"Packet {number} works"],
             "status": "pending",
-            "difficulty": "mechanical" if number == 1 else "routine",
-            "risk": "low" if number == 1 else "medium",
-            "recommended_worker_profile": "economy" if number == 1 else "standard",
+            "difficulty": (
+                "mechanical" if number == 1 else "complex" if number == 3 else "routine"
+            ),
+            "risk": "low" if number == 1 else "high" if number == 3 else "medium",
+            "recommended_worker_profile": (
+                "economy" if number == 1 else "complex" if number == 3 else "standard"
+            ),
             "recommended_review_profile": "routine_review",
             "check_tier": tier,
             "max_worker_turns": 10 if number == 1 else 20,
@@ -269,6 +286,18 @@ class AdaptiveRuntimeTests(unittest.TestCase):
                 },
             }
         )
+        config["adaptive_profiles"] = json.loads(
+            json.dumps(config["adaptive_profiles"])
+        )
+        config["adaptive_profiles"]["claude"]["economy"]["candidates"] = [
+            {
+                "model": "fake-cheap",
+                "effort": "low",
+                "requires_subscription_confirmation": True,
+            },
+            {"model": "sonnet", "effort": "low"},
+        ]
+        config["confirmed_subscription_models"] = ["fake-cheap"]
         return config
 
     def test_complete_fake_cli_multi_packet_chain_reaches_done(self):
@@ -282,6 +311,7 @@ class AdaptiveRuntimeTests(unittest.TestCase):
             "FAKE_CODEX_DECISIONS": str(self.decisions_path),
             "FAKE_CODEX_COUNTER": str(self.codex_counter),
             "FAKE_CLAUDE_COUNTER": str(self.claude_counter),
+            "FAKE_CLAUDE_REJECT_MODEL": "fake-cheap",
         }
         with mock.patch.dict(os.environ, env, clear=False), mock.patch.object(
             forge, "codex_auth_status", return_value=(True, "Logged in using ChatGPT")
@@ -289,6 +319,8 @@ class AdaptiveRuntimeTests(unittest.TestCase):
             forge,
             "claude_auth_status",
             return_value=(True, '{"loggedIn":true,"subscriptionType":"max"}'),
+        ), mock.patch.object(
+            forge, "WORKER_BOUNDARIES", "TEST BOUNDARIES"
         ):
             exit_code = forge.run_chain(
                 self.project, "Build a four-packet fake application", config_path
@@ -310,20 +342,47 @@ class AdaptiveRuntimeTests(unittest.TestCase):
         status = json.loads(
             (self.project / ".forge" / "status.json").read_text(encoding="utf-8")
         )
+        chain_telemetry = json.loads(
+            (self.project / ".forge" / "chain-telemetry.json").read_text(
+                encoding="utf-8"
+            )
+        )
         self.assertEqual(result["final_status"], "done")
         self.assertEqual(plan["status"], "done")
         self.assertEqual(len(plan["work_packets"]), 4)
         self.assertEqual(len(plan["completed_packet_ids"]), 4)
         self.assertEqual(result["last_check_tier"], "release")
         self.assertEqual(result["last_release_check_run_id"], result["run_id"])
-        self.assertEqual(result["chain_worker_calls"], 4)
+        self.assertEqual(result["chain_worker_calls"], 5)
+        self.assertEqual(result["chain_model_fallbacks"], 1)
+        self.assertTrue(
+            any(
+                (check.get("tests_executed") or 0) > 0
+                for check in result["checks"]
+            )
+        )
         self.assertEqual(result["chain_child_runs"], 3)
         self.assertEqual(supervisor["status"], "done")
         self.assertEqual(status["packet_completed"], 4)
         self.assertFalse(status["model_polling"])
+        self.assertGreater(status["requested_turn_budget"], 0)
+        self.assertFalse(status["cli_turn_limit_enforced"])
         self.assertTrue((self.project / "ASSUMPTIONS.md").is_file())
         self.assertEqual(int(self.codex_counter.read_text(encoding="utf-8")), 6)
-        self.assertEqual(int(self.claude_counter.read_text(encoding="utf-8")), 4)
+        self.assertEqual(int(self.claude_counter.read_text(encoding="utf-8")), 5)
+        profiles = {
+            profile
+            for run in chain_telemetry["runs"]
+            for profile in run["claude_calls_by_profile"]
+        }
+        self.assertTrue({"economy", "complex"}.issubset(profiles))
+        self.assertTrue(
+            all(
+                "cli_turn_limit_enforced" in record
+                for run in chain_telemetry["runs"]
+                for record in run["turn_budget_records"]
+            )
+        )
         runs = sorted((self.project / ".forge" / "runs").iterdir())
         self.assertEqual(len(runs), 4)
         for run in runs:
@@ -522,7 +581,7 @@ class SupervisorTerminalTests(unittest.TestCase):
                 Path(forge.__file__).with_name("forge.config.json"),
             )
         self.assertEqual(result, forge.EXIT_DONE)
-        resume.assert_called_once_with(self.project, "source-run")
+        resume.assert_called_once_with(self.project.resolve(), "source-run")
 
 
 if __name__ == "__main__":

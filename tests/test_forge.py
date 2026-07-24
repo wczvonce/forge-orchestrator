@@ -157,6 +157,26 @@ class StatusAndPromptTests(unittest.TestCase):
         self.assertIn("CURRENT ACCEPTANCE CRITERIA", content)
         self.assertIn("WORKER BOUNDARIES", content)
 
+    def test_review_prompt_aggregates_findings_without_inventing_blockers(self):
+        prompt = forge.build_review_prompt(
+            "Build the local mobile application described by SPEC.md.",
+            2,
+            "Bounded repository evidence.",
+            None,
+            [],
+            0,
+            phase="final",
+        )
+        normalized = " ".join(prompt.split())
+
+        self.assertIn("Report every actionable defect", normalized)
+        self.assertIn("do not drip-feed", normalized)
+        self.assertIn("goal and SPEC as authoritative", normalized)
+        self.assertIn("UI capability", normalized)
+        self.assertIn("OAuth/API scope", normalized)
+        self.assertIn("must not block independent", normalized)
+        self.assertIn("dependency-ready packet", normalized)
+
 
 class OrchestratorTests(unittest.TestCase):
     def test_codex_plan_patch_cannot_increment_worker_attempt_counter(self):
@@ -206,6 +226,45 @@ class OrchestratorTests(unittest.TestCase):
                 goal=goal,
             )
         self.assertEqual(updated.work_packets[0].attempts, 0)
+
+    def test_blocked_decision_without_patch_persists_blocked_plan(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp)
+            goal = "Product goal"
+            plan = forge.load_or_create_plan(project, goal)
+            plan = forge.apply_plan_patch(
+                plan,
+                forge.PlanPatch(
+                    add_packets=[
+                        forge.WorkPacket(
+                            packet_id="WP-01",
+                            title="External integration",
+                            objective="Connect the optional external account.",
+                            acceptance_criteria=["Connection is verified."],
+                        )
+                    ],
+                    active_packet_id="WP-01",
+                    explanation="Create the plan.",
+                ),
+                checks_passed=False,
+            )
+            decision = forge.Decision(
+                status="blocked",
+                decision_kind="blocked",
+                assessment="The required external account is unavailable.",
+                active_packet_id="WP-01",
+            )
+
+            updated = forge.update_plan_from_decision(
+                project,
+                plan,
+                decision,
+                checks_are_green=False,
+                snapshot_path=project / ".forge" / "blocked.json",
+                goal=goal,
+            )
+
+        self.assertEqual(updated.status, "blocked")
 
     def test_codex_output_schema_requires_every_declared_property(self):
         objects_with_properties = []
@@ -665,6 +724,20 @@ class FakeClaudeTests(unittest.TestCase):
         self.assertEqual(continuation["repository_fingerprint"], result["repository_fingerprint"])
         self.assertEqual(continuation["chain_worker_calls"], 1)
         self.assertEqual(continuation["chain_full_check_suites"], 1)
+        run_directory = Path(result["run_directory"])
+        run_payload = json.loads(
+            (run_directory / "run.json").read_text(encoding="utf-8")
+        )
+        snapshot = json.loads(
+            (run_directory / "config.snapshot.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(run_payload["config"], snapshot)
+        self.assertEqual(run_payload["config_hash"], forge.config_hash(snapshot))
+        self.assertEqual(result["config_hash"], run_payload["config_hash"])
+        self.assertEqual(
+            continuation["config_hash"],
+            run_payload["config_hash"],
+        )
 
     def test_resume_latest_creates_child_and_preserves_old_logs_bitwise(self):
         _, _, source_result = self._create_needs_continuation()
@@ -750,7 +823,16 @@ class FakeClaudeTests(unittest.TestCase):
         run_payload = json.loads(source_run_path.read_text(encoding="utf-8"))
         run_payload["config"]["claude_escalation_enabled"] = True
         run_payload["config"]["claude_escalation_max_per_run"] = 1
+        canonical_config = forge._canonical_config_snapshot(run_payload["config"])
+        canonical_hash = forge.config_hash(canonical_config)
+        run_payload["config_hash"] = canonical_hash
         source_run_path.write_text(json.dumps(run_payload), encoding="utf-8")
+        (source_directory / "config.snapshot.json").write_text(
+            json.dumps(canonical_config),
+            encoding="utf-8",
+        )
+        source["config_hash"] = canonical_hash
+        source["continuation"]["config_hash"] = canonical_hash
         source["continuation"]["chain_premium_escalations"] = 1
         source["chain_premium_escalations"] = 1
         source["premium_claude_escalations_used"] = 1
@@ -1028,9 +1110,10 @@ class WrapperContinuationTests(unittest.TestCase):
             config = forge.DEFAULT_CONFIG.copy()
             config["adaptive_orchestration"] = True
             config["adaptive_auto_supervisor"] = True
-            (root / "forge.config.json").write_text(
+            (root / "forge.max-economy.config.json").write_text(
                 json.dumps(config), encoding="utf-8"
             )
+            (root / "srt.cmd").write_text("@exit /b 0\r\n", encoding="utf-8")
             calls_path = root / "calls.jsonl"
             fake_forge = root / "forge.py"
             fake_forge.write_text(
@@ -1046,16 +1129,40 @@ class WrapperContinuationTests(unittest.TestCase):
                         handle.write(json.dumps(args) + "\\n")
                     if args and args[0] == "doctor":
                         raise SystemExit(0)
+                    if args and args[0] == "resume-eligibility":
+                        print(
+                            json.dumps(
+                                 {
+                                     "schema_version": 4,
+                                     "eligible": True,
+                                     "source_run_id": "resume-source",
+                                     "source_stop_reason_code": "chain_budget_exhausted",
+                                     "source_automatic_resume_allowed": False,
+                                    "action": "extend_chain_budget_one_tranche",
+                                    "reason_code": "eligible",
+                                    "state_mutated": False,
+                                    "model_calls_made": 0,
+                                    "supervisor_config_enforced": True,
+                                    "effective_security_profile": "strict",
+                                    "bounded_packet_recovery_eligible": False,
+                                    "budget_tranche_extension_eligible": True,
+                                }
+                            )
+                        )
+                        raise SystemExit(0)
                     if args and args[0] == "run-chain":
                         project = Path(args[args.index("--project") + 1])
                         forge_dir = project / ".forge"
                         forge_dir.mkdir(parents=True, exist_ok=True)
                         (forge_dir / "result.json").write_text(
                             json.dumps(
-                                {
-                                    "schema_version": 2,
-                                    "run_id": "resume-source",
-                                    "final_status": "needs_continuation",
+                                 {
+                                     "schema_version": 4,
+                                     "run_id": "continued-run",
+                                     "final_status": "needs_continuation",
+                                     "stop_reason_code": "chain_budget_exhausted",
+                                     "automatic_resume_allowed": False,
+                                     "final_message": "Continuation chain budget exhausted.",
                                 }
                             ),
                             encoding="utf-8",
@@ -1069,7 +1176,13 @@ class WrapperContinuationTests(unittest.TestCase):
             )
             env = os.environ.copy()
             env["FAKE_FORGE_CALLS"] = str(calls_path)
-            env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
+            env["PATH"] = (
+                str(root)
+                + os.pathsep
+                + str(Path(sys.executable).parent)
+                + os.pathsep
+                + env.get("PATH", "")
+            )
             completed = subprocess.run(
                 [
                     powershell,
@@ -1081,6 +1194,8 @@ class WrapperContinuationTests(unittest.TestCase):
                     "-ProjectPath",
                     str(project),
                     "-ResumeLatest",
+                    "-Mode",
+                    "EconomyMax",
                     "-NoMonitor",
                 ],
                 text=True,
@@ -1096,9 +1211,21 @@ class WrapperContinuationTests(unittest.TestCase):
             ]
         self.assertEqual(completed.returncode, forge.EXIT_NEEDS_CONTINUATION)
         self.assertEqual(sum(1 for call in calls if call and call[0] == "doctor"), 1)
+        self.assertEqual(
+            sum(
+                1
+                for call in calls
+                if call and call[0] == "resume-eligibility"
+            ),
+            1,
+        )
         self.assertEqual(sum(1 for call in calls if call and call[0] == "run-chain"), 1)
         chain_call = next(call for call in calls if call and call[0] == "run-chain")
         self.assertIn("--resume-run-id", chain_call)
+        self.assertEqual(
+            chain_call[chain_call.index("--resume-run-id") + 1],
+            "resume-source",
+        )
         self.assertEqual(sum(1 for call in calls if call and call[0] == "run"), 0)
         output = completed.stdout + completed.stderr
         self.assertIn("Nespustil sa ziadny genericky restart", output)

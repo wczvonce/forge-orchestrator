@@ -29,6 +29,7 @@
   "claude_bare_mode": false,
   "claude_safe_mode": true,
   "claude_strict_mcp": true,
+  "claude_outer_srt_on_wsl": true,
   "claude_tools": "Bash,Read,Edit,Write,Glob,Grep",
   "strict_subscription_auth": true,
   "security_profile": "strict",

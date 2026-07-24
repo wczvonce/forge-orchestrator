@@ -113,6 +113,8 @@ class WorkPacket(StrictModel):
     expected_paths: list[str] = Field(default_factory=list)
     forbidden_scope: list[str] = Field(default_factory=list)
     attempts: int = Field(default=0, ge=0)
+    final_review_recovery_authorized: bool = False
+    final_review_recovery_used: bool = False
     last_fingerprint: str | None = None
     last_failure_signature: str | None = None
     closes_milestone: bool = False
@@ -126,6 +128,13 @@ class WorkPacket(StrictModel):
             raise ValueError("Economy worker cannot be recommended for high-risk work.")
         if self.risk == "critical" and self.check_tier in {"smoke", "targeted"}:
             raise ValueError("Critical work requires milestone or release checks.")
+        if (
+            self.final_review_recovery_authorized
+            and self.final_review_recovery_used
+        ):
+            raise ValueError(
+                "A final-review recovery cannot be both authorized and consumed."
+            )
         return self
 
 
@@ -156,6 +165,8 @@ class PacketUpdate(StrictModel):
     expected_paths: list[str] | None = None
     forbidden_scope: list[str] | None = None
     attempts_increment: int = Field(default=0, ge=0, le=1)
+    final_review_recovery_authorized: bool | None = None
+    final_review_recovery_used: bool | None = None
     last_fingerprint: str | None = None
     last_failure_signature: str | None = None
     closes_milestone: bool | None = None
@@ -291,6 +302,8 @@ class AdaptiveDecision(StrictModel):
     routing_reason: str = ""
     closes_milestone: bool = False
     requires_release_check: bool = False
+    approve_check_contract_drift: bool = False
+    check_contract_approval_reason: str = ""
 
     @model_validator(mode="after")
     def validate_decision(self) -> "AdaptiveDecision":
@@ -303,6 +316,21 @@ class AdaptiveDecision(StrictModel):
             self.decision_kind = "complete_project"
         if self.status == "blocked":
             self.decision_kind = "blocked"
+        approval_reason = self.check_contract_approval_reason.strip()
+        if self.approve_check_contract_drift:
+            if self.status != "continue":
+                raise ValueError(
+                    "Check-contract drift approval is valid only with status=continue."
+                )
+            if not approval_reason:
+                raise ValueError(
+                    "Check-contract drift approval requires a non-empty reason."
+                )
+            self.check_contract_approval_reason = approval_reason
+        elif approval_reason:
+            raise ValueError(
+                "Check-contract approval reason requires explicit approval=true."
+            )
         return self
 
 
@@ -382,6 +410,19 @@ class CheckContract(StrictModel):
 
     @model_validator(mode="after")
     def validate_hash(self) -> "CheckContract":
+        check_ids = [item.check_id for item in self.check_definitions]
+        duplicate_ids = sorted(
+            {
+                check_id
+                for check_id in check_ids
+                if check_ids.count(check_id) > 1
+            }
+        )
+        if duplicate_ids:
+            raise ValueError(
+                "Check contract contains duplicate check IDs: "
+                + ", ".join(duplicate_ids)
+            )
         if self.contract_hash != check_contract_hash(self):
             raise ValueError("Check contract hash does not match its canonical content.")
         return self
@@ -591,6 +632,60 @@ def build_check_contract(
     return CheckContract.model_validate(payload)
 
 
+def stable_auto_check_id(command: str) -> str:
+    """Return the canonical semantic identity for an auto-discovered check."""
+    normalized = command.strip()
+    lowered = normalized.casefold()
+    if normalized == "forge internal bootstrap-integrity":
+        return "auto-bootstrap-integrity"
+    if lowered == "git diff --check":
+        return "auto-git-worktree-whitespace"
+    if lowered == "git diff --cached --check":
+        return "auto-git-index-whitespace"
+    package_match = re.search(
+        r"\b(npm|pnpm|yarn|bun)\s+(?:run\s+)?([A-Za-z0-9:_-]+)\b",
+        normalized,
+        re.I,
+    )
+    if package_match:
+        script = re.sub(
+            r"[^a-z0-9]+",
+            "-",
+            package_match.group(2).casefold(),
+        ).strip("-")
+        return f"auto-{package_match.group(1).casefold()}-{script}"
+    if re.search(r"\bgradlew(?:\.bat)?\b.*\btest\b", normalized, re.I):
+        return "auto-gradle-test"
+    if re.search(r"\bpytest\b", normalized, re.I):
+        return "auto-python-pytest"
+    if re.search(r"\bunittest\b", normalized, re.I):
+        return "auto-python-unittest"
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+    return f"auto-command-{digest}"
+
+
+def collision_safe_auto_check_id(
+    command: str,
+    assigned_ids: dict[str, str],
+) -> str:
+    """Keep the semantic ID unless a distinct command already owns it."""
+    normalized = command.strip()
+    base_id = stable_auto_check_id(normalized)
+    existing_command = assigned_ids.get(base_id)
+    if existing_command is None or existing_command == normalized:
+        return base_id
+
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    for digest_length in (12, 16, 24, 32, 64):
+        suffix = f"-{digest[:digest_length]}"
+        prefix = base_id[: 80 - len(suffix)].rstrip("-")
+        candidate = f"{prefix}{suffix}"
+        existing_command = assigned_ids.get(candidate)
+        if existing_command is None or existing_command == normalized:
+            return candidate
+    raise ValueError("Unable to derive a unique stable auto-check ID.")
+
+
 def validate_contract_update(
     previous: CheckContract,
     proposed: CheckContract,
@@ -601,18 +696,118 @@ def validate_contract_update(
         raise ValueError("Check contract changes require a justification.")
     old = {item.check_id: item for item in previous.check_definitions}
     new = {item.check_id: item for item in proposed.check_definitions}
+
+    def semantic_payload(definition: CheckDefinition) -> dict[str, Any]:
+        payload = definition.model_dump(mode="json")
+        payload.pop("check_id", None)
+        return payload
+
+    unmatched_new = set(new)
+    legacy_identity_migrations: dict[str, str] = {}
     for check_id, definition in old.items():
-        if definition.required_before_done and check_id not in new:
+        if check_id in new:
+            unmatched_new.discard(check_id)
+            continue
+        if re.fullmatch(r"auto-\d{2}", check_id):
+            matches = [
+                candidate_id
+                for candidate_id in unmatched_new
+                if semantic_payload(new[candidate_id])
+                == semantic_payload(definition)
+                and candidate_id == stable_auto_check_id(definition.command)
+            ]
+            if len(matches) == 1:
+                legacy_identity_migrations[check_id] = matches[0]
+                unmatched_new.remove(matches[0])
+
+    protected_auto_checks = {
+        "auto-bootstrap-integrity": (
+            "forge internal bootstrap-integrity",
+            "security",
+        ),
+        "auto-git-worktree-whitespace": ("git diff --check", "auto"),
+        "auto-git-index-whitespace": (
+            "git diff --cached --check",
+            "auto",
+        ),
+    }
+    if (
+        previous.source == "validated_auto_discovery"
+        or proposed.source == "validated_auto_discovery"
+    ):
+        for check_id, (command, check_kind) in protected_auto_checks.items():
+            protected = new.get(check_id)
+            if protected is None:
+                raise ValueError(
+                    f"Protected Forge check cannot be removed: {check_id}"
+                )
+            if (
+                protected.command != command
+                or protected.check_kind != check_kind
+                or protected.tier != "smoke"
+                or not protected.required_before_done
+                or protected.cacheable
+            ):
+                raise ValueError(
+                    f"Protected Forge check cannot be weakened: {check_id}"
+                )
+
+    tier_order = {"smoke": 0, "targeted": 1, "milestone": 2, "release": 3}
+    for check_id, definition in old.items():
+        replacement_id = (
+            check_id
+            if check_id in new
+            else legacy_identity_migrations.get(check_id)
+        )
+        if definition.required_before_done and replacement_id is None:
             raise ValueError(f"Required check cannot be removed: {check_id}")
-        replacement = new.get(check_id)
+        replacement = new.get(replacement_id) if replacement_id else None
         if replacement is None:
             continue
+        if replacement_id == check_id and definition.command != replacement.command:
+            raise ValueError(
+                f"Check command cannot be substituted under the same ID: {check_id}"
+            )
         if definition.required_before_done and not replacement.required_before_done:
             raise ValueError(f"required_before_done cannot be disabled: {check_id}")
         if definition.require_test_execution and not replacement.require_test_execution:
             raise ValueError(f"require_test_execution cannot be disabled: {check_id}")
-        if definition.report_path and not replacement.report_path:
-            raise ValueError(f"Required report cannot be removed: {check_id}")
+        if tier_order[replacement.tier] > tier_order[definition.tier]:
+            raise ValueError(f"Check tier cannot be weakened: {check_id}")
+        if definition.check_kind != replacement.check_kind:
+            raise ValueError(f"check_kind cannot be changed: {check_id}")
+        if definition.stacks != replacement.stacks:
+            raise ValueError(f"check stacks cannot be changed: {check_id}")
+        if definition.when_paths != replacement.when_paths:
+            raise ValueError(f"when_paths cannot be changed: {check_id}")
+        if definition.report_format != replacement.report_format:
+            raise ValueError(f"report_format cannot be changed: {check_id}")
+        if definition.report_path != replacement.report_path:
+            raise ValueError(f"report_path cannot be changed: {check_id}")
+        if definition.report_glob != replacement.report_glob:
+            raise ValueError(f"report_glob cannot be changed: {check_id}")
+        if (
+            definition.test_count_pattern is not None
+            and definition.test_count_pattern != replacement.test_count_pattern
+        ):
+            raise ValueError(f"test_count_pattern cannot be weakened: {check_id}")
+        report_strength = {"none": 0, "exists": 1, "nonempty": 2, "json": 3}
+        if (
+            report_strength[replacement.report_validation]
+            < report_strength[definition.report_validation]
+        ):
+            raise ValueError(f"report_validation cannot be weakened: {check_id}")
+        if not definition.cacheable and replacement.cacheable:
+            raise ValueError(f"cacheability cannot be enabled during drift: {check_id}")
+
+    removed_indirect = sorted(
+        set(previous.indirect_source_hashes) - set(proposed.indirect_source_hashes)
+    )
+    if removed_indirect:
+        raise ValueError(
+            "Indirect check sources cannot be removed during automatic re-lock: "
+            + ", ".join(removed_indirect)
+        )
 
 
 class EvidenceIndex(StrictModel):
@@ -672,7 +867,11 @@ class RoutingRecord(StrictModel):
     max_turns_argument_allowed: bool = False
 
 
-def stable_project_identity(project: Path) -> dict[str, str]:
+def stable_project_identity(
+    project: Path,
+    *,
+    create_if_missing: bool = True,
+) -> dict[str, str]:
     metadata_path = project / ".forge" / "project.json"
     canonical = str(project.resolve()).casefold()
     canonical_hash = sha256_text(canonical)
@@ -693,6 +892,16 @@ def stable_project_identity(project: Path) -> dict[str, str]:
                 "project_id": payload["project_id"],
                 "created_at": str(payload.get("created_at") or ""),
             }
+        if not create_if_missing:
+            raise RuntimeError(
+                "Persistent project identity is invalid; read-only validation "
+                "refused to replace it."
+            )
+    elif not create_if_missing:
+        raise RuntimeError(
+            "Persistent project identity is missing; read-only validation "
+            "refused to create it."
+        )
     project_id = f"project-{sha256_text(canonical)[:20]}"
     payload = {
         "schema_version": ADAPTIVE_SCHEMA_VERSION,
@@ -712,6 +921,15 @@ def plan_hash(plan: ProjectPlan) -> str:
     payload = plan.model_dump(mode="json")
     for volatile in ("updated_at", "last_validated_at", "last_validation_summary"):
         payload.pop(volatile, None)
+    # Schema-4 plans written before bounded final-review recovery did not
+    # contain these keys. Keep the canonical hash byte-compatible while both
+    # values are at their default; include either key as soon as recovery state
+    # is actually persisted.
+    for packet in payload.get("work_packets", []):
+        if not packet.get("final_review_recovery_authorized", False):
+            packet.pop("final_review_recovery_authorized", None)
+        if not packet.get("final_review_recovery_used", False):
+            packet.pop("final_review_recovery_used", None)
     return sha256_text(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
 
@@ -837,7 +1055,50 @@ def apply_plan_patch(plan: ProjectPlan, patch: PlanPatch, *, checks_passed: bool
     updated.completed_packet_ids = [
         packet.packet_id for packet in updated.work_packets if packet.status == "completed"
     ]
-    if updated.work_packets and updated.status == "planning":
+    unfinished = [
+        packet
+        for packet in updated.work_packets
+        if packet.status not in {"completed", "superseded"}
+    ]
+    dependency_ready = [
+        packet
+        for packet in unfinished
+        if packet.status in {"pending", "in_progress", "verification"}
+        and all(
+            by_id[dependency].status == "completed"
+            for dependency in packet.dependencies
+        )
+    ]
+    current_active = by_id.get(updated.active_packet_id or "")
+    if (
+        dependency_ready
+        and updated.status != "blocked"
+        and (
+            current_active is None
+            or current_active.status in {"blocked", "superseded"}
+        )
+    ):
+        # Do not strand unrelated local work behind a packet-level blocker.
+        # Plan order is persistent, so the first ready packet is deterministic.
+        replacement = dependency_ready[0]
+        updated.active_packet_id = replacement.packet_id
+        if replacement.status == "pending":
+            replacement.status = "in_progress"
+    if unfinished and not dependency_ready:
+        # A legitimate model decision may block the only reachable packet (and
+        # therefore every packet that depends on it).  Persist that as a clean
+        # project-level blocked state instead of letting the final invariant
+        # turn a product/dependency blocker into a Forge technical failure.
+        updated.status = "blocked"
+    elif (
+        updated.work_packets
+        and updated.status == "planning"
+    ) or (
+        updated.status == "blocked"
+        and patch.active_packet_id is not None
+        and dependency_ready
+    ):
+        # Reopening a blocked plan requires an explicit packet activation.
         updated.status = "active"
     updated.updated_at = utc_now()
     return ProjectPlan.model_validate(updated.model_dump(mode="json"))
@@ -941,7 +1202,102 @@ def choose_worker_profile(
 def packet_attempt_budget_exhausted(
     packet: WorkPacket, config: dict[str, Any]
 ) -> bool:
-    return packet.attempts >= int(config.get("max_packet_attempts", 3))
+    maximum = int(config.get("max_packet_attempts", 3))
+    if packet.attempts < maximum:
+        return False
+    return not (
+        packet.attempts == maximum
+        and packet.final_review_recovery_authorized
+        and not packet.final_review_recovery_used
+    )
+
+
+def authorize_final_review_recovery(
+    plan: ProjectPlan,
+    packet_id: str,
+    config: dict[str, Any],
+) -> tuple[ProjectPlan, bool]:
+    """Persist one extra logical attempt authorized by a green final review."""
+    updated = plan.model_copy(deep=True)
+    packet = next(
+        (item for item in updated.work_packets if item.packet_id == packet_id),
+        None,
+    )
+    if packet is None:
+        raise ValueError(f"Unknown work packet {packet_id}.")
+    maximum = int(config.get("max_packet_attempts", 3))
+    if (
+        packet.attempts != maximum
+        or packet.final_review_recovery_authorized
+        or packet.final_review_recovery_used
+    ):
+        return plan, False
+    packet.final_review_recovery_authorized = True
+    updated.updated_at = utc_now()
+    return ProjectPlan.model_validate(updated.model_dump(mode="json")), True
+
+
+def begin_packet_attempt(
+    plan: ProjectPlan,
+    packet_id: str,
+    config: dict[str, Any],
+) -> tuple[ProjectPlan, bool]:
+    """Record a normal attempt or consume the single authorized recovery."""
+    updated = plan.model_copy(deep=True)
+    packet = next(
+        (item for item in updated.work_packets if item.packet_id == packet_id),
+        None,
+    )
+    if packet is None:
+        raise ValueError(f"Unknown work packet {packet_id}.")
+    maximum = int(config.get("max_packet_attempts", 3))
+    recovery_attempt = packet.attempts >= maximum
+    if recovery_attempt:
+        if not (
+            packet.attempts == maximum
+            and packet.final_review_recovery_authorized
+            and not packet.final_review_recovery_used
+        ):
+            raise ValueError(
+                f"Packet attempt budget exhausted for {packet.packet_id}: "
+                f"{packet.attempts}/{maximum}."
+            )
+        packet.final_review_recovery_authorized = False
+        packet.final_review_recovery_used = True
+    packet.attempts += 1
+    updated.updated_at = utc_now()
+    return (
+        ProjectPlan.model_validate(updated.model_dump(mode="json")),
+        recovery_attempt,
+    )
+
+
+def refund_packet_attempt(
+    plan: ProjectPlan,
+    packet_id: str,
+    *,
+    recovery_attempt: bool,
+) -> ProjectPlan:
+    """Refund an invocation that produced no valid worker outcome."""
+    updated = plan.model_copy(deep=True)
+    packet = next(
+        (item for item in updated.work_packets if item.packet_id == packet_id),
+        None,
+    )
+    if packet is None:
+        raise ValueError(f"Unknown work packet {packet_id}.")
+    if packet.attempts <= 0:
+        raise ValueError(f"Packet {packet.packet_id} has no attempt to refund.")
+    packet.attempts -= 1
+    if recovery_attempt:
+        if not packet.final_review_recovery_used:
+            raise ValueError(
+                f"Packet {packet.packet_id} has no consumed recovery to refund."
+            )
+        packet.final_review_recovery_used = False
+        packet.final_review_recovery_authorized = True
+    updated.updated_at = utc_now()
+    return ProjectPlan.model_validate(updated.model_dump(mode="json"))
 
 
 def resolve_worker_runtime(

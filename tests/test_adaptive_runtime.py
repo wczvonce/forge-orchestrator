@@ -507,6 +507,10 @@ class SupervisorTerminalTests(unittest.TestCase):
         self.sandbox.stop()
         self.temp.cleanup()
 
+    def test_strict_config_explicitly_enables_outer_srt_on_wsl(self):
+        raw_config = json.loads(self.strict_config.read_text(encoding="utf-8"))
+        self.assertIs(raw_config.get("claude_outer_srt_on_wsl"), True)
+
     def _terminal(self, code: int) -> tuple[int, mock.Mock]:
         resume = mock.Mock()
         with mock.patch.object(forge, "run_forge", return_value=code), mock.patch.object(
@@ -655,7 +659,11 @@ class SupervisorTerminalTests(unittest.TestCase):
                 self.strict_config,
             )
         self.assertEqual(result, forge.EXIT_DONE)
-        resume.assert_called_once_with(self.project.resolve(), "source-run")
+        resume.assert_called_once()
+        args, kwargs = resume.call_args
+        self.assertEqual(args, (self.project.resolve(), "source-run"))
+        self.assertEqual(kwargs["resume_kind"], "internal_automatic")
+        self.assertEqual(kwargs["supervisor_config"]["security_profile"], "strict")
 
     def test_next_packet_and_reviewer_continue_are_resumable(self):
         for reason in ("next_packet_ready", "reviewer_continue"):
@@ -751,7 +759,11 @@ class SupervisorTerminalTests(unittest.TestCase):
                 self.strict_config,
             )
         self.assertEqual(result, forge.EXIT_DONE)
-        resume.assert_called_once_with(self.project.resolve(), "source-run")
+        resume.assert_called_once()
+        args, kwargs = resume.call_args
+        self.assertEqual(args, (self.project.resolve(), "source-run"))
+        self.assertEqual(kwargs["resume_kind"], "internal_automatic")
+        self.assertEqual(kwargs["supervisor_config"]["security_profile"], "strict")
 
 
 if __name__ == "__main__":

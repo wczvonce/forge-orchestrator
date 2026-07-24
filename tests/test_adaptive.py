@@ -55,6 +55,29 @@ class AdaptiveSchemaTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             adaptive.AdaptiveDecision(status="continue", assessment="Missing prompt")
 
+    def test_contract_drift_approval_is_explicit_and_reasoned(self):
+        ordinary = adaptive.AdaptiveDecision(
+            status="continue",
+            assessment="Continue normally",
+            next_prompt="Implement packet.",
+        )
+        self.assertFalse(ordinary.approve_check_contract_drift)
+        self.assertEqual(ordinary.check_contract_approval_reason, "")
+        with self.assertRaises(ValidationError):
+            adaptive.AdaptiveDecision(
+                status="continue",
+                assessment="Approve without evidence reason",
+                next_prompt="Implement packet.",
+                approve_check_contract_drift=True,
+            )
+        with self.assertRaises(ValidationError):
+            adaptive.AdaptiveDecision(
+                status="continue",
+                assessment="Ambiguous reason",
+                next_prompt="Implement packet.",
+                check_contract_approval_reason="Looks fine.",
+            )
+
 
 class ProjectPlanTests(unittest.TestCase):
     def packet(self, packet_id="packet-001", **overrides):
@@ -200,6 +223,69 @@ class ProjectPlanTests(unittest.TestCase):
             ).read_text(encoding="utf-8")
         self.assertIn("Use a local offline database.", assumptions)
         self.assertIn("Prefer a reversible MVP.", assumptions)
+
+    def test_blocking_only_reachable_packet_derives_blocked_plan(self):
+        base = adaptive.ProjectPlan(
+            plan_id="plan-1",
+            project_id="project-1",
+            goal_hash="g",
+            spec_hash="s",
+            created_at=adaptive.utc_now(),
+            updated_at=adaptive.utc_now(),
+            status="active",
+            active_packet_id="packet-001",
+            work_packets=[
+                self.packet("packet-001", status="in_progress"),
+                self.packet("packet-002", dependencies=["packet-001"]),
+            ],
+        )
+        patch = adaptive.PlanPatch(
+            update_packets=[
+                adaptive.PacketUpdate(
+                    packet_id="packet-001",
+                    status="blocked",
+                    justification="A required external account is unavailable.",
+                )
+            ],
+            explanation="Persist the real dependency blocker.",
+        )
+
+        updated = adaptive.apply_plan_patch(base, patch, checks_passed=False)
+
+        self.assertEqual(updated.status, "blocked")
+        self.assertEqual(updated.work_packets[0].status, "blocked")
+
+    def test_blocked_packet_does_not_hide_independent_ready_work(self):
+        base = adaptive.ProjectPlan(
+            plan_id="plan-1",
+            project_id="project-1",
+            goal_hash="g",
+            spec_hash="s",
+            created_at=adaptive.utc_now(),
+            updated_at=adaptive.utc_now(),
+            status="active",
+            active_packet_id="packet-001",
+            work_packets=[
+                self.packet("packet-001", status="in_progress"),
+                self.packet("packet-002"),
+            ],
+        )
+        patch = adaptive.PlanPatch(
+            update_packets=[
+                adaptive.PacketUpdate(
+                    packet_id="packet-001",
+                    status="blocked",
+                    justification="Only this external integration is blocked.",
+                )
+            ],
+            explanation="Continue independent local work.",
+        )
+
+        updated = adaptive.apply_plan_patch(base, patch, checks_passed=False)
+
+        self.assertEqual(updated.status, "active")
+        self.assertEqual(updated.active_packet_id, "packet-002")
+        self.assertEqual(updated.work_packets[1].status, "in_progress")
 
 
 class AdaptiveRouterTests(unittest.TestCase):

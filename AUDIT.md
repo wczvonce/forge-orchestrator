@@ -1,16 +1,115 @@
 # Audit GPT–Claude Forge
 
-Dátum auditu: 22. júl 2026
+Dátum auditu: 24. júl 2026
 
-## Strict Windows wrapper používa auditovaný WSL2 runtime — 24. júl 2026
+## Packet recovery, bootstrap integrity a presný Windows runtime — 24. júl 2026
 
-1. `Start-ForgeAutonomous.ps1 -Mode Strict` už na Windows nevyberá natívny
-   Python bez plného Claude Bash sandboxu.
+Táto maintainer údržba zavádza mechanizmy proti falošnému vyčerpaniu packetu,
+slepému resume a zeleným kontrolám nad nevidenými novými súbormi. Nasledujúce
+body opisujú implementovaný kontrakt.
+
+1. Predvolený Windows režim `EconomySafe` aj explicitný `Strict` používajú
+   WSL2 strict runtime. Natívny Windows worker nie je tichým fallbackom, ak
+   strict preflight zlyhá.
+2. Wrapper pred doctorom a workerom porovná SHA-256 súborov `forge.py`,
+   `forge_adaptive.py`, `forge_reports.py` a `forge.strict.config.json` medzi
+   Windows zdrojom a WSL mirrorom. Okrem verzie `srt` vykoná model-free
+   funkčný canary; chyba zastaví beh ešte pred modelovým volaním.
+3. Neplatný technický worker výsledok, napríklad transportná chyba alebo
+   chýbajúci finálny event, vráti logický `packet.attempts`. Skutočne
+   dispatchnutý worker call a uplynutý chain čas zostanú započítané, takže
+   refund neopravňuje neobmedzené alebo bezplatné opakovanie.
+4. Po čerstvých zelených kontrolách môže Python supervisor autorizovať najviac
+   jeden ohraničený final-review recovery pokus pre packet. Autorizácia a jej
+   použitie sú perzistentné v ProjectPlane; Claude ani text review ich
+   nemôžu vytvoriť, obnoviť alebo resetovať.
+5. `packet_attempts_exhausted` je lokálny limit packetu, nie
+   `chain_budget_exhausted`. Zakazuje automatický resume a wrapper pri ňom
+   neponúka slepý manuálny resume. Iba skutočné vyčerpanie chain budgetu môže
+   skončiť presným používateľským `-ResumeRunId`.
+6. Výsledok a atomický status odvodzujú `needs_human` z terminálneho dôvodu.
+   Live Monitor číta `stop_reason_code` a `automatic_resume_allowed`,
+   terminálny stav nevydáva za hang a pri packet limite žiada opravu príčiny
+   alebo plánu namiesto opakovania rovnakého runu.
+7. Auto-discovered check kontrakt obsahuje interný
+   `forge internal bootstrap-integrity`. NUL-safe Git index zahŕňa untracked,
+   unstaged aj staged cesty; kontroluje hranice projektu, ignoruje symlink
+   úniky a má limity veľkosti aj počtu súborov.
+8. Bootstrap scanner kontroluje textové zmeny na konfliktové markery, trailing
+   whitespace, private-key hlavičky a bežné provider/credential vzory.
+   Potenciálne tajomstvo nikdy nevypíše: evidence obsahuje iba kategóriu,
+   relatívnu cestu a číslo riadku. Binárne a neplatné UTF-8 súbory sa
+   nespracujú ako text.
+9. Povinné `git diff --check` a `git diff --cached --check` pokrývajú pracovný
+   strom aj staged index. Nový, odstránený alebo zmenený auto-discovered runner
+   vytvorí contract drift; Forge dočasne povolí iba bootstrap/diff kontroly,
+   vyžiada read-only Codex consistency review a až potom môže kontrakt znovu
+   uzamknúť.
+10. Gradle a Android checky objavujú relevantné root build vstupy a agregujú
+    všetky čerstvé reporty. Chýbajúci, nulový, poškodený, starý, zlyhaný alebo
+    cestou unikajúci report nemôže splniť gate.
+11. Check-contract drift sa už nedá potvrdiť obyčajným `continue`. Codex musí
+    vrátiť osobitné `approve_check_contract_drift=true`, neprázdny dôvod a
+    schválenie sa viaže na presný redigovaný sémantický rozdiel. Forge rozdiel
+    znovu vypočíta tesne pred zápisom a odmietne oslabenie runnera, required
+    checku, test evidence, reportu, tieru, ciest alebo cache politiky.
+12. Nové runy ukladajú presný kanonický `config.snapshot.json` a zhodný SHA-256
+    v `run.json`, `result.json` aj continuation payload. Automatický child
+    resume odmietne legacy konfiguráciu alebo nezhodu; explicitný resume musí
+    prejsť model-free eligibility a trusted supervisor bezpečnostným obalom.
+13. Explicitný resume po `chain_budget_exhausted` pridá najviac jeden základný
+    tranche na jedno používateľské pokračovanie. Kumulatívne worker/Codex/time/
+    check/no-progress počítadlá sa neresetujú a prémiový strop sa nezvyšuje.
+    Interný automatický resume budget rozšíriť nesmie.
+14. `resume-eligibility` je bezmodelový a nemutujúci CLI gate. Wrapper akceptuje
+    iba strojovo validované akcie `bounded_final_review_recovery`,
+    `extend_chain_budget_one_tranche` alebo `validated_exact_resume`, overí
+    nulový počet modelových volaní, nulovú mutáciu a použitie trusted configu.
+15. Bootstrap kontrola číta aj staged Git blob priamo z indexu, bezpečne
+    odmieta gitlinky a nebezpečné symlinky a pri náleze JSON hesla alebo iného
+    credential vzoru vypíše iba kategóriu, cestu a riadok.
+16. Celý zapisujúci run drží jeden fail-fast projektový lock na Windows aj
+    WSL/POSIX. Druhý Forge proces nemôže súbežne meniť ProjectPlan. Resume po
+    dlhšom Git baseline znovu overí project ID, goal, plan ID/hash a
+    check-contract hash tesne pred prvým perzistentným zápisom; konkurenčnú
+    zmenu neprepíše.
+17. Wrapper validuje bezpečnostné voľby a eligibility verdict podľa skutočných
+    JSON typov, nie cez PowerShell coercion. `ResumeLatest` sa po bezmodelovom
+    overení nahradí presným `source_run_id`, takže neskorší nový run nemôže
+    zmeniť cieľ resume.
+18. Live Monitor dostáva generačný čas konkrétneho wrapper spustenia a ignoruje
+    staré status/result/supervisor súbory. Terminálny `chain-supervisor.json` je
+    autoritatívny aj pri chýbajúcom alebo poškodenom `status.json`; mŕtvy alebo
+    chýbajúci supervisor so stale heartbeat skončí fail-closed.
+19. Manuálny resume príkaz sa zobrazí až po terminálnom supervisor stave
+    `needs_continuation` s exit kódom 4. Vyčerpaný prémiový strop, neplatné
+    budget typy alebo neextendovateľná tranche príkaz nevytvoria.
+20. Supervisor pri vlastnej výnimke vždy zapíše terminálny stav. Neplatný rescue
+    výsledok nespúšťa projektové kontroly ani aplikačné no-progress/escalation
+    účtovanie, ale fyzický call, čas a prípadné prémiové použitie zostanú
+    započítané.
+
+Finálne model-free overenie po týchto opravách: 278/278 unit, integračných,
+wrapperových, monitorových, bezpečnostných a fake-CLI E2E testov prešlo.
+Zelené boli aj `py_compile`, štyri JSON konfigurácie, parser oboch PowerShell
+skriptov, CLI help, `git diff --check` a bootstrap-integrity scan nad samotným
+Forge repozitárom. Windows a WSL runtime súbory sa zhodovali podľa SHA-256.
+Reálny `EconomySafe -DoctorOnly -NoMonitor` prešiel vo WSL2 strict vrátane
+projektového SRT/DrvFS canary; WSL projektový lock a model-free eligibility
+pôvodného zastaveného runu boli overené bez mutácie a bez Codex/Claude
+modelového volania.
+
+## EconomySafe a Strict používajú auditovaný WSL2 runtime — 24. júl 2026
+
+1. Predvolený `Start-ForgeAutonomous.ps1 -Mode EconomySafe` ani explicitný
+   `-Mode Strict` už na Windows nevyberajú natívny Python bez plného Claude
+   Bash sandboxu.
 2. Wrapper používa WSL distribúciu `Ubuntu-24.04`, používateľa `forge` a
    izolovaný Forge runtime v `/home/forge/GPT-Claude-Forge`.
-3. Pred doctorom overuje SHA-256 zhodu `forge.py` a strict konfigurácie medzi
-   Windows zdrojom a WSL mirrorom, Python 3.11+ s `pydantic` a funkčný
-   Sandbox Runtime cez `srt --version`.
+3. Pred doctorom overuje SHA-256 zhodu `forge.py`, `forge_adaptive.py`,
+   `forge_reports.py` a strict konfigurácie medzi Windows zdrojom a WSL
+   mirrorom, Python 3.11+ s `pydantic`, `srt --version` a funkčný model-free
+   Sandbox Runtime canary.
 4. Windows cestu projektu prekladá iba z validnej lokálnej cesty s písmenom
    disku a existenciu cieľa overí vo WSL. UNC a nejednoznačné cesty bezpečne
    odmietne.

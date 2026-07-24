@@ -321,6 +321,8 @@ class AdaptiveRuntimeTests(unittest.TestCase):
             return_value=(True, '{"loggedIn":true,"subscriptionType":"max"}'),
         ), mock.patch.object(
             forge, "WORKER_BOUNDARIES", "TEST BOUNDARIES"
+        ), mock.patch.object(
+            forge, "sandbox_runtime_available", return_value=True
         ):
             exit_code = forge.run_chain(
                 self.project, "Build a four-packet fake application", config_path
@@ -488,8 +490,13 @@ class SupervisorTerminalTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.project = Path(self.temp.name) / "project"
         self.project.mkdir()
+        self.sandbox = mock.patch.object(
+            forge, "sandbox_runtime_available", return_value=True
+        )
+        self.sandbox.start()
 
     def tearDown(self):
+        self.sandbox.stop()
         self.temp.cleanup()
 
     def _terminal(self, code: int) -> tuple[int, mock.Mock]:
@@ -548,6 +555,25 @@ class SupervisorTerminalTests(unittest.TestCase):
         result, resume = self._terminal(forge.EXIT_SUBSCRIPTION_LIMIT)
         self.assertEqual(result, forge.EXIT_SUBSCRIPTION_LIMIT)
         resume.assert_not_called()
+
+    def test_unattended_chain_without_sandbox_stops_before_worker(self):
+        run = mock.Mock(return_value=forge.EXIT_DONE)
+        with mock.patch.object(
+            forge, "sandbox_runtime_available", return_value=False
+        ), mock.patch.object(forge, "run_forge", run):
+            result = forge.run_chain(
+                self.project,
+                "Goal",
+                Path(forge.__file__).with_name("forge.config.json"),
+            )
+        self.assertEqual(result, forge.EXIT_FAILED)
+        run.assert_not_called()
+        state = json.loads(
+            (self.project / ".forge" / "chain-supervisor.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(state["stop_reason_code"], "technical_failure")
 
     def test_budget_exhaustion_stops_without_another_child(self):
         self._write_needs_result(

@@ -618,6 +618,7 @@ DEFAULT_CONFIG = {
     "security_profile": "balanced",
     "final_review_after_last_worker": True,
     "sandbox_checks": "auto",
+    "unattended_requires_sandbox": True,
     "check_network_domains": [],
     # Adaptive orchestration is enabled by the audited JSON profiles. Keeping
     # the code-level default off preserves legacy programmatic callers that
@@ -1059,7 +1060,22 @@ def find_cli(name: str) -> str | None:
 
 def run_git(project: Path, *args: str, timeout: int = 120) -> tuple[int, str]:
     try:
-        cp = run_process(["git", *args], project, timeout)
+        disabled_hooks = project / ".forge" / "git-hooks-disabled"
+        disabled_hooks.mkdir(parents=True, exist_ok=True)
+        env = subscription_only_env()
+        env.update(
+            {
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_TERMINAL_PROMPT": "0",
+                "GCM_INTERACTIVE": "Never",
+            }
+        )
+        cp = run_process(
+            ["git", "-c", f"core.hooksPath={disabled_hooks.resolve()}", *args],
+            project,
+            timeout,
+            env=env,
+        )
         output = (cp.stdout or "") + ("\n" + cp.stderr if cp.stderr else "")
         return cp.returncode, output.strip()
     except subprocess.TimeoutExpired:
@@ -1625,6 +1641,92 @@ def check_command_args(command: str, project: Path, config: dict) -> tuple[list[
     return command, True
 
 
+def sandbox_runtime_available() -> bool:
+    """Return true only when the configured local sandbox CLI answers successfully."""
+    executable = shutil.which("srt")
+    if not executable:
+        return False
+    try:
+        probe = subprocess.run(
+            [executable, "--version"],
+            text=True,
+            capture_output=True,
+            timeout=15,
+            errors="replace",
+            env=subscription_only_env(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe.returncode == 0
+
+
+def build_check_environment(project: Path) -> dict[str, str]:
+    """Build a secret-scrubbed, non-interactive environment for project checks."""
+    env = subscription_only_env()
+    check_home = project / ".forge" / "check-home"
+    check_tmp = project / ".forge" / "check-tmp"
+    disabled_hooks = project / ".forge" / "git-hooks-disabled"
+    check_home.mkdir(parents=True, exist_ok=True)
+    check_tmp.mkdir(parents=True, exist_ok=True)
+    disabled_hooks.mkdir(parents=True, exist_ok=True)
+    empty_git_config = check_home / "gitconfig"
+    if not empty_git_config.exists():
+        empty_git_config.write_text("", encoding="utf-8")
+    for key in list(env):
+        upper = key.upper()
+        if upper in {
+            "SSH_AUTH_SOCK",
+            "SSH_AGENT_PID",
+            "GIT_ASKPASS",
+            "SSH_ASKPASS",
+            "GIT_SSH",
+            "GIT_SSH_COMMAND",
+        } or upper.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")):
+            env.pop(key, None)
+    env.update(
+        {
+            "HOME": str(check_home.resolve()),
+            "USERPROFILE": str(check_home.resolve()),
+            "TMPDIR": str(check_tmp.resolve()),
+            "TEMP": str(check_tmp.resolve()),
+            "TMP": str(check_tmp.resolve()),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": str(empty_git_config.resolve()),
+            "GIT_TERMINAL_PROMPT": "0",
+            "GCM_INTERACTIVE": "Never",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.hooksPath",
+            "GIT_CONFIG_VALUE_0": str(disabled_hooks.resolve()),
+        }
+    )
+    return env
+
+
+def git_metadata_manifest(project: Path) -> dict[str, str]:
+    """Hash Git control files that project checks must not mutate silently."""
+    manifest: dict[str, str] = {}
+    candidates: list[Path] = [project / ".gitmodules"]
+    git_entry = project / ".git"
+    if git_entry.is_dir():
+        candidates.append(git_entry / "config")
+        hooks = git_entry / "hooks"
+        if hooks.is_dir():
+            candidates.extend(
+                path
+                for path in hooks.rglob("*")
+                if path.is_file() and not path.name.endswith(".sample")
+            )
+    elif git_entry.is_file():
+        manifest[".git"] = hashlib.sha256(git_entry.read_bytes()).hexdigest()
+    for path in sorted(candidates, key=lambda item: str(item).casefold()):
+        relative = path.relative_to(project).as_posix()
+        if path.is_file():
+            manifest[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+        else:
+            manifest[relative] = "<missing>"
+    return manifest
+
+
 def run_checks(
     project: Path,
     config: dict,
@@ -1632,20 +1734,15 @@ def run_checks(
     *,
     tier: str = "release",
     requested_ids: list[str] | None = None,
+    git_metadata_baseline: dict[str, str] | None = None,
 ) -> list[CheckResult]:
     results: list[CheckResult] = []
-    env = subscription_only_env()
-    check_home = project / ".forge" / "check-home"
-    check_tmp = project / ".forge" / "check-tmp"
-    check_home.mkdir(parents=True, exist_ok=True)
-    check_tmp.mkdir(parents=True, exist_ok=True)
-    env.update({
-        "HOME": str(check_home.resolve()),
-        "USERPROFILE": str(check_home.resolve()),
-        "TMPDIR": str(check_tmp.resolve()),
-        "TEMP": str(check_tmp.resolve()),
-        "TMP": str(check_tmp.resolve()),
-    })
+    env = build_check_environment(project)
+    trusted_git_metadata = (
+        dict(git_metadata_baseline)
+        if git_metadata_baseline is not None
+        else git_metadata_manifest(project)
+    )
     warned_unsandboxed = False
     if config.get("adaptive_orchestration", False):
         definitions = discover_check_definitions(
@@ -1678,7 +1775,12 @@ def run_checks(
         try:
             invocation, use_shell = check_command_args(command, project, config)
             if use_shell and str(config.get("sandbox_checks", "auto")).lower() == "auto" and not warned_unsandboxed:
-                print("  UPOZORNENIE: srt nie je nainštalovaný; kontroly bežia so scrubnutým prostredím, ale bez OS sandboxu.")
+                print(
+                    "  BEZPEČNOSTNÉ VAROVANIE: srt nie je nainštalovaný; "
+                    "projektové kontroly bežia so scrubnutým prostredím, "
+                    "ale bez OS sandboxu. Tento režim je určený iba pre "
+                    "manuálny beh s človekom pri počítači."
+                )
                 warned_unsandboxed = True
             cp = subprocess.run(
                 invocation,
@@ -1729,6 +1831,24 @@ def run_checks(
                     or detected_test_count is not None
                 )
             )
+            current_git_metadata = git_metadata_manifest(project)
+            metadata_drift = {
+                key: {
+                    "before": trusted_git_metadata.get(key, "<missing>"),
+                    "after": current_git_metadata.get(key, "<missing>"),
+                }
+                for key in sorted(
+                    set(trusted_git_metadata) | set(current_git_metadata)
+                )
+                if trusted_git_metadata.get(key) != current_git_metadata.get(key)
+            }
+            if metadata_drift:
+                report_valid = False
+                test_metrics.report_valid = False
+                test_metrics.failure_reason = (
+                    "Git control metadata changed during worker/check execution: "
+                    + ", ".join(metadata_drift)
+                )
             output = raw_check_output
             output_limit = int(
                 config.get(
@@ -3212,6 +3332,8 @@ def run_forge(
     )
     logs = run_directory / "logs"
     logs.mkdir(parents=True, exist_ok=True)
+    trusted_git_metadata = git_metadata_manifest(project)
+    save_json(run_directory / "git-metadata-baseline.json", trusted_git_metadata)
     adaptive_enabled = bool(config.get("adaptive_orchestration", False))
     project_identity: dict[str, str] | None = None
     project_plan: ProjectPlan | None = None
@@ -4002,6 +4124,7 @@ def run_forge(
                             status,
                             tier="release",
                             requested_ids=decision.check_ids or None,
+                            git_metadata_baseline=trusted_git_metadata,
                         )
                         chain_full_check_suites += 1
                         last_check_tier = "release"
@@ -4245,6 +4368,7 @@ def run_forge(
                 requested_ids=(
                     decision.check_ids or None if adaptive_enabled else None
                 ),
+                git_metadata_baseline=trusted_git_metadata,
             )
             if last_check_tier == "release":
                 last_release_check_run_id = run_id
@@ -4404,6 +4528,7 @@ def run_forge(
                     requested_ids=(
                         decision.check_ids or None if adaptive_enabled else None
                     ),
+                    git_metadata_baseline=trusted_git_metadata,
                 )
                 save_json(
                     logs / f"{escalation_stem}-checks.json",
@@ -4505,6 +4630,7 @@ def run_forge(
                         status,
                         tier="release",
                         requested_ids=final_decision.check_ids or None,
+                        git_metadata_baseline=trusted_git_metadata,
                     )
                     chain_full_check_suites += 1
                     last_check_tier = "release"
@@ -5094,6 +5220,32 @@ def run_chain(
         "model_polling": False,
     }
     save_json(supervisor_path, supervisor_state)
+    supervisor_config = load_config(config_path)
+    validate_config(supervisor_config)
+    if (
+        supervisor_config.get("unattended_requires_sandbox", True)
+        and not sandbox_runtime_available()
+    ):
+        message = (
+            "Bezobslužný run-chain sa zastavil pred prvým workerom: overený "
+            "Sandbox Runtime (srt) nie je dostupný. Nainštaluj "
+            "@anthropic-ai/sandbox-runtime alebo použi auditovaný WSL2 strict "
+            "režim. Manuálny `forge.py run` môže zostať pod priamym dohľadom."
+        )
+        supervisor_state.update(
+            {
+                "status": "failed",
+                "stop_reason": message,
+                "stop_reason_code": "technical_failure",
+                "automatic_resume_allowed": False,
+                "exit_code": EXIT_FAILED,
+                "finished_at": utc_now(),
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+            }
+        )
+        save_json(supervisor_path, supervisor_state)
+        print(f"[Forge][SupervisorSafety] {message}", file=sys.stderr)
+        return EXIT_FAILED
     if resume_run_id is not None:
         exit_code = resume_forge(project, resume_run_id)
     else:

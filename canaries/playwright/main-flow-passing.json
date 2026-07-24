@@ -1,0 +1,8 @@
+{
+  "stats": {
+    "expected": 2,
+    "unexpected": 0,
+    "skipped": 0,
+    "flaky": 0
+  }
+}

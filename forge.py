@@ -18,13 +18,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, TextIO
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from forge_adaptive import (
     ADAPTIVE_SCHEMA_VERSION,
     AdaptiveDecision,
     ChainBudgets,
     ChainCounters,
+    CheckContract,
     CheckDefinition,
     PacketUpdate,
     PlanPatch,
@@ -32,11 +33,13 @@ from forge_adaptive import (
     WorkPacket,
     apply_plan_patch,
     bootstrap_packet,
+    build_check_contract,
     budget_exhaustion,
     build_evidence_index,
     choose_codex_profile,
     choose_worker_profile,
     classify_worker_termination,
+    collect_indirect_check_sources,
     detect_test_count,
     export_schemas,
     git_baseline,
@@ -50,6 +53,7 @@ from forge_adaptive import (
     select_check_definitions,
     stable_project_identity,
     validate_check_report,
+    validate_contract_update,
     write_assumptions,
 )
 from forge_reports import TestMetrics, evaluate_test_evidence
@@ -87,9 +91,13 @@ class CheckResult(BaseModel):
     tests_failed: int | None = None
     tests_skipped: int | None = None
     report_path: str | None = None
+    report_files: list[str] = Field(default_factory=list)
+    report_file_count: int = 0
     report_format: str | None = None
     report_failure_reason: str | None = None
     report_valid: bool = True
+    check_contract_hash: str | None = None
+    check_contract_valid: bool = True
     cache_hit: bool = False
 
 
@@ -144,6 +152,65 @@ class ContinuationPayload(BaseModel):
     last_release_check_run_id: str | None = None
     unavailable_models: dict[str, str] = Field(default_factory=dict)
     chain_model_fallbacks: int = 0
+    check_contract_hash: str | None = None
+
+
+StopReasonCode = Literal[
+    "chain_budget_exhausted",
+    "packet_attempts_exhausted",
+    "reviewer_continue",
+    "iterations_exhausted",
+    "next_packet_ready",
+    "external_change_review_required",
+    "blocked",
+    "subscription_limit",
+    "technical_failure",
+    "completed",
+]
+
+
+class ResultTermination(BaseModel):
+    """Strict machine-readable termination contract for current result files."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    final_status: Literal[
+        "done", "blocked", "subscription_limit", "failed", "needs_continuation"
+    ]
+    stop_reason_code: StopReasonCode
+    automatic_resume_allowed: bool
+
+    @model_validator(mode="after")
+    def validate_combination(self) -> "ResultTermination":
+        allowed_status = {
+            "chain_budget_exhausted": "needs_continuation",
+            "packet_attempts_exhausted": "needs_continuation",
+            "reviewer_continue": "needs_continuation",
+            "iterations_exhausted": "needs_continuation",
+            "next_packet_ready": "needs_continuation",
+            "external_change_review_required": "needs_continuation",
+            "blocked": "blocked",
+            "subscription_limit": "subscription_limit",
+            "technical_failure": "failed",
+            "completed": "done",
+        }[self.stop_reason_code]
+        resumable = {
+            "reviewer_continue",
+            "iterations_exhausted",
+            "next_packet_ready",
+            "external_change_review_required",
+        }
+        expected_resume = self.stop_reason_code in resumable
+        if self.final_status != allowed_status:
+            raise ValueError(
+                f"{self.stop_reason_code} is incompatible with {self.final_status}."
+            )
+        if self.automatic_resume_allowed != expected_resume:
+            raise ValueError(
+                f"{self.stop_reason_code} requires automatic_resume_allowed="
+                f"{str(expected_resume).lower()}."
+            )
+        return self
 
 
 ALLOWED_PHASES = {
@@ -558,6 +625,7 @@ DEFAULT_CONFIG = {
     "security_profile": "balanced",
     "final_review_after_last_worker": True,
     "sandbox_checks": "auto",
+    "unattended_requires_sandbox": True,
     "check_network_domains": [],
     # Adaptive orchestration is enabled by the audited JSON profiles. Keeping
     # the code-level default off preserves legacy programmatic callers that
@@ -999,7 +1067,22 @@ def find_cli(name: str) -> str | None:
 
 def run_git(project: Path, *args: str, timeout: int = 120) -> tuple[int, str]:
     try:
-        cp = run_process(["git", *args], project, timeout)
+        disabled_hooks = project / ".forge" / "git-hooks-disabled"
+        disabled_hooks.mkdir(parents=True, exist_ok=True)
+        env = subscription_only_env()
+        env.update(
+            {
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_TERMINAL_PROMPT": "0",
+                "GCM_INTERACTIVE": "Never",
+            }
+        )
+        cp = run_process(
+            ["git", "-c", f"core.hooksPath={disabled_hooks.resolve()}", *args],
+            project,
+            timeout,
+            env=env,
+        )
         output = (cp.stdout or "") + ("\n" + cp.stderr if cp.stderr else "")
         return cp.returncode, output.strip()
     except subprocess.TimeoutExpired:
@@ -1064,6 +1147,21 @@ def read_result_compat(path: Path) -> dict[str, Any]:
     payload.setdefault("parent_run_id", None)
     payload.setdefault("continuation_chain_id", payload.get("run_id"))
     payload.setdefault("continuation", None)
+    if int(payload.get("schema_version") or 1) >= SCHEMA_VERSION:
+        try:
+            ResultTermination.model_validate(
+                {
+                    "final_status": payload.get("final_status"),
+                    "stop_reason_code": payload.get("stop_reason_code"),
+                    "automatic_resume_allowed": payload.get(
+                        "automatic_resume_allowed"
+                    ),
+                }
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Current Forge result has an invalid structured termination contract."
+            ) from exc
     return payload
 
 
@@ -1209,6 +1307,7 @@ def load_resume_context(project: Path, requested_run_id: str) -> dict[str, Any]:
             "chain_child_runs",
             "chain_codex_calls",
             "chain_no_progress_events",
+            "check_contract_hash",
         }
         adaptive_missing = sorted(
             key
@@ -1235,6 +1334,24 @@ def load_resume_context(project: Path, requested_run_id: str) -> dict[str, Any]:
             raise RuntimeError(
                 "Persistent project plan changed outside the source run; resume stopped "
                 "instead of silently executing a stale packet."
+            )
+        contract_path = project / ".forge" / "check-contract.json"
+        if not contract_path.is_file():
+            raise RuntimeError(
+                "Forge-owned check contract is missing; resume stopped safely."
+            )
+        try:
+            current_contract = CheckContract.model_validate_json(
+                contract_path.read_text(encoding="utf-8")
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Forge-owned check contract is invalid; resume stopped safely."
+            ) from exc
+        if current_contract.contract_hash != continuation.check_contract_hash:
+            raise RuntimeError(
+                "Check contract hash changed since the source run; resume requires "
+                "a consistency review and stopped before worker execution."
             )
 
     return {
@@ -1504,6 +1621,102 @@ def discover_check_definitions(
     return selected
 
 
+def ensure_check_contract(
+    project: Path,
+    config: dict,
+    *,
+    approve_indirect_drift: bool = False,
+    change_reason: str = "Forge validated the active verification configuration.",
+) -> CheckContract:
+    """Create or validate the Forge-owned verification contract."""
+    definitions = discover_check_definitions(project, config, "release")
+    if not definitions:
+        raise RuntimeError("Adaptive Forge requires at least one check definition.")
+    source = (
+        "explicit_project_config"
+        if normalize_check_definitions(config)
+        else "validated_auto_discovery"
+    )
+    stacks = sorted(
+        {
+            stack
+            for definition in definitions
+            for stack in definition.stacks
+        }
+    )
+    proposed = build_check_contract(
+        project,
+        definitions,
+        source=source,
+        stacks=stacks,
+        change_reason=change_reason,
+    )
+    path = project / ".forge" / "check-contract.json"
+    if not path.is_file():
+        save_json(path, proposed)
+        return proposed
+    try:
+        current = CheckContract.model_validate_json(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(
+            "Existing Forge check contract is malformed or its hash was altered."
+        ) from exc
+    current_definitions = [
+        item.model_dump(mode="json") for item in current.check_definitions
+    ]
+    proposed_definitions = [
+        item.model_dump(mode="json") for item in proposed.check_definitions
+    ]
+    if current_definitions != proposed_definitions:
+        validate_contract_update(
+            current,
+            proposed,
+            justification=proposed.change_reason,
+        )
+        save_json(path, proposed)
+        return proposed
+    if (
+        approve_indirect_drift
+        and current.indirect_source_hashes != proposed.indirect_source_hashes
+    ):
+        validate_contract_update(
+            current,
+            proposed,
+            justification=change_reason,
+        )
+        save_json(path, proposed)
+        return proposed
+    return current
+
+
+def check_contract_runtime_error(
+    project: Path, expected: CheckContract
+) -> str | None:
+    path = project / ".forge" / "check-contract.json"
+    if not path.is_file():
+        return "Forge-owned check contract disappeared."
+    try:
+        stored = CheckContract.model_validate_json(path.read_text(encoding="utf-8"))
+    except Exception:
+        return "Forge-owned check contract is malformed or has an invalid hash."
+    if stored.contract_hash != expected.contract_hash:
+        return "Forge-owned check contract changed after validation."
+    current_indirect = collect_indirect_check_sources(
+        project, expected.check_definitions
+    )
+    if current_indirect != expected.indirect_source_hashes:
+        changed = sorted(
+            key
+            for key in set(current_indirect) | set(expected.indirect_source_hashes)
+            if current_indirect.get(key) != expected.indirect_source_hashes.get(key)
+        )
+        return (
+            "Indirect check sources drifted and require a Codex consistency review: "
+            + ", ".join(changed)
+        )
+    return None
+
+
 def build_srt_settings(project: Path, config: dict) -> Path:
     home = str(Path.home().resolve())
     temp_dir = project / ".forge" / "check-tmp"
@@ -1550,6 +1763,92 @@ def check_command_args(command: str, project: Path, config: dict) -> tuple[list[
     return command, True
 
 
+def sandbox_runtime_available() -> bool:
+    """Return true only when the configured local sandbox CLI answers successfully."""
+    executable = shutil.which("srt")
+    if not executable:
+        return False
+    try:
+        probe = subprocess.run(
+            [executable, "--version"],
+            text=True,
+            capture_output=True,
+            timeout=15,
+            errors="replace",
+            env=subscription_only_env(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe.returncode == 0
+
+
+def build_check_environment(project: Path) -> dict[str, str]:
+    """Build a secret-scrubbed, non-interactive environment for project checks."""
+    env = subscription_only_env()
+    check_home = project / ".forge" / "check-home"
+    check_tmp = project / ".forge" / "check-tmp"
+    disabled_hooks = project / ".forge" / "git-hooks-disabled"
+    check_home.mkdir(parents=True, exist_ok=True)
+    check_tmp.mkdir(parents=True, exist_ok=True)
+    disabled_hooks.mkdir(parents=True, exist_ok=True)
+    empty_git_config = check_home / "gitconfig"
+    if not empty_git_config.exists():
+        empty_git_config.write_text("", encoding="utf-8")
+    for key in list(env):
+        upper = key.upper()
+        if upper in {
+            "SSH_AUTH_SOCK",
+            "SSH_AGENT_PID",
+            "GIT_ASKPASS",
+            "SSH_ASKPASS",
+            "GIT_SSH",
+            "GIT_SSH_COMMAND",
+        } or upper.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")):
+            env.pop(key, None)
+    env.update(
+        {
+            "HOME": str(check_home.resolve()),
+            "USERPROFILE": str(check_home.resolve()),
+            "TMPDIR": str(check_tmp.resolve()),
+            "TEMP": str(check_tmp.resolve()),
+            "TMP": str(check_tmp.resolve()),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": str(empty_git_config.resolve()),
+            "GIT_TERMINAL_PROMPT": "0",
+            "GCM_INTERACTIVE": "Never",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.hooksPath",
+            "GIT_CONFIG_VALUE_0": str(disabled_hooks.resolve()),
+        }
+    )
+    return env
+
+
+def git_metadata_manifest(project: Path) -> dict[str, str]:
+    """Hash Git control files that project checks must not mutate silently."""
+    manifest: dict[str, str] = {}
+    candidates: list[Path] = [project / ".gitmodules"]
+    git_entry = project / ".git"
+    if git_entry.is_dir():
+        candidates.append(git_entry / "config")
+        hooks = git_entry / "hooks"
+        if hooks.is_dir():
+            candidates.extend(
+                path
+                for path in hooks.rglob("*")
+                if path.is_file() and not path.name.endswith(".sample")
+            )
+    elif git_entry.is_file():
+        manifest[".git"] = hashlib.sha256(git_entry.read_bytes()).hexdigest()
+    for path in sorted(candidates, key=lambda item: str(item).casefold()):
+        relative = path.relative_to(project).as_posix()
+        if path.is_file():
+            manifest[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+        else:
+            manifest[relative] = "<missing>"
+    return manifest
+
+
 def run_checks(
     project: Path,
     config: dict,
@@ -1557,20 +1856,16 @@ def run_checks(
     *,
     tier: str = "release",
     requested_ids: list[str] | None = None,
+    git_metadata_baseline: dict[str, str] | None = None,
+    check_contract: CheckContract | None = None,
 ) -> list[CheckResult]:
     results: list[CheckResult] = []
-    env = subscription_only_env()
-    check_home = project / ".forge" / "check-home"
-    check_tmp = project / ".forge" / "check-tmp"
-    check_home.mkdir(parents=True, exist_ok=True)
-    check_tmp.mkdir(parents=True, exist_ok=True)
-    env.update({
-        "HOME": str(check_home.resolve()),
-        "USERPROFILE": str(check_home.resolve()),
-        "TMPDIR": str(check_tmp.resolve()),
-        "TEMP": str(check_tmp.resolve()),
-        "TMP": str(check_tmp.resolve()),
-    })
+    env = build_check_environment(project)
+    trusted_git_metadata = (
+        dict(git_metadata_baseline)
+        if git_metadata_baseline is not None
+        else git_metadata_manifest(project)
+    )
     warned_unsandboxed = False
     if config.get("adaptive_orchestration", False):
         definitions = discover_check_definitions(
@@ -1603,7 +1898,12 @@ def run_checks(
         try:
             invocation, use_shell = check_command_args(command, project, config)
             if use_shell and str(config.get("sandbox_checks", "auto")).lower() == "auto" and not warned_unsandboxed:
-                print("  UPOZORNENIE: srt nie je nainštalovaný; kontroly bežia so scrubnutým prostredím, ale bez OS sandboxu.")
+                print(
+                    "  BEZPEČNOSTNÉ VAROVANIE: srt nie je nainštalovaný; "
+                    "projektové kontroly bežia so scrubnutým prostredím, "
+                    "ale bez OS sandboxu. Tento režim je určený iba pre "
+                    "manuálny beh s človekom pri počítači."
+                )
                 warned_unsandboxed = True
             cp = subprocess.run(
                 invocation,
@@ -1654,6 +1954,33 @@ def run_checks(
                     or detected_test_count is not None
                 )
             )
+            current_git_metadata = git_metadata_manifest(project)
+            metadata_drift = {
+                key: {
+                    "before": trusted_git_metadata.get(key, "<missing>"),
+                    "after": current_git_metadata.get(key, "<missing>"),
+                }
+                for key in sorted(
+                    set(trusted_git_metadata) | set(current_git_metadata)
+                )
+                if trusted_git_metadata.get(key) != current_git_metadata.get(key)
+            }
+            if metadata_drift:
+                report_valid = False
+                test_metrics.report_valid = False
+                test_metrics.failure_reason = (
+                    "Git control metadata changed during worker/check execution: "
+                    + ", ".join(metadata_drift)
+                )
+            contract_error = (
+                check_contract_runtime_error(project, check_contract)
+                if check_contract is not None
+                else None
+            )
+            if contract_error:
+                report_valid = False
+                test_metrics.report_valid = False
+                test_metrics.failure_reason = contract_error
             output = raw_check_output
             output_limit = int(
                 config.get(
@@ -1680,9 +2007,17 @@ def run_checks(
                     tests_failed=test_metrics.failed,
                     tests_skipped=test_metrics.skipped,
                     report_path=test_metrics.report_path,
+                    report_files=test_metrics.report_files,
+                    report_file_count=test_metrics.report_file_count,
                     report_format=test_metrics.report_format,
                     report_failure_reason=test_metrics.failure_reason,
                     report_valid=report_valid,
+                    check_contract_hash=(
+                        check_contract.contract_hash
+                        if check_contract is not None
+                        else None
+                    ),
+                    check_contract_valid=contract_error is None,
                 )
             )
         except subprocess.TimeoutExpired as exc:
@@ -3135,13 +3470,19 @@ def run_forge(
     )
     logs = run_directory / "logs"
     logs.mkdir(parents=True, exist_ok=True)
+    trusted_git_metadata = git_metadata_manifest(project)
+    save_json(run_directory / "git-metadata-baseline.json", trusted_git_metadata)
     adaptive_enabled = bool(config.get("adaptive_orchestration", False))
     project_identity: dict[str, str] | None = None
     project_plan: ProjectPlan | None = None
+    check_contract: CheckContract | None = None
     baseline_snapshot: dict[str, Any] | None = None
     if adaptive_enabled:
         project_identity = stable_project_identity(project)
         project_plan = load_or_create_plan(project, goal)
+        check_contract = ensure_check_contract(project, config)
+        project_plan.check_contract_hash = check_contract.contract_hash
+        save_json(run_directory / "check-contract.snapshot.json", check_contract)
         export_schemas(forge_dir / "schemas")
         baseline_snapshot = git_baseline(project)
         save_json(run_directory / "git-baseline.json", baseline_snapshot)
@@ -3402,6 +3743,7 @@ def run_forge(
     final_status = "failed"
     final_message = "Forge sa nedokončil."
     exit_code = EXIT_FAILED
+    stop_reason_code: StopReasonCode | None = None
     error_text: str | None = None
     continuation_payload: ContinuationPayload | None = None
     packet_transition_ready = False
@@ -3479,6 +3821,7 @@ def run_forge(
             if budget_reason:
                 final_status = "needs_continuation"
                 final_message = budget_reason
+                stop_reason_code = "chain_budget_exhausted"
                 exit_code = EXIT_NEEDS_CONTINUATION
                 status.set_phase(
                     "needs_continuation",
@@ -3607,6 +3950,7 @@ def run_forge(
                         if budget_reason:
                             final_status = "needs_continuation"
                             final_message = budget_reason
+                            stop_reason_code = "chain_budget_exhausted"
                             exit_code = EXIT_NEEDS_CONTINUATION
                             break
                         chain_codex_calls += 1
@@ -3731,6 +4075,7 @@ def run_forge(
                     if budget_reason:
                         final_status = "needs_continuation"
                         final_message = budget_reason
+                        stop_reason_code = "chain_budget_exhausted"
                         exit_code = EXIT_NEEDS_CONTINUATION
                         break
                     chain_codex_calls += 1
@@ -3921,6 +4266,8 @@ def run_forge(
                             status,
                             tier="release",
                             requested_ids=decision.check_ids or None,
+                            git_metadata_baseline=trusted_git_metadata,
+                            check_contract=check_contract,
                         )
                         chain_full_check_suites += 1
                         last_check_tier = "release"
@@ -3998,6 +4345,42 @@ def run_forge(
                 print(f"[Codex][Decision] blocked - {redact_text(final_message)}")
                 break
 
+            if (
+                adaptive_enabled
+                and check_contract is not None
+                and decision.status == "continue"
+            ):
+                contract_error = check_contract_runtime_error(
+                    project, check_contract
+                )
+                if contract_error and contract_error.startswith(
+                    "Indirect check sources drifted"
+                ):
+                    check_contract = ensure_check_contract(
+                        project,
+                        config,
+                        approve_indirect_drift=True,
+                        change_reason=(
+                            "Codex reviewed the reported indirect check-source drift: "
+                            + (decision.routing_reason or decision.assessment)
+                        ),
+                    )
+                    if project_plan is not None:
+                        project_plan.check_contract_hash = (
+                            check_contract.contract_hash
+                        )
+                        save_plan(
+                            project,
+                            project_plan,
+                            snapshot_path=(
+                                run_directory
+                                / f"project-plan.contract-approved-{iteration:02d}.json"
+                            ),
+                        )
+                    save_json(
+                        run_directory / "check-contract.snapshot.json",
+                        check_contract,
+                    )
             final_decision = decision
             logical_worker_profile = "standard"
             worker_routing_reason = "Legacy-compatible standard worker profile."
@@ -4007,6 +4390,7 @@ def run_forge(
                 if budget_reason:
                     final_status = "needs_continuation"
                     final_message = budget_reason
+                    stop_reason_code = "chain_budget_exhausted"
                     exit_code = EXIT_NEEDS_CONTINUATION
                     break
                 packet_for_worker = active_plan_packet(project_plan)
@@ -4015,6 +4399,7 @@ def run_forge(
                 max_packet_attempts = int(config.get("max_packet_attempts", 3))
                 if packet_attempt_budget_exhausted(packet_for_worker, config):
                     final_status = "needs_continuation"
+                    stop_reason_code = "packet_attempts_exhausted"
                     final_message = (
                         f"Packet attempt budget exhausted for "
                         f"{packet_for_worker.packet_id}: "
@@ -4162,6 +4547,8 @@ def run_forge(
                 requested_ids=(
                     decision.check_ids or None if adaptive_enabled else None
                 ),
+                git_metadata_baseline=trusted_git_metadata,
+                check_contract=check_contract,
             )
             if last_check_tier == "release":
                 last_release_check_run_id = run_id
@@ -4321,6 +4708,8 @@ def run_forge(
                     requested_ids=(
                         decision.check_ids or None if adaptive_enabled else None
                     ),
+                    git_metadata_baseline=trusted_git_metadata,
+                    check_contract=check_contract,
                 )
                 save_json(
                     logs / f"{escalation_stem}-checks.json",
@@ -4370,6 +4759,7 @@ def run_forge(
                 "Dosiahnutý maximálny počet iterácií; nasleduje povinný "
                 "záverečný Codex review."
             )
+            stop_reason_code = "iterations_exhausted"
             exit_code = EXIT_FAILED
             print(f"[Forge][Result] {final_message}")
 
@@ -4380,6 +4770,7 @@ def run_forge(
             and final_decision.status == "continue"
         ):
             final_status = "needs_continuation"
+            stop_reason_code = "next_packet_ready"
             final_message = (
                 "Verified packet completed. The exact next dependency-ready packet "
                 "is stored for the bounded chain supervisor."
@@ -4405,6 +4796,7 @@ def run_forge(
                 if budget_reason:
                     final_status = "needs_continuation"
                     final_message = budget_reason
+                    stop_reason_code = "chain_budget_exhausted"
                     exit_code = EXIT_NEEDS_CONTINUATION
                     status.set_phase(
                         "needs_continuation",
@@ -4419,6 +4811,8 @@ def run_forge(
                         status,
                         tier="release",
                         requested_ids=final_decision.check_ids or None,
+                        git_metadata_baseline=trusted_git_metadata,
+                        check_contract=check_contract,
                     )
                     chain_full_check_suites += 1
                     last_check_tier = "release"
@@ -4435,6 +4829,7 @@ def run_forge(
                 if budget_reason:
                     final_status = "needs_continuation"
                     final_message = budget_reason
+                    stop_reason_code = "chain_budget_exhausted"
                     exit_code = EXIT_NEEDS_CONTINUATION
                     status.set_phase(
                         "needs_continuation",
@@ -4572,6 +4967,7 @@ def run_forge(
                     final_status="blocked",
                 )
             elif final_decision.status == "continue":
+                stop_reason_code = "reviewer_continue"
                 continuation_payload = ContinuationPayload(
                     source_run_id=run_id,
                     continuation_chain_id=continuation_chain_id,
@@ -4611,6 +5007,11 @@ def run_forge(
                     last_release_check_run_id=last_release_check_run_id,
                     unavailable_models=unavailable_models,
                     chain_model_fallbacks=chain_model_fallbacks,
+                    check_contract_hash=(
+                        check_contract.contract_hash
+                        if check_contract is not None
+                        else None
+                    ),
                 )
                 final_status = "needs_continuation"
                 final_message = (
@@ -4634,6 +5035,7 @@ def run_forge(
                 )
             else:
                 final_status = "failed"
+                stop_reason_code = "technical_failure"
                 final_message = (
                     "Forge nedostal schválenie done alebo povinné kontroly neprešli."
                 )
@@ -4672,6 +5074,7 @@ def run_forge(
             )
             if not (next_prompt or "").strip():
                 final_status = "failed"
+                stop_reason_code = "technical_failure"
                 final_message = (
                     "Chain budget sa vyčerpal pred vytvorením bezpečného next_promptu; "
                     "Forge odmietol vymyslieť pokračovanie."
@@ -4731,6 +5134,11 @@ def run_forge(
                     last_release_check_run_id=last_release_check_run_id,
                     unavailable_models=unavailable_models,
                     chain_model_fallbacks=chain_model_fallbacks,
+                    check_contract_hash=(
+                        check_contract.contract_hash
+                        if check_contract is not None
+                        else None
+                    ),
                 )
                 print(
                     f"[Forge][NeedsContinuation] {final_message}\n"
@@ -4745,6 +5153,7 @@ def run_forge(
             if current_iteration > 0:
                 save_json(logs / f"{current_iteration:02d}-worker.json", worker)
         final_status = "subscription_limit"
+        stop_reason_code = "subscription_limit"
         final_message = redact_text(str(exc))
         error_text = final_message
         exit_code = EXIT_SUBSCRIPTION_LIMIT
@@ -4757,6 +5166,7 @@ def run_forge(
         print(f"[Forge][SubscriptionLimit] {truncate(final_message, 3000)}")
     except Exception as exc:
         final_status = "failed"
+        stop_reason_code = "technical_failure"
         final_message = redact_text(str(exc))
         error_text = final_message
         exit_code = EXIT_FAILED
@@ -4774,6 +5184,27 @@ def run_forge(
     )
     if continuation_payload is not None:
         continuation_payload.chain_elapsed_seconds = chain_elapsed_seconds
+    terminal_reason = {
+        "done": "completed",
+        "blocked": "blocked",
+        "subscription_limit": "subscription_limit",
+        "failed": "technical_failure",
+    }.get(final_status)
+    if terminal_reason is not None:
+        stop_reason_code = terminal_reason
+    elif stop_reason_code is None:
+        stop_reason_code = "iterations_exhausted"
+    automatic_resume_allowed = stop_reason_code in {
+        "reviewer_continue",
+        "iterations_exhausted",
+        "next_packet_ready",
+        "external_change_review_required",
+    }
+    termination = ResultTermination(
+        final_status=final_status,
+        stop_reason_code=stop_reason_code,
+        automatic_resume_allowed=automatic_resume_allowed,
+    )
     final_state = {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
@@ -4782,6 +5213,8 @@ def run_forge(
         "goal": goal,
         "finished_at": utc_now(),
         "final_status": final_status,
+        "stop_reason_code": termination.stop_reason_code,
+        "automatic_resume_allowed": termination.automatic_resume_allowed,
         "final_message": final_message,
         "error": error_text,
         "final_decision": final_decision.model_dump(mode="json") if final_decision else None,
@@ -4815,6 +5248,9 @@ def run_forge(
         ),
         "plan_id": project_plan.plan_id if project_plan is not None else None,
         "plan_hash": plan_hash(project_plan) if project_plan is not None else None,
+        "check_contract_hash": (
+            check_contract.contract_hash if check_contract is not None else None
+        ),
         "active_packet_id": (
             project_plan.active_packet_id if project_plan is not None else None
         ),
@@ -4979,6 +5415,32 @@ def run_chain(
         "model_polling": False,
     }
     save_json(supervisor_path, supervisor_state)
+    supervisor_config = load_config(config_path)
+    validate_config(supervisor_config)
+    if (
+        supervisor_config.get("unattended_requires_sandbox", True)
+        and not sandbox_runtime_available()
+    ):
+        message = (
+            "Bezobslužný run-chain sa zastavil pred prvým workerom: overený "
+            "Sandbox Runtime (srt) nie je dostupný. Nainštaluj "
+            "@anthropic-ai/sandbox-runtime alebo použi auditovaný WSL2 strict "
+            "režim. Manuálny `forge.py run` môže zostať pod priamym dohľadom."
+        )
+        supervisor_state.update(
+            {
+                "status": "failed",
+                "stop_reason": message,
+                "stop_reason_code": "technical_failure",
+                "automatic_resume_allowed": False,
+                "exit_code": EXIT_FAILED,
+                "finished_at": utc_now(),
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+            }
+        )
+        save_json(supervisor_path, supervisor_state)
+        print(f"[Forge][SupervisorSafety] {message}", file=sys.stderr)
+        return EXIT_FAILED
     if resume_run_id is not None:
         exit_code = resume_forge(project, resume_run_id)
     else:
@@ -4988,7 +5450,13 @@ def run_chain(
 
     while exit_code == EXIT_NEEDS_CONTINUATION:
         result_path = project / ".forge" / "result.json"
-        result = read_result_compat(result_path)
+        try:
+            result = read_result_compat(result_path)
+        except RuntimeError as exc:
+            supervisor_state["status"] = "failed"
+            supervisor_state["stop_reason"] = str(exc)
+            exit_code = EXIT_FAILED
+            break
         run_id = _safe_run_id(str(result.get("run_id") or ""))
         supervisor_state["last_run_id"] = run_id
         supervisor_state["last_status"] = result.get("final_status")
@@ -5005,11 +5473,33 @@ def run_chain(
                 result.get("chain_no_progress_events") or 0
             ),
         }
+        schema_version = int(result.get("schema_version") or 1)
         final_message_text = str(result.get("final_message") or "")
-        if "budget exhausted" in final_message_text.lower():
-            supervisor_state["status"] = "needs_continuation"
-            supervisor_state["stop_reason"] = final_message_text
-            break
+        if schema_version >= SCHEMA_VERSION:
+            termination = ResultTermination.model_validate(
+                {
+                    "final_status": result.get("final_status"),
+                    "stop_reason_code": result.get("stop_reason_code"),
+                    "automatic_resume_allowed": result.get(
+                        "automatic_resume_allowed"
+                    ),
+                }
+            )
+            supervisor_state["stop_reason_code"] = termination.stop_reason_code
+            supervisor_state["automatic_resume_allowed"] = (
+                termination.automatic_resume_allowed
+            )
+            if not termination.automatic_resume_allowed:
+                supervisor_state["status"] = termination.final_status
+                supervisor_state["stop_reason"] = final_message_text
+                break
+        else:
+            # Legacy schema compatibility only. Current results never route by text.
+            if "budget exhausted" in final_message_text.lower():
+                supervisor_state["status"] = "needs_continuation"
+                supervisor_state["stop_reason"] = final_message_text
+                supervisor_state["legacy_stop_detection"] = True
+                break
         continuation = result.get("continuation")
         if not isinstance(continuation, dict) or not str(
             continuation.get("next_prompt") or ""
@@ -5032,11 +5522,17 @@ def run_chain(
         )
         exit_code = resume_forge(project, run_id)
 
-    latest_result = (
-        read_result_compat(project / ".forge" / "result.json")
-        if (project / ".forge" / "result.json").is_file()
-        else {}
-    )
+    try:
+        latest_result = (
+            read_result_compat(project / ".forge" / "result.json")
+            if (project / ".forge" / "result.json").is_file()
+            else {}
+        )
+    except RuntimeError as exc:
+        latest_result = {}
+        supervisor_state["status"] = "failed"
+        supervisor_state["stop_reason"] = str(exc)
+        exit_code = EXIT_FAILED
     supervisor_state["status"] = str(
         latest_result.get("final_status")
         or supervisor_state.get("status")

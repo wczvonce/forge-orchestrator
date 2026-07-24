@@ -33,6 +33,7 @@
   "strict_subscription_auth": true,
   "security_profile": "strict",
   "sandbox_checks": "required",
+  "unattended_requires_sandbox": true,
   "check_network_domains": [],
   "max_iterations": 2,
   "claude_timeout_seconds": 3600,

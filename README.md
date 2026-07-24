@@ -7,6 +7,48 @@ Forge používa existujúce ChatGPT a Claude.ai predplatné, nie API kľúče:
 - **Forge** je lokálna Python slučka, ktorá vyberá správny model podľa fázy, zbiera iba potrebné dôkazy, spúšťa kontroly a bezpečne zastavuje proces.
 - **Live Monitor** je obyčajný lokálny PowerShell. Jeho obnovovanie nespotrebúva modelové tokeny.
 
+## Verification hardening — 24. júl 2026
+
+Aktuálna schema 4 pridáva strojovo čitateľný koniec runu:
+`stop_reason_code` a `automatic_resume_allowed`. Nový supervisor pri schema 4
+nikdy nerozhoduje podľa textu `final_message`. Automatický resume je povolený
+iba pre validovaný `reviewer_continue`, `next_packet_ready`,
+`iterations_exhausted` alebo `external_change_review_required`. Vyčerpanie
+chain budgetu alebo packet attempts, blocked, subscription limit a technická
+chyba vždy zastavia supervisor.
+
+Adaptívny run vytvára Forge-owned kontrakt v
+`.forge/check-contract.json`. Strict `CheckContract` obsahuje validované
+`CheckDefinition`, zdroj, stacky, dôvod zmeny, hashe nepriamych vstupov a
+kanonický `contract_hash`. Pri npm sa hashujú konkrétne scripts, lockfile a
+runner configy; pri Gradle relevantné settings/build/wrapper súbory. Worker
+nemôže ticho odstrániť required check, vypnúť `require_test_execution` ani
+zmeniť kontrakt bez nového hashu a viditeľného Codex consistency review.
+Contract hash sa prenáša cez ProjectPlan a continuation; nezhoda pri resume
+zastaví worker pred vykonaním.
+
+Kontrakt určuje, čo Forge spúšťa a aký dôkaz vyžaduje. Nezaručuje kvalitu
+workerom napísaných testov, nenahrádza read-only Codex review a nie je OS
+sandbox.
+
+Project check prostredie odstraňuje SSH agent/askpass kanály, používa prázdnu
+globálnu Git konfiguráciu, `GIT_CONFIG_NOSYSTEM=1`,
+`GIT_TERMINAL_PROMPT=0`, `GCM_INTERACTIVE=Never` a vypnutý hooks path.
+Forge porovnáva `.git/config`, aktívne `.git/hooks` a `.gitmodules` pred a po
+checkoch. Drift nemôže byť zeleným gate.
+
+Bezobslužný `run-chain` má `unattended_requires_sandbox=true` a pred prvým
+workerom vyžaduje dostupný a úspešne overený `srt`. Ak sandbox chýba, skončí
+technickou bezpečnou chybou. Manuálny `run` s človekom pri počítači môže v
+`sandbox_checks=auto` pokračovať bez `srt`, ale zobrazí výrazné bezpečnostné
+varovanie. `Strict` naďalej bez sandboxu zlyhá.
+
+Android unit a instrumentation checky agregujú čerstvé `TEST-*.xml` zo
+všetkých dynamických modulov, odmietajú prázdny adresár, malformed XML, nulu
+testov, failed test, stale report, `..` a symlink/junction únik mimo projektu.
+Podporované dôkazy zahŕňajú aj Mocha JSON a textové `passing`, `failing`,
+`pending`.
+
 ## Subscription-safe runtime routing — 24. júl 2026
 
 Každé produkčné Claude volanie, vrátane opravy po zaseknutí, prechádza cez
@@ -35,7 +77,7 @@ vynucujú timeout, packet attempts, worker-call, elapsed a no-progress budgety.
 Test checks normalizujú `tests_discovered`, `tests_executed`, `tests_passed`,
 `tests_failed` a `tests_skipped`. Podporované dôkazy zahŕňajú pytest/unittest
 text, JUnit XML, Jest/Vitest JSON, Playwright JSON, Gradle/Android JUnit, TRX a
-Flutter JSON events. Povinný test check s nulou vykonaných testov, neplatným,
+Flutter JSON events aj Mocha JSON/text. Povinný test check s nulou vykonaných testov, neplatným,
 starým alebo mimoprojektovým reportom nie je zelený. Build, lint a type-check
 nepotrebujú test count.
 
@@ -156,7 +198,7 @@ Stavový a exit-code model:
 | `subscription_limit` | 3 | vyčerpaný subscription limit bez API fallbacku |
 | `needs_continuation` | 4 | bezpečný continuation bod; supervisor pokračuje presným resume alebo sa po vyčerpaní budgetu zastaví |
 
-Nové súbory obsahujú `schema_version: 3`. Staré `result.json` schema 1 a schema 2 zostávajú čitateľné. Starý alebo neúplný run bez bezpečného continuation payloadu sa odmietne s jasnou chybou; Forge nikdy nevymyslí náhradný prompt.
+Nové súbory obsahujú `schema_version: 4`. Staré `result.json` schema 1, 2 a 3 zostávajú čitateľné cez samostatnú legacy vetvu. Starý alebo neúplný run bez bezpečného continuation payloadu sa odmietne s jasnou chybou; Forge nikdy nevymyslí náhradný prompt.
 
 ## Nemenné logy a Live Monitor
 
@@ -221,6 +263,7 @@ Každá worker iterácia vytvára redigované súbory `NN-claude-prompt.txt`, `N
 - Codex pracuje v read-only sandboxe a ignoruje používateľský config aj projektové rules.
 - Zakázané zostávajú push, publish, deploy, produkčné migrácie, cloud CLI, platené nákupy a práca s produkčnými tajomstvami.
 - Natívny Windows nemá plný Claude Bash sandbox. Pre najvyššiu izoláciu použi WSL2/Linux a režim `Strict`.
+- Bezobslužný `run-chain` bez overeného `srt` sa nespustí; natívny Windows bez `srt` podporuje iba priamo dohliadaný manuálny `run`.
 
 ## Inštalácia a doctor
 
@@ -246,11 +289,30 @@ python -m py_compile .\forge.py
 python -m unittest discover -s .\tests -v
 ```
 
-Testy používajú falošné Codex a Claude CLI procesy. Sada pokrýva 84 pôvodných
-regresných scenárov a 46 nových routing/fallback/report/DAG scenárov, spolu 130
-testov. Multi-packet fake E2E simuluje odmietnutý economy model, bezpečný
+Testy používajú falošné Codex a Claude CLI procesy. Aktuálna sada obsahuje 186
+unit, integračných, bezpečnostných, reportových a canary scenárov.
+Multi-packet fake E2E simuluje odmietnutý economy model, bezpečný
 fallback, economy aj complex packet, reportované test counts, automatické
 resume, čerstvú release suite a `done` — bez reálneho modelového volania.
+
+Model-free fixtures v `canaries/` pokrývajú pytest, Vitest, Playwright a
+multi-module Android unit reporty. Android instrumentation zostáva manuálnym
+canary, pretože bežný Windows CI neprovisionuje emulátor.
+
+## Rollback
+
+Pred nasadením maintainer vytvára úplnú timestampovanú zálohu so
+`SHA256-MANIFEST.json`, `ORIGINAL-COMMIT.txt` a `ROLLBACK.md`. Rollback sa robí
+iba pri zastavenom Forge:
+
+1. over, že nebeží `forge.py` ani `Start-ForgeAutonomous.ps1`;
+2. premenuj aktuálny `C:\AI-Tools\GPT-Claude-Forge` na karanténny názov;
+3. skopíruj obsah vybranej zálohy späť na pôvodnú cestu;
+4. znovu over všetky SHA-256 z manifestu;
+5. spusti `Start-ForgeAutonomous.ps1 -DoctorOnly -NoMonitor`.
+
+Nepoužívaj čiastočný rollback jednotlivých Python súborov medzi rozdielnymi
+schema verziami.
 
 ## Limity
 

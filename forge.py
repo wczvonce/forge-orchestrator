@@ -25,6 +25,7 @@ from forge_adaptive import (
     AdaptiveDecision,
     ChainBudgets,
     ChainCounters,
+    CheckContract,
     CheckDefinition,
     PacketUpdate,
     PlanPatch,
@@ -32,11 +33,13 @@ from forge_adaptive import (
     WorkPacket,
     apply_plan_patch,
     bootstrap_packet,
+    build_check_contract,
     budget_exhaustion,
     build_evidence_index,
     choose_codex_profile,
     choose_worker_profile,
     classify_worker_termination,
+    collect_indirect_check_sources,
     detect_test_count,
     export_schemas,
     git_baseline,
@@ -50,6 +53,7 @@ from forge_adaptive import (
     select_check_definitions,
     stable_project_identity,
     validate_check_report,
+    validate_contract_update,
     write_assumptions,
 )
 from forge_reports import TestMetrics, evaluate_test_evidence
@@ -92,6 +96,8 @@ class CheckResult(BaseModel):
     report_format: str | None = None
     report_failure_reason: str | None = None
     report_valid: bool = True
+    check_contract_hash: str | None = None
+    check_contract_valid: bool = True
     cache_hit: bool = False
 
 
@@ -146,6 +152,7 @@ class ContinuationPayload(BaseModel):
     last_release_check_run_id: str | None = None
     unavailable_models: dict[str, str] = Field(default_factory=dict)
     chain_model_fallbacks: int = 0
+    check_contract_hash: str | None = None
 
 
 StopReasonCode = Literal[
@@ -1300,6 +1307,7 @@ def load_resume_context(project: Path, requested_run_id: str) -> dict[str, Any]:
             "chain_child_runs",
             "chain_codex_calls",
             "chain_no_progress_events",
+            "check_contract_hash",
         }
         adaptive_missing = sorted(
             key
@@ -1326,6 +1334,24 @@ def load_resume_context(project: Path, requested_run_id: str) -> dict[str, Any]:
             raise RuntimeError(
                 "Persistent project plan changed outside the source run; resume stopped "
                 "instead of silently executing a stale packet."
+            )
+        contract_path = project / ".forge" / "check-contract.json"
+        if not contract_path.is_file():
+            raise RuntimeError(
+                "Forge-owned check contract is missing; resume stopped safely."
+            )
+        try:
+            current_contract = CheckContract.model_validate_json(
+                contract_path.read_text(encoding="utf-8")
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Forge-owned check contract is invalid; resume stopped safely."
+            ) from exc
+        if current_contract.contract_hash != continuation.check_contract_hash:
+            raise RuntimeError(
+                "Check contract hash changed since the source run; resume requires "
+                "a consistency review and stopped before worker execution."
             )
 
     return {
@@ -1595,6 +1621,102 @@ def discover_check_definitions(
     return selected
 
 
+def ensure_check_contract(
+    project: Path,
+    config: dict,
+    *,
+    approve_indirect_drift: bool = False,
+    change_reason: str = "Forge validated the active verification configuration.",
+) -> CheckContract:
+    """Create or validate the Forge-owned verification contract."""
+    definitions = discover_check_definitions(project, config, "release")
+    if not definitions:
+        raise RuntimeError("Adaptive Forge requires at least one check definition.")
+    source = (
+        "explicit_project_config"
+        if normalize_check_definitions(config)
+        else "validated_auto_discovery"
+    )
+    stacks = sorted(
+        {
+            stack
+            for definition in definitions
+            for stack in definition.stacks
+        }
+    )
+    proposed = build_check_contract(
+        project,
+        definitions,
+        source=source,
+        stacks=stacks,
+        change_reason=change_reason,
+    )
+    path = project / ".forge" / "check-contract.json"
+    if not path.is_file():
+        save_json(path, proposed)
+        return proposed
+    try:
+        current = CheckContract.model_validate_json(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(
+            "Existing Forge check contract is malformed or its hash was altered."
+        ) from exc
+    current_definitions = [
+        item.model_dump(mode="json") for item in current.check_definitions
+    ]
+    proposed_definitions = [
+        item.model_dump(mode="json") for item in proposed.check_definitions
+    ]
+    if current_definitions != proposed_definitions:
+        validate_contract_update(
+            current,
+            proposed,
+            justification=proposed.change_reason,
+        )
+        save_json(path, proposed)
+        return proposed
+    if (
+        approve_indirect_drift
+        and current.indirect_source_hashes != proposed.indirect_source_hashes
+    ):
+        validate_contract_update(
+            current,
+            proposed,
+            justification=change_reason,
+        )
+        save_json(path, proposed)
+        return proposed
+    return current
+
+
+def check_contract_runtime_error(
+    project: Path, expected: CheckContract
+) -> str | None:
+    path = project / ".forge" / "check-contract.json"
+    if not path.is_file():
+        return "Forge-owned check contract disappeared."
+    try:
+        stored = CheckContract.model_validate_json(path.read_text(encoding="utf-8"))
+    except Exception:
+        return "Forge-owned check contract is malformed or has an invalid hash."
+    if stored.contract_hash != expected.contract_hash:
+        return "Forge-owned check contract changed after validation."
+    current_indirect = collect_indirect_check_sources(
+        project, expected.check_definitions
+    )
+    if current_indirect != expected.indirect_source_hashes:
+        changed = sorted(
+            key
+            for key in set(current_indirect) | set(expected.indirect_source_hashes)
+            if current_indirect.get(key) != expected.indirect_source_hashes.get(key)
+        )
+        return (
+            "Indirect check sources drifted and require a Codex consistency review: "
+            + ", ".join(changed)
+        )
+    return None
+
+
 def build_srt_settings(project: Path, config: dict) -> Path:
     home = str(Path.home().resolve())
     temp_dir = project / ".forge" / "check-tmp"
@@ -1735,6 +1857,7 @@ def run_checks(
     tier: str = "release",
     requested_ids: list[str] | None = None,
     git_metadata_baseline: dict[str, str] | None = None,
+    check_contract: CheckContract | None = None,
 ) -> list[CheckResult]:
     results: list[CheckResult] = []
     env = build_check_environment(project)
@@ -1849,6 +1972,15 @@ def run_checks(
                     "Git control metadata changed during worker/check execution: "
                     + ", ".join(metadata_drift)
                 )
+            contract_error = (
+                check_contract_runtime_error(project, check_contract)
+                if check_contract is not None
+                else None
+            )
+            if contract_error:
+                report_valid = False
+                test_metrics.report_valid = False
+                test_metrics.failure_reason = contract_error
             output = raw_check_output
             output_limit = int(
                 config.get(
@@ -1880,6 +2012,12 @@ def run_checks(
                     report_format=test_metrics.report_format,
                     report_failure_reason=test_metrics.failure_reason,
                     report_valid=report_valid,
+                    check_contract_hash=(
+                        check_contract.contract_hash
+                        if check_contract is not None
+                        else None
+                    ),
+                    check_contract_valid=contract_error is None,
                 )
             )
         except subprocess.TimeoutExpired as exc:
@@ -3337,10 +3475,14 @@ def run_forge(
     adaptive_enabled = bool(config.get("adaptive_orchestration", False))
     project_identity: dict[str, str] | None = None
     project_plan: ProjectPlan | None = None
+    check_contract: CheckContract | None = None
     baseline_snapshot: dict[str, Any] | None = None
     if adaptive_enabled:
         project_identity = stable_project_identity(project)
         project_plan = load_or_create_plan(project, goal)
+        check_contract = ensure_check_contract(project, config)
+        project_plan.check_contract_hash = check_contract.contract_hash
+        save_json(run_directory / "check-contract.snapshot.json", check_contract)
         export_schemas(forge_dir / "schemas")
         baseline_snapshot = git_baseline(project)
         save_json(run_directory / "git-baseline.json", baseline_snapshot)
@@ -4125,6 +4267,7 @@ def run_forge(
                             tier="release",
                             requested_ids=decision.check_ids or None,
                             git_metadata_baseline=trusted_git_metadata,
+                            check_contract=check_contract,
                         )
                         chain_full_check_suites += 1
                         last_check_tier = "release"
@@ -4202,6 +4345,42 @@ def run_forge(
                 print(f"[Codex][Decision] blocked - {redact_text(final_message)}")
                 break
 
+            if (
+                adaptive_enabled
+                and check_contract is not None
+                and decision.status == "continue"
+            ):
+                contract_error = check_contract_runtime_error(
+                    project, check_contract
+                )
+                if contract_error and contract_error.startswith(
+                    "Indirect check sources drifted"
+                ):
+                    check_contract = ensure_check_contract(
+                        project,
+                        config,
+                        approve_indirect_drift=True,
+                        change_reason=(
+                            "Codex reviewed the reported indirect check-source drift: "
+                            + (decision.routing_reason or decision.assessment)
+                        ),
+                    )
+                    if project_plan is not None:
+                        project_plan.check_contract_hash = (
+                            check_contract.contract_hash
+                        )
+                        save_plan(
+                            project,
+                            project_plan,
+                            snapshot_path=(
+                                run_directory
+                                / f"project-plan.contract-approved-{iteration:02d}.json"
+                            ),
+                        )
+                    save_json(
+                        run_directory / "check-contract.snapshot.json",
+                        check_contract,
+                    )
             final_decision = decision
             logical_worker_profile = "standard"
             worker_routing_reason = "Legacy-compatible standard worker profile."
@@ -4369,6 +4548,7 @@ def run_forge(
                     decision.check_ids or None if adaptive_enabled else None
                 ),
                 git_metadata_baseline=trusted_git_metadata,
+                check_contract=check_contract,
             )
             if last_check_tier == "release":
                 last_release_check_run_id = run_id
@@ -4529,6 +4709,7 @@ def run_forge(
                         decision.check_ids or None if adaptive_enabled else None
                     ),
                     git_metadata_baseline=trusted_git_metadata,
+                    check_contract=check_contract,
                 )
                 save_json(
                     logs / f"{escalation_stem}-checks.json",
@@ -4631,6 +4812,7 @@ def run_forge(
                         tier="release",
                         requested_ids=final_decision.check_ids or None,
                         git_metadata_baseline=trusted_git_metadata,
+                        check_contract=check_contract,
                     )
                     chain_full_check_suites += 1
                     last_check_tier = "release"
@@ -4825,6 +5007,11 @@ def run_forge(
                     last_release_check_run_id=last_release_check_run_id,
                     unavailable_models=unavailable_models,
                     chain_model_fallbacks=chain_model_fallbacks,
+                    check_contract_hash=(
+                        check_contract.contract_hash
+                        if check_contract is not None
+                        else None
+                    ),
                 )
                 final_status = "needs_continuation"
                 final_message = (
@@ -4947,6 +5134,11 @@ def run_forge(
                     last_release_check_run_id=last_release_check_run_id,
                     unavailable_models=unavailable_models,
                     chain_model_fallbacks=chain_model_fallbacks,
+                    check_contract_hash=(
+                        check_contract.contract_hash
+                        if check_contract is not None
+                        else None
+                    ),
                 )
                 print(
                     f"[Forge][NeedsContinuation] {final_message}\n"
@@ -5056,6 +5248,9 @@ def run_forge(
         ),
         "plan_id": project_plan.plan_id if project_plan is not None else None,
         "plan_hash": plan_hash(project_plan) if project_plan is not None else None,
+        "check_contract_hash": (
+            check_contract.contract_hash if check_contract is not None else None
+        ),
         "active_packet_id": (
             project_plan.active_packet_id if project_plan is not None else None
         ),

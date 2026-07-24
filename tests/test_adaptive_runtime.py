@@ -430,12 +430,14 @@ class AdaptiveRuntimeTests(unittest.TestCase):
 
     def test_adaptive_resume_rejects_wrong_project_id(self):
         identity = adaptive.stable_project_identity(self.project)
+        config = forge.DEFAULT_CONFIG.copy()
+        config["adaptive_orchestration"] = True
+        contract = forge.ensure_check_contract(self.project, config)
         plan = adaptive.load_or_create_plan(self.project, "Safe goal")
+        plan.check_contract_hash = contract.contract_hash
         adaptive.save_plan(self.project, plan)
         run = self.project / ".forge" / "runs" / "source-run"
         run.mkdir(parents=True)
-        config = forge.DEFAULT_CONFIG.copy()
-        config["adaptive_orchestration"] = True
         (run / "run.json").write_text(
             json.dumps({"goal": "Safe goal", "config": config}),
             encoding="utf-8",
@@ -453,6 +455,7 @@ class AdaptiveRuntimeTests(unittest.TestCase):
             chain_child_runs=1,
             chain_codex_calls=1,
             chain_no_progress_events=0,
+            check_contract_hash=contract.contract_hash,
         )
         (run / "result.json").write_text(
             json.dumps(

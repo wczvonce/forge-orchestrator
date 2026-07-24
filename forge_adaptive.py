@@ -5,6 +5,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -194,6 +195,7 @@ class ProjectPlan(StrictModel):
     technology_layers: list[str] = Field(default_factory=list)
     last_validated_at: str | None = None
     last_validation_summary: str = ""
+    check_contract_hash: str | None = None
 
     @model_validator(mode="after")
     def validate_plan(self) -> "ProjectPlan":
@@ -359,6 +361,254 @@ class CheckDefinition(StrictModel):
             ):
                 raise ValueError("report_glob must be a safe project-relative pattern.")
         return self
+
+
+class CheckContract(StrictModel):
+    schema_version: int = ADAPTIVE_SCHEMA_VERSION
+    check_definitions: list[CheckDefinition] = Field(min_length=1)
+    contract_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
+    source: Literal[
+        "explicit_project_config",
+        "forge_stack_template",
+        "validated_auto_discovery",
+        "codex_validated_proposal",
+    ]
+    stacks: list[str] = Field(default_factory=list)
+    created_at: str
+    indirect_source_hashes: dict[str, str] = Field(default_factory=dict)
+    change_reason: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_hash(self) -> "CheckContract":
+        if self.contract_hash != check_contract_hash(self):
+            raise ValueError("Check contract hash does not match its canonical content.")
+        return self
+
+
+class CheckProposal(StrictModel):
+    check_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
+    runner: Literal[
+        "python-pytest",
+        "python-unittest",
+        "npm-script",
+        "gradle-task",
+        "dotnet-test",
+        "flutter-test",
+    ]
+    target: str = Field(min_length=1, max_length=120)
+    tier: Literal["smoke", "targeted", "milestone", "release"] = "targeted"
+    required_before_done: bool = False
+    require_test_execution: bool = False
+    report_path: str | None = None
+    report_glob: str | None = None
+    report_format: Literal[
+        "auto",
+        "text",
+        "pytest-text",
+        "unittest-text",
+        "junit-xml",
+        "jest-json",
+        "vitest-json",
+        "playwright-json",
+        "gradle-junit",
+        "android-junit",
+        "trx",
+        "flutter-json",
+    ] = "auto"
+
+    @model_validator(mode="after")
+    def validate_target(self) -> "CheckProposal":
+        if not re.fullmatch(r"[A-Za-z0-9_./:@-]+", self.target):
+            raise ValueError("Check proposal target contains unsafe shell syntax.")
+        return self
+
+
+def materialize_check_proposal(proposal: CheckProposal) -> CheckDefinition:
+    """Translate a structured Codex proposal through Forge-owned templates."""
+    commands = {
+        "python-pytest": f'"{sys.executable}" -m pytest {proposal.target}',
+        "python-unittest": f'"{sys.executable}" -m unittest {proposal.target}',
+        "npm-script": f"npm run {proposal.target}",
+        "gradle-task": f".\\gradlew.bat --no-daemon {proposal.target}",
+        "dotnet-test": f"dotnet test {proposal.target}",
+        "flutter-test": f"flutter test {proposal.target}",
+    }
+    runner_format = {
+        "python-pytest": "pytest-text",
+        "python-unittest": "unittest-text",
+        "npm-script": proposal.report_format,
+        "gradle-task": proposal.report_format,
+        "dotnet-test": proposal.report_format,
+        "flutter-test": "flutter-json",
+    }
+    return CheckDefinition(
+        check_id=proposal.check_id,
+        command=commands[proposal.runner],
+        tier=proposal.tier,
+        required_before_done=proposal.required_before_done,
+        check_kind="test",
+        require_test_execution=proposal.require_test_execution,
+        report_path=proposal.report_path,
+        report_glob=proposal.report_glob,
+        report_format=runner_format[proposal.runner],
+    )
+
+
+def _file_hash(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def collect_indirect_check_sources(
+    project: Path, definitions: list[CheckDefinition]
+) -> dict[str, str]:
+    """Hash scripts and build inputs that can change an indirect check command."""
+    project = project.resolve()
+    candidates: set[Path] = set()
+    package_path = project / "package.json"
+    package_payload: dict[str, Any] = {}
+    if package_path.is_file():
+        try:
+            loaded = json.loads(package_path.read_text(encoding="utf-8"))
+            package_payload = loaded if isinstance(loaded, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            package_payload = {}
+    for definition in definitions:
+        command = definition.command.strip()
+        npm_match = re.search(
+            r"\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?([A-Za-z0-9:_-]+)\b",
+            command,
+            re.I,
+        )
+        if npm_match and package_path.is_file():
+            script_name = npm_match.group(1)
+            script_value = package_payload.get("scripts", {}).get(script_name)
+            if isinstance(script_value, str):
+                key = f"package.json#scripts.{script_name}"
+                candidates.add(package_path)
+                package_payload[key] = script_value
+            for name in (
+                "package-lock.json",
+                "pnpm-lock.yaml",
+                "yarn.lock",
+                "bun.lock",
+                "bun.lockb",
+                "vitest.config.js",
+                "vitest.config.ts",
+                "jest.config.js",
+                "jest.config.ts",
+                "playwright.config.js",
+                "playwright.config.ts",
+            ):
+                if (project / name).is_file():
+                    candidates.add(project / name)
+        if re.search(r"\bgradlew(?:\.bat)?\b|\bgradle\b", command, re.I):
+            for pattern in (
+                "settings.gradle*",
+                "build.gradle*",
+                "**/build.gradle*",
+                "gradle/libs.versions.toml",
+                "gradle/wrapper/gradle-wrapper.properties",
+            ):
+                candidates.update(path for path in project.glob(pattern) if path.is_file())
+        if re.search(r"\bpytest\b|\bunittest\b", command, re.I):
+            for name in (
+                "pyproject.toml",
+                "pytest.ini",
+                "tox.ini",
+                "setup.cfg",
+                "requirements.txt",
+                "requirements.lock",
+                "uv.lock",
+                "poetry.lock",
+            ):
+                if (project / name).is_file():
+                    candidates.add(project / name)
+    hashes = {
+        path.relative_to(project).as_posix(): _file_hash(path)
+        for path in sorted(candidates, key=lambda item: str(item).casefold())
+    }
+    scripts = package_payload.get("scripts", {})
+    if isinstance(scripts, dict):
+        for definition in definitions:
+            match = re.search(
+                r"\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?([A-Za-z0-9:_-]+)\b",
+                definition.command,
+                re.I,
+            )
+            if match and isinstance(scripts.get(match.group(1)), str):
+                value = scripts[match.group(1)]
+                hashes[f"package.json#scripts.{match.group(1)}"] = hashlib.sha256(
+                    value.encode("utf-8")
+                ).hexdigest()
+    return hashes
+
+
+def check_contract_hash(contract: CheckContract | dict[str, Any]) -> str:
+    payload = (
+        contract.model_dump(mode="json")
+        if isinstance(contract, CheckContract)
+        else dict(contract)
+    )
+    payload.pop("contract_hash", None)
+    payload.pop("created_at", None)
+    serialized = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def build_check_contract(
+    project: Path,
+    definitions: list[CheckDefinition],
+    *,
+    source: Literal[
+        "explicit_project_config",
+        "forge_stack_template",
+        "validated_auto_discovery",
+        "codex_validated_proposal",
+    ],
+    stacks: list[str],
+    change_reason: str,
+) -> CheckContract:
+    payload = {
+        "schema_version": ADAPTIVE_SCHEMA_VERSION,
+        "check_definitions": [
+            item.model_dump(mode="json") for item in definitions
+        ],
+        "source": source,
+        "stacks": sorted(set(stacks)),
+        "created_at": utc_now(),
+        "indirect_source_hashes": collect_indirect_check_sources(
+            project, definitions
+        ),
+        "change_reason": change_reason,
+    }
+    payload["contract_hash"] = check_contract_hash(payload)
+    return CheckContract.model_validate(payload)
+
+
+def validate_contract_update(
+    previous: CheckContract,
+    proposed: CheckContract,
+    *,
+    justification: str,
+) -> None:
+    if not justification.strip():
+        raise ValueError("Check contract changes require a justification.")
+    old = {item.check_id: item for item in previous.check_definitions}
+    new = {item.check_id: item for item in proposed.check_definitions}
+    for check_id, definition in old.items():
+        if definition.required_before_done and check_id not in new:
+            raise ValueError(f"Required check cannot be removed: {check_id}")
+        replacement = new.get(check_id)
+        if replacement is None:
+            continue
+        if definition.required_before_done and not replacement.required_before_done:
+            raise ValueError(f"required_before_done cannot be disabled: {check_id}")
+        if definition.require_test_execution and not replacement.require_test_execution:
+            raise ValueError(f"require_test_execution cannot be disabled: {check_id}")
+        if definition.report_path and not replacement.report_path:
+            raise ValueError(f"Required report cannot be removed: {check_id}")
 
 
 class EvidenceIndex(StrictModel):
@@ -1090,6 +1340,8 @@ def export_schemas(directory: Path) -> list[Path]:
         "decision.schema.json": AdaptiveDecision,
         "plan-patch.schema.json": PlanPatch,
         "check-definition.schema.json": CheckDefinition,
+        "check-contract.schema.json": CheckContract,
+        "check-proposal.schema.json": CheckProposal,
         "evidence-index.schema.json": EvidenceIndex,
         "chain-budgets.schema.json": ChainBudgets,
         "routing-record.schema.json": RoutingRecord,

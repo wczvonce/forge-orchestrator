@@ -7990,6 +7990,7 @@ def update_plan_from_decision(
                     PacketUpdate(
                         packet_id=active.packet_id,
                         status="completed",
+                        completed_by="codex_review",
                         justification=(
                             "Codex requested packet completion and deterministic checks passed."
                         ),
@@ -8046,6 +8047,91 @@ def lean_packet_decision(
         closes_milestone=packet.closes_milestone,
         requires_release_check=packet.requires_fresh_release_check,
     )
+
+
+def complete_lean_packet_by_checks(
+    plan: ProjectPlan,
+    packet_id: str,
+    *,
+    completed_by: Literal["forge_checks", "claude_review"] = "forge_checks",
+) -> ProjectPlan:
+    """Close one green lean packet and activate the next ready packet."""
+    completed = apply_plan_patch(
+        plan,
+        PlanPatch(
+            update_packets=[
+                PacketUpdate(
+                    packet_id=packet_id,
+                    status="completed",
+                    completed_by=completed_by,
+                    justification=(
+                        "Lean packet closed by deterministic green checks."
+                        if completed_by == "forge_checks"
+                        else "Lean packet closed after green checks and read-only Claude review."
+                    ),
+                )
+            ],
+            explanation="Deterministic lean packet completion.",
+        ),
+        checks_passed=True,
+    )
+    ready = dependency_ready_packet(completed)
+    if ready is None:
+        return completed
+    return apply_plan_patch(
+        completed,
+        PlanPatch(
+            active_packet_id=ready.packet_id,
+            explanation=(
+                "Select the first dependency-ready pending packet in persistent "
+                "plan order."
+            ),
+        ),
+        checks_passed=True,
+    )
+
+
+def record_lean_check_evidence(
+    plan: ProjectPlan,
+    packet_id: str,
+    checks: list[CheckResult],
+) -> ProjectPlan:
+    """Persist the last two consecutive failures for one lean packet."""
+    updated = plan.model_copy(deep=True)
+    packet = next(
+        (
+            item
+            for item in updated.work_packets
+            if item.packet_id == packet_id
+        ),
+        None,
+    )
+    if packet is None:
+        raise ValueError(f"Unknown lean packet {packet_id}.")
+    if checks_passed(checks):
+        packet.consecutive_check_failures = []
+    else:
+        packet.consecutive_check_failures = (
+            packet.consecutive_check_failures
+            + [
+                {
+                    "recorded_at": utc_now(),
+                    "signature": check_failure_signature(checks),
+                    "checks": [
+                        {
+                            "check_id": item.check_id or item.command,
+                            "exit_code": item.exit_code,
+                            "report_valid": item.report_valid,
+                            "output": truncate(item.output, 1800),
+                        }
+                        for item in checks
+                        if item.exit_code != 0 or not item.report_valid
+                    ],
+                }
+            ]
+        )[-2:]
+    updated.updated_at = utc_now()
+    return ProjectPlan.model_validate(updated.model_dump(mode="json"))
 
 
 def maybe_authorize_final_review_recovery(
@@ -9012,6 +9098,7 @@ def _run_forge_locked(
     error_text: str | None = None
     continuation_payload: ContinuationPayload | None = None
     packet_transition_ready = False
+    lean_pending_decision: Decision | None = None
     pending_check_contract_review = False
     logical_attempt_pending = False
     logical_attempt_packet_id: str | None = None
@@ -9100,6 +9187,7 @@ def _run_forge_locked(
             )
 
         for iteration in range(1, int(config["max_iterations"]) + 1):
+            lean_all_packets_complete = False
             budget_reason = current_budget_reason() if adaptive_enabled else None
             if budget_reason:
                 final_status = "needs_continuation"
@@ -9352,6 +9440,27 @@ def _run_forge_locked(
                         flush=True,
                     )
                 evidence_baseline = current_manifest
+            elif lean_mode and lean_pending_decision is not None:
+                decision = lean_pending_decision
+                lean_pending_decision = None
+                packet_transition_ready = False
+                review_prompt = textwrap.dedent(
+                    f"""
+                    LEAN DETERMINISTIC PACKET DISPATCH
+                    PACKET: {decision.active_packet_id}
+                    SOURCE: persisted ProjectPlan.worker_prompt
+                    CODEX MODEL CALL: skipped
+                    """
+                ).strip()
+                status.set_phase(
+                    "codex_review",
+                    iteration=iteration,
+                    current_agent="Forge",
+                    message=(
+                        "Lean režim vybral ďalší dependency-ready packet bez "
+                        "rutinného Codex volania."
+                    ),
+                )
             else:
                 codex_phase = (
                     "architecture"
@@ -9745,6 +9854,15 @@ def _run_forge_locked(
                 )
             ):
                 ready_packet = dependency_ready_packet(project_plan)
+                if ready_packet is None and lean_mode:
+                    already_activated = active_plan_packet(project_plan)
+                    if (
+                        already_activated is not None
+                        and already_activated.status == "in_progress"
+                        and already_activated.packet_id
+                        != decision.active_packet_id
+                    ):
+                        ready_packet = already_activated
                 if ready_packet is not None:
                     project_plan = apply_plan_patch(
                         project_plan,
@@ -9804,12 +9922,15 @@ def _run_forge_locked(
                         )
                     )
                     packet_transition_ready = True
+                    if lean_mode:
+                        decision = final_decision
                 print(
                     "[Forge][Plan] Aktívny packet je overený; ďalší packet vyberie "
                     "nasledujúci Codex review.",
                     flush=True,
                 )
-                continue
+                if not lean_mode or ready_packet is None:
+                    continue
 
             if decision.status == "done":
                 if adaptive_enabled and project_plan is not None:
@@ -10588,6 +10709,133 @@ def _run_forge_locked(
                 escalation_records.append(escalation_record)
                 save_json(run_directory / "escalations.json", escalation_records)
             if (
+                lean_mode
+                and project_plan is not None
+                and packet_for_worker is not None
+            ):
+                reviewed_packet = next(
+                    (
+                        packet
+                        for packet in project_plan.work_packets
+                        if packet.packet_id == packet_for_worker.packet_id
+                    ),
+                    None,
+                )
+                if reviewed_packet is not None:
+                    project_plan = record_lean_check_evidence(
+                        project_plan,
+                        reviewed_packet.packet_id,
+                        checks,
+                    )
+                    save_plan(
+                        project,
+                        project_plan,
+                        snapshot_path=(
+                            run_directory
+                            / f"project-plan.check-evidence-{iteration:02d}.json"
+                        ),
+                    )
+                    reviewed_packet = next(
+                        packet
+                        for packet in project_plan.work_packets
+                        if packet.packet_id == packet_for_worker.packet_id
+                    )
+                routine_check_close = bool(
+                    reviewed_packet is not None
+                    and reviewed_packet.packet_type in {"code", "docs"}
+                    and reviewed_packet.check_tier in {"smoke", "targeted"}
+                    and not reviewed_packet.closes_milestone
+                    and not reviewed_packet.requires_fresh_release_check
+                )
+                if routine_check_close and checks_passed(checks):
+                    project_plan = complete_lean_packet_by_checks(
+                        project_plan,
+                        reviewed_packet.packet_id,
+                    )
+                    save_plan(
+                        project,
+                        project_plan,
+                        snapshot_path=(
+                            run_directory
+                            / f"project-plan.forge-completed-{iteration:02d}.json"
+                        ),
+                    )
+                    next_packet = active_plan_packet(project_plan)
+                    unfinished_packets = [
+                        packet
+                        for packet in project_plan.work_packets
+                        if packet.status not in {"completed", "superseded"}
+                    ]
+                    if not unfinished_packets:
+                        lean_all_packets_complete = True
+                        packet_transition_ready = False
+                        final_decision = Decision(
+                            status="continue",
+                            decision_kind="verify_packet",
+                            assessment=(
+                                "All lean packets are complete by verified gates; "
+                                "run the fresh release suite and final Codex review."
+                            ),
+                            next_prompt=(
+                                "Do not implement. Transfer the completed plan to "
+                                "the mandatory fresh release and final review gates."
+                            ),
+                            acceptance_criteria=[],
+                            risks=project_plan.overall_risks,
+                            recommended_review_profile="final_review",
+                            check_tier="release",
+                            requires_release_check=True,
+                            routing_reason="All persistent lean packets are complete.",
+                        )
+                    elif (
+                        next_packet is not None
+                        and next_packet.status == "in_progress"
+                    ):
+                        lean_pending_decision = lean_packet_decision(
+                            next_packet,
+                            project_plan,
+                            assessment=(
+                                "Forge checks closed the previous routine packet; "
+                                "dispatch the next dependency-ready packet."
+                            ),
+                        )
+                        final_decision = lean_pending_decision
+                        packet_transition_ready = True
+                    refresh_monitor_context(
+                        last_result=(
+                            f"Packet {reviewed_packet.packet_id} uzavreli zelené "
+                            "Forge kontroly bez Codex review."
+                        ),
+                        next_action=(
+                            "Nasleduje čerstvý release gate."
+                            if lean_all_packets_complete
+                            else "Forge spustí ďalší uložený worker_prompt."
+                        ),
+                    )
+                elif (
+                    reviewed_packet is not None
+                    and not checks_passed(checks)
+                    and failed_iterations < 2
+                ):
+                    repair = lean_packet_decision(
+                        reviewed_packet,
+                        project_plan,
+                        assessment=(
+                            "First consecutive check failure; perform one "
+                            "deterministic repair before involving Codex."
+                        ),
+                        decision_kind="repair_packet",
+                    )
+                    failure_evidence = checks_as_text(checks, config)
+                    repair.next_prompt = (
+                        f"{repair.next_prompt}\n\nCURRENT FAILED CHECK EVIDENCE:\n"
+                        f"{failure_evidence}\n\nRepair all grounded failures above "
+                        "without weakening or removing valid checks."
+                    )
+                    lean_pending_decision = repair
+                    final_decision = repair
+                    packet_transition_ready = True
+            if (
                 logical_attempt_pending
                 and logical_attempt_packet_id is not None
                 and project_plan is not None
@@ -10608,6 +10856,12 @@ def _run_forge_locked(
                 f"[Forge][Iteration] {iteration} completed; checks_passed={checks_passed(checks)}",
                 flush=True,
             )
+            if lean_all_packets_complete:
+                break
+            if lean_pending_decision is not None and iteration < int(
+                config["max_iterations"]
+            ):
+                continue
         else:
             final_message = (
                 "Dosiahnutý maximálny počet iterácií; nasleduje povinný "
@@ -10645,7 +10899,19 @@ def _run_forge_locked(
             and worker is not None
         ):
             print("\n=== ZÁVEREČNÝ CODEX/GPT REVIEW PO POSLEDNEJ IMPLEMENTÁCII ===")
-            if adaptive_enabled and last_check_tier != "release":
+            lean_incomplete_review = bool(
+                lean_mode
+                and project_plan is not None
+                and any(
+                    packet.status not in {"completed", "superseded"}
+                    for packet in project_plan.work_packets
+                )
+            )
+            if (
+                adaptive_enabled
+                and last_check_tier != "release"
+                and not lean_incomplete_review
+            ):
                 budget_reason = current_budget_reason()
                 if budget_reason:
                     final_status = "needs_continuation"
@@ -10694,8 +10960,22 @@ def _run_forge_locked(
             if final_status != "needs_continuation":
                 if adaptive_enabled:
                     chain_codex_calls += 1
-                    increment_count(codex_profile_counts, "final_review")
-                final_model, final_effort = select_codex_profile(config, "final")
+                    increment_count(
+                        codex_profile_counts,
+                        (
+                            "important_review"
+                            if lean_incomplete_review
+                            else "final_review"
+                        ),
+                    )
+                final_review_phase = (
+                    "review" if lean_incomplete_review else "final"
+                )
+                final_model, final_effort = select_codex_profile(
+                    config,
+                    final_review_phase,
+                    important=lean_incomplete_review,
+                )
                 status.set_phase(
                     "final_codex_review",
                     iteration=int(config["max_iterations"]) + 1,
@@ -10757,7 +11037,7 @@ def _run_forge_locked(
                         checks,
                         no_progress_count,
                         config,
-                        "final",
+                        final_review_phase,
                         project_plan=project_plan,
                         active_packet=active_plan_packet(project_plan),
                         allowed_check_ids=[
@@ -10779,7 +11059,7 @@ def _run_forge_locked(
                     review_prompt,
                     config,
                     logs / "final-decision-raw.json",
-                    phase="final",
+                    phase=final_review_phase,
                     important=True,
                     metadata_path=logs / "final-codex-usage.json",
                 )
@@ -10898,6 +11178,27 @@ def _run_forge_locked(
                                 / "project-plan.final-review-recovery.json"
                             ),
                         )
+                    if (
+                        lean_incomplete_review
+                        and final_decision.decision_kind == "complete_packet"
+                        and any(
+                            packet.status not in {"completed", "superseded"}
+                            for packet in project_plan.work_packets
+                        )
+                    ):
+                        next_packet = active_plan_packet(project_plan)
+                        if (
+                            next_packet is not None
+                            and next_packet.status == "in_progress"
+                        ):
+                            final_decision = lean_packet_decision(
+                                next_packet,
+                                project_plan,
+                                assessment=(
+                                    "Codex completed the milestone packet; the next "
+                                    "dependency-ready lean packet is persisted."
+                                ),
+                            )
                 save_json(logs / "final-decision.json", final_decision)
                 print(f"[Codex][Decision] {final_decision.status}", flush=True)
                 print(f"[Codex][Assessment] {redact_text(final_decision.assessment)}")

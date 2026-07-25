@@ -129,12 +129,21 @@ class AdaptiveRuntimeTests(unittest.TestCase):
         self._launcher("claude", script)
 
     @staticmethod
-    def _packet(number: int, tier: str = "targeted") -> dict:
+    def _packet(
+        number: int,
+        tier: str = "targeted",
+        packet_type: str = "code",
+    ) -> dict:
         return {
             "packet_id": f"packet-{number:03d}",
             "title": f"Packet {number}",
             "objective": f"Implement coherent packet {number}.",
             "context": "Fake multi-packet E2E.",
+            "packet_type": packet_type,
+            "worker_prompt": (
+                f"Implement coherent packet {number}. Change only the expected "
+                f"fake output path and pass the {tier} checks."
+            ),
             "dependencies": [] if number == 1 else [f"packet-{number - 1:03d}"],
             "acceptance_criteria": [f"Packet {number} works"],
             "status": "pending",
@@ -227,6 +236,41 @@ class AdaptiveRuntimeTests(unittest.TestCase):
             self._complete(2, "targeted"),
             self._complete(3, "milestone"),
             self._complete(4, "targeted"),
+            final,
+        ]
+
+    def lean_decisions(self) -> list[dict]:
+        architecture = self._continue(1, "targeted")
+        architecture["plan_patch"] = {
+            "add_packets": [
+                self._packet(1, "targeted"),
+                self._packet(2, "targeted", "docs"),
+                self._packet(3, "milestone"),
+                self._packet(4, "targeted"),
+                self._packet(5, "targeted"),
+            ],
+            "update_packets": [],
+            "active_packet_id": "packet-001",
+            "append_milestones": ["Packet 3 is the milestone"],
+            "append_release_gates": ["Fresh release checks and final Codex approval"],
+            "append_architectural_decisions": ["Use deterministic fake outputs"],
+            "append_safe_assumptions": ["The fake project remains offline."],
+            "append_risks": [],
+            "explanation": "Five dependency-ordered lean packets.",
+        }
+        final = self._complete(5, "release")
+        final.update(
+            {
+                "decision_kind": "complete_project",
+                "assessment": "All lean packets and release evidence are complete.",
+                "recommended_review_profile": "final_review",
+                "check_tier": "release",
+                "requires_release_check": True,
+            }
+        )
+        return [
+            architecture,
+            self._complete(3, "milestone"),
             final,
         ]
 
@@ -396,6 +440,59 @@ class AdaptiveRuntimeTests(unittest.TestCase):
             )
             self.assertFalse(telemetry["raw_prompts_stored"])
             self.assertFalse(telemetry["private_reasoning_stored"])
+
+    def test_lean_fake_cli_chain_skips_routine_codex_reviews(self):
+        self.decisions_path.write_text(
+            json.dumps(self.lean_decisions()), encoding="utf-8"
+        )
+        config = self.config()
+        config["orchestration_style"] = "lean"
+        config["adaptive_profiles"]["claude"]["economy"]["candidates"] = [
+            {"model": "sonnet", "effort": "low"}
+        ]
+        config["confirmed_subscription_models"] = []
+        config_path = self.root / "lean.config.json"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        env = {
+            "PATH": str(self.fake_bin) + os.pathsep + os.environ.get("PATH", ""),
+            "FAKE_CODEX_DECISIONS": str(self.decisions_path),
+            "FAKE_CODEX_COUNTER": str(self.codex_counter),
+            "FAKE_CLAUDE_COUNTER": str(self.claude_counter),
+        }
+        with mock.patch.dict(os.environ, env, clear=False), mock.patch.object(
+            forge, "codex_auth_status", return_value=(True, "Logged in using ChatGPT")
+        ), mock.patch.object(
+            forge,
+            "claude_auth_status",
+            return_value=(True, '{"loggedIn":true,"subscriptionType":"max"}'),
+        ), mock.patch.object(
+            forge, "WORKER_BOUNDARIES", "TEST BOUNDARIES"
+        ), mock.patch.object(
+            forge, "sandbox_runtime_available", return_value=True
+        ), mock.patch.object(
+            forge, "running_in_wsl", return_value=False
+        ):
+            exit_code = forge.run_chain(
+                self.project,
+                "Build a five-packet lean fake application",
+                config_path,
+            )
+        self.assertEqual(exit_code, forge.EXIT_DONE)
+        plan = json.loads(
+            (self.project / ".forge" / "project-plan.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(int(self.codex_counter.read_text(encoding="utf-8")), 3)
+        self.assertLessEqual(
+            int(self.codex_counter.read_text(encoding="utf-8")),
+            4,
+        )
+        self.assertEqual(int(self.claude_counter.read_text(encoding="utf-8")), 5)
+        self.assertEqual(len(plan["completed_packet_ids"]), 5)
+        self.assertEqual(plan["work_packets"][0]["completed_by"], "forge_checks")
+        self.assertEqual(plan["work_packets"][1]["completed_by"], "forge_checks")
+        self.assertEqual(plan["work_packets"][2]["completed_by"], "codex_review")
 
     def test_self_installation_is_rejected(self):
         with self.assertRaises(SystemExit):

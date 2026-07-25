@@ -122,6 +122,10 @@ class WorkPacket(StrictModel):
     closes_milestone: bool = False
     requires_fresh_release_check: bool = False
     completed_by: Literal["forge_checks", "claude_review", "codex_review"] | None = None
+    consecutive_check_failures: list[dict[str, Any]] = Field(
+        default_factory=list,
+        max_length=2,
+    )
 
     @model_validator(mode="after")
     def validate_packet(self) -> "WorkPacket":

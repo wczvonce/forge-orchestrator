@@ -240,6 +240,80 @@ class ProjectPlanTests(unittest.TestCase):
             "packet-002",
         )
 
+    def test_green_lean_packet_is_closed_and_next_is_activated(self):
+        first = self.packet(
+            "packet-001",
+            worker_prompt="Implement packet 1.",
+            status="in_progress",
+        )
+        second = self.packet(
+            "packet-002",
+            worker_prompt="Implement packet 2.",
+            dependencies=["packet-001"],
+        )
+        plan = adaptive.ProjectPlan(
+            plan_id="plan-1",
+            project_id="project-1",
+            goal_hash="g",
+            spec_hash="s",
+            created_at=adaptive.utc_now(),
+            updated_at=adaptive.utc_now(),
+            status="active",
+            active_packet_id="packet-001",
+            work_packets=[first, second],
+        )
+        updated = forge.complete_lean_packet_by_checks(plan, "packet-001")
+        self.assertEqual(updated.completed_packet_ids, ["packet-001"])
+        self.assertEqual(updated.work_packets[0].completed_by, "forge_checks")
+        self.assertEqual(updated.active_packet_id, "packet-002")
+        self.assertEqual(updated.work_packets[1].status, "in_progress")
+
+    def test_lean_packet_keeps_both_consecutive_check_failures_for_review(self):
+        packet = self.packet(
+            "packet-001",
+            worker_prompt="Repair the packet.",
+            status="in_progress",
+        )
+        plan = adaptive.ProjectPlan(
+            plan_id="plan-1",
+            project_id="project-1",
+            goal_hash="g",
+            spec_hash="s",
+            created_at=adaptive.utc_now(),
+            updated_at=adaptive.utc_now(),
+            status="active",
+            active_packet_id=packet.packet_id,
+            work_packets=[packet],
+        )
+        first = forge.CheckResult(
+            command="first",
+            check_id="targeted",
+            exit_code=1,
+            output="first grounded failure",
+        )
+        second = forge.CheckResult(
+            command="second",
+            check_id="targeted",
+            exit_code=1,
+            output="second grounded failure",
+        )
+        plan = forge.record_lean_check_evidence(plan, packet.packet_id, [first])
+        plan = forge.record_lean_check_evidence(plan, packet.packet_id, [second])
+        history = plan.work_packets[0].consecutive_check_failures
+        self.assertEqual(len(history), 2)
+        prompt = forge.build_review_prompt(
+            "Repair app",
+            3,
+            "repository evidence",
+            None,
+            [second],
+            0,
+            project_plan=plan,
+            active_packet=plan.work_packets[0],
+        )
+        self.assertIn("first grounded failure", prompt)
+        self.assertIn("second grounded failure", prompt)
+
     def test_replan_preserves_completed_packets_and_safe_assumptions(self):
         completed = self.packet("packet-001", status="completed")
         pending = self.packet(

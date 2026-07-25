@@ -168,7 +168,12 @@ class BootstrapCheckTests(unittest.TestCase):
             self.project, index_entries
         )
         self.assertIsNone(error)
-        link = self.project / "link.txt"
+        # The helper's production callers construct candidates from the
+        # canonical project root. Match that contract here as well: GitHub's
+        # Windows workspace may otherwise spell the same directory through a
+        # path alias that Path.relative_to correctly treats as a different
+        # lexical root.
+        link = self.project.resolve() / "link.txt"
         self.assertIsNone(
             forge._bootstrap_symlink_finding(
                 self.project.resolve(),

@@ -51,7 +51,9 @@ class DecisionNormalizationTests(unittest.TestCase):
             raw["check_contract_approval_reason"],
             "No drift approval is requested.",
         )
-        self.assertFalse(forge.Decision.model_validate(normalized).approve_check_contract_drift)
+        decision = forge.Decision.model_validate(normalized)
+        self.assertFalse(decision.approve_check_contract_drift)
+        self.assertTrue(decision.normalization_warnings)
 
     def test_normalizer_never_coerces_or_weakens_true_approval(self) -> None:
         with self.assertRaises(ValueError):

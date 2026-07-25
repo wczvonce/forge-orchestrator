@@ -71,13 +71,14 @@ class AdaptiveSchemaTests(unittest.TestCase):
                 next_prompt="Implement packet.",
                 approve_check_contract_drift=True,
             )
-        with self.assertRaises(ValidationError):
-            adaptive.AdaptiveDecision(
-                status="continue",
-                assessment="Ambiguous reason",
-                next_prompt="Implement packet.",
-                check_contract_approval_reason="Looks fine.",
-            )
+        normalized = adaptive.AdaptiveDecision(
+            status="continue",
+            assessment="Ambiguous reason",
+            next_prompt="Implement packet.",
+            check_contract_approval_reason="Looks fine.",
+        )
+        self.assertEqual(normalized.check_contract_approval_reason, "")
+        self.assertTrue(normalized.normalization_warnings)
 
     def test_lean_architecture_requires_every_worker_prompt(self):
         packets = [

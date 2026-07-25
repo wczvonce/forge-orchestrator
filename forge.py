@@ -183,6 +183,17 @@ def normalize_codex_decision_payload(payload: dict[str, Any]) -> dict[str, Any]:
         reason = payload.get("check_contract_approval_reason")
         if approval is False and isinstance(reason, str) and reason.strip():
             normalized["check_contract_approval_reason"] = ""
+            warning = (
+                "Dropped check_contract_approval_reason because "
+                "approve_check_contract_drift=false."
+            )
+            warnings = normalized.get("normalization_warnings")
+            if not isinstance(warnings, list):
+                warnings = []
+            normalized["normalization_warnings"] = [
+                *[str(item) for item in warnings if str(item).strip()],
+                *([] if warning in warnings else [warning]),
+            ]
     return normalized
 
 
@@ -6738,6 +6749,18 @@ def ask_orchestrator(
         # ineffective reason is removed only from the validated Decision and
         # the later *-decision.json artifact.
         atomic_save_json(output_path, payload)
+        if metadata_path is not None and decision.normalization_warnings:
+            telemetry_payload: dict[str, Any] = {}
+            if metadata_path.is_file():
+                candidate = json.loads(
+                    metadata_path.read_text(encoding="utf-8")
+                )
+                if isinstance(candidate, dict):
+                    telemetry_payload = candidate
+            telemetry_payload["normalization_warnings"] = list(
+                decision.normalization_warnings
+            )
+            save_json(metadata_path, telemetry_payload)
     except Exception as exc:
         raise RuntimeError(
             "Codex vrátil neplatné rozhodnutie:\n"

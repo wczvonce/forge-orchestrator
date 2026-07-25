@@ -348,6 +348,7 @@ class AdaptiveDecision(StrictModel):
     requires_release_check: bool = False
     approve_check_contract_drift: bool = False
     check_contract_approval_reason: str = ""
+    normalization_warnings: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_decision(self) -> "AdaptiveDecision":
@@ -372,9 +373,16 @@ class AdaptiveDecision(StrictModel):
                 )
             self.check_contract_approval_reason = approval_reason
         elif approval_reason:
-            raise ValueError(
-                "Check-contract approval reason requires explicit approval=true."
+            self.check_contract_approval_reason = ""
+            warning = (
+                "Dropped check_contract_approval_reason because "
+                "approve_check_contract_drift=false."
             )
+            if warning not in self.normalization_warnings:
+                self.normalization_warnings.append(warning)
+        if self.status != "continue" and isinstance(self.next_prompt, str):
+            if not self.next_prompt.strip():
+                self.next_prompt = None
         return self
 
 

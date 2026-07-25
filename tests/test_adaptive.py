@@ -84,6 +84,9 @@ class AdaptiveSchemaTests(unittest.TestCase):
         packets = [
             self.packet(
                 packet_id=f"packet-{index:03d}",
+                expected_paths=(
+                    ["src/app.py"] if index == 2 else ["docs/packet.md"]
+                ),
                 worker_prompt=(
                     "Implement the bounded packet and run targeted checks."
                     if index != 3
@@ -95,6 +98,39 @@ class AdaptiveSchemaTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "packet-003"):
             adaptive.validate_lean_initial_plan(packets)
         packets[2].worker_prompt = "Implement packet 3 and run its checks."
+        adaptive.validate_lean_initial_plan(packets)
+
+    def test_lean_plan_rejects_document_heavy_start(self):
+        packets = [
+            self.packet(
+                packet_id=f"packet-{index:03d}",
+                packet_type=("code" if index == 3 else "docs"),
+                worker_prompt=f"Complete packet {index}.",
+                expected_paths=(
+                    ["src/app.py"] if index == 3 else [f"docs/{index}.md"]
+                ),
+            )
+            for index in range(1, 6)
+        ]
+        with self.assertRaisesRegex(ValueError, "at most two"):
+            adaptive.validate_lean_initial_plan(packets)
+
+    def test_lean_plan_accepts_walking_skeleton_in_packet_two(self):
+        packets = [
+            self.packet(
+                packet_id=f"packet-{index:03d}",
+                packet_type=("docs" if index == 1 else "code"),
+                worker_prompt=f"Complete packet {index}.",
+                expected_paths=(
+                    ["docs/plan.md"]
+                    if index == 1
+                    else ["src/main.py"]
+                    if index == 2
+                    else [f"src/feature_{index}.py"]
+                ),
+            )
+            for index in range(1, 5)
+        ]
         adaptive.validate_lean_initial_plan(packets)
 
     def test_worker_prompt_and_packet_type_are_backward_compatible(self):

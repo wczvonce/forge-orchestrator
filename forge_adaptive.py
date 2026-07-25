@@ -1206,6 +1206,41 @@ def validate_lean_initial_plan(packets: list[WorkPacket]) -> None:
             "Lean architecture requires a complete worker_prompt for every packet; "
             "missing: " + ", ".join(missing_prompts)
         )
+    first_three = packets[:3]
+    has_walking_skeleton = any(
+        packet.packet_type == "code"
+        and any(
+            (
+                (normalized := path.replace("\\", "/").lstrip("./"))
+                and not normalized.casefold().startswith("docs/")
+                and normalized.casefold() != "readme.md"
+            )
+            for path in packet.expected_paths
+        )
+        for packet in first_three
+    )
+    if not has_walking_skeleton:
+        raise ValueError(
+            "Lean architecture requires runnable application code with an "
+            "expected_path outside docs/ no later than packet 3."
+        )
+    documentation_or_process = 0
+    process_words = re.compile(
+        r"(?i)\b(document|documentation|readme|spec|audit|process|policy)\b"
+    )
+    for packet in packets[:5]:
+        if packet.packet_type == "docs" or (
+            packet.packet_type == "infra"
+            and process_words.search(
+                f"{packet.title} {packet.objective} {packet.context}"
+            )
+        ):
+            documentation_or_process += 1
+    if documentation_or_process > 2:
+        raise ValueError(
+            "Lean architecture permits at most two documentation/process "
+            "packets among the first five packets."
+        )
 
 
 def dependency_ready_packet(plan: ProjectPlan) -> WorkPacket | None:

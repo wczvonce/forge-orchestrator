@@ -157,7 +157,13 @@ class AdaptiveRuntimeTests(unittest.TestCase):
             "recommended_review_profile": "routine_review",
             "check_tier": tier,
             "max_worker_turns": 10 if number == 1 else 20,
-            "expected_paths": [],
+            "expected_paths": [
+                (
+                    f"packet-output-{number}.txt"
+                    if packet_type == "docs"
+                    else f"src/packet-{number}.txt"
+                )
+            ],
             "forbidden_scope": [],
             "attempts": 0,
             "last_fingerprint": None,

@@ -58,6 +58,7 @@
   "adaptive_orchestration": true,
   "adaptive_auto_supervisor": true,
   "orchestration_style": "lean",
+  "routine_reviewer": "none",
   "claude_supports_model": true,
   "claude_supports_effort": true,
   "claude_supports_max_turns": false,
@@ -104,6 +105,11 @@
           {"model": "opus", "effort": "high"},
           {"model": "sonnet", "effort": "high"}
         ]
+      },
+      "claude_reviewer": {
+        "max_turns": 10,
+        "reason": "Read-only structured review after green milestone checks.",
+        "candidates": [{"model": "sonnet", "effort": "low"}]
       }
     },
     "codex": {

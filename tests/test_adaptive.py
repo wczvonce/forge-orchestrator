@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import forge_adaptive as adaptive
 import forge
@@ -105,6 +106,64 @@ class AdaptiveSchemaTests(unittest.TestCase):
         )
         self.assertEqual(docs.packet_type, "docs")
         self.assertIn("README.md", docs.worker_prompt or "")
+
+    def test_read_only_claude_reviewer_uses_shared_router_without_write_tools(self):
+        packet = self.packet(
+            worker_prompt="Implement packet.",
+            check_tier="milestone",
+        )
+        worker = forge.WorkerResult(
+            exit_code=0,
+            summary=json.dumps(
+                {
+                    "approve": False,
+                    "issues": [
+                        {
+                            "file_path": "src/app.py",
+                            "description": "Handle the empty state.",
+                        }
+                    ],
+                }
+            ),
+            raw_output="",
+            duration_seconds=0.1,
+            termination_reason="success",
+            valid_worker_outcome=True,
+        )
+        routed = forge.RoutedWorkerOutcome(worker=worker, worker_calls=1)
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(
+            forge,
+            "run_claude_routed",
+            return_value=routed,
+        ) as mocked:
+            verdict, outcome = forge.run_read_only_claude_review(
+                Path(temp),
+                "Build app",
+                packet,
+                [
+                    forge.CheckResult(
+                        command="test",
+                        exit_code=0,
+                        output="Ran 1 tests",
+                    )
+                ],
+                forge.DEFAULT_CONFIG,
+                iteration=1,
+                logs=Path(temp) / "logs",
+                status=None,
+                unavailable_models={},
+                max_worker_calls_remaining=2,
+                max_premium_calls_remaining=1,
+            )
+        self.assertFalse(verdict.approve)
+        self.assertEqual(outcome.worker_calls, 1)
+        kwargs = mocked.call_args.kwargs
+        self.assertEqual(kwargs["profile"], "claude_reviewer")
+        self.assertEqual(kwargs["tools_override"], "Read,Glob,Grep")
+        self.assertTrue(kwargs["read_only"])
+        self.assertNotIn("Write", kwargs["tools_override"])
+        self.assertNotIn("Edit", kwargs["tools_override"])
+        self.assertNotIn("Bash", kwargs["tools_override"])
 
 
 class ProjectPlanTests(unittest.TestCase):
@@ -313,6 +372,51 @@ class ProjectPlanTests(unittest.TestCase):
         )
         self.assertIn("first grounded failure", prompt)
         self.assertIn("second grounded failure", prompt)
+
+    def test_claude_reviewer_rejection_allows_one_repair_then_codex(self):
+        packet = self.packet(
+            "packet-001",
+            worker_prompt="Implement the milestone.",
+            status="in_progress",
+            check_tier="milestone",
+            attempts=1,
+        )
+        plan = adaptive.ProjectPlan(
+            plan_id="plan-1",
+            project_id="project-1",
+            goal_hash="g",
+            spec_hash="s",
+            created_at=adaptive.utc_now(),
+            updated_at=adaptive.utc_now(),
+            status="active",
+            active_packet_id=packet.packet_id,
+            work_packets=[packet],
+        )
+        verdict = forge.ClaudeReviewVerdict(
+            approve=False,
+            issues=[
+                forge.ClaudeReviewIssue(
+                    file_path="src/app.py",
+                    description="Handle the empty state.",
+                )
+            ],
+        )
+        updated, repair = forge.prepare_claude_review_repair(
+            plan,
+            packet.packet_id,
+            verdict,
+        )
+        self.assertIsNotNone(repair)
+        self.assertIn("Handle the empty state", repair.next_prompt or "")
+        self.assertEqual(updated.work_packets[0].attempts, 1)
+        self.assertTrue(updated.work_packets[0].claude_review_repair_used)
+        second, second_repair = forge.prepare_claude_review_repair(
+            updated,
+            packet.packet_id,
+            verdict,
+        )
+        self.assertIsNone(second_repair)
+        self.assertEqual(second.work_packets[0].attempts, 1)
 
     def test_replan_preserves_completed_packets_and_safe_assumptions(self):
         completed = self.packet("packet-001", status="completed")

@@ -233,6 +233,26 @@ class RoutedWorkerOutcome(BaseModel):
     unavailable_models: dict[str, str] = Field(default_factory=dict)
 
 
+class ClaudeReviewIssue(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    file_path: str = ""
+    description: str = Field(min_length=1)
+
+
+class ClaudeReviewVerdict(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    approve: bool
+    issues: list[ClaudeReviewIssue] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def require_issues_when_rejected(self) -> "ClaudeReviewVerdict":
+        if not self.approve and not self.issues:
+            raise ValueError("A rejected Claude review requires at least one issue.")
+        return self
+
+
 class ContinuationPayload(BaseModel):
     schema_version: int = SCHEMA_VERSION
     source_run_id: str
@@ -758,6 +778,7 @@ DEFAULT_CONFIG = {
     # Audited JSON profiles opt into lean.  Keeping the in-code fallback
     # classic preserves callers that construct DEFAULT_CONFIG directly.
     "orchestration_style": "classic",
+    "routine_reviewer": "codex",
     "claude_supports_model": True,
     "claude_supports_effort": True,
     # Claude Code 2.1.205 does not advertise --max-turns. Forge therefore
@@ -811,6 +832,11 @@ DEFAULT_CONFIG = {
                     {"model": "opus", "effort": "high"},
                     {"model": "sonnet", "effort": "high"},
                 ],
+            },
+            "claude_reviewer": {
+                "max_turns": 10,
+                "reason": "Read-only structured review after green milestone checks.",
+                "candidates": [{"model": "sonnet", "effort": "low"}],
             },
         },
         "codex": {
@@ -6720,7 +6746,12 @@ def ask_orchestrator(
     return decision
 
 
-def build_claude_settings(project: Path, config: dict) -> Path:
+def build_claude_settings(
+    project: Path,
+    config: dict,
+    *,
+    read_only: bool = False,
+) -> Path:
     deny = [
         "Bash(git push)", "Bash(git push *)", "Bash(git remote set-url *)",
         "Bash(gh pr create *)", "Bash(gh pr merge *)", "Bash(gh release create *)",
@@ -6736,6 +6767,17 @@ def build_claude_settings(project: Path, config: dict) -> Path:
                 "Read(~/.claude/**)",
                 "Edit(~/.claude/**)",
                 "Write(~/.claude/**)",
+            ]
+        )
+    if read_only:
+        deny.extend(
+            [
+                "Bash",
+                "Bash(*)",
+                "Edit",
+                "Edit(*)",
+                "Write",
+                "Write(*)",
             ]
         )
     payload: dict = {"permissions": {"deny": deny}}
@@ -6768,7 +6810,11 @@ def build_claude_settings(project: Path, config: dict) -> Path:
                     ]
                 },
             }
-    path = project / ".forge" / "claude-settings.json"
+    path = project / ".forge" / (
+        "claude-reviewer-settings.json"
+        if read_only
+        else "claude-settings.json"
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
@@ -6928,16 +6974,32 @@ def run_claude(
     effective_timeout_override: int | None = None,
     escalated: bool = False,
     log_stem: str | None = None,
+    prompt_override: str | None = None,
+    tools_override: str | None = None,
+    system_prompt_override: str | None = None,
+    read_only: bool = False,
 ) -> WorkerResult:
     claude = find_cli("claude")
     if not claude:
         raise RuntimeError("Príkaz 'claude' sa nenašiel. Nainštaluj Claude Code a spusti claude.")
-    prompt = redact_text(build_worker_prompt(goal, decision))
+    prompt = redact_text(
+        prompt_override
+        if prompt_override is not None
+        else build_worker_prompt(goal, decision)
+    )
     stem = log_stem or f"{iteration:02d}"
     write_prompt_log(logs, stem, prompt)
     raw_path = logs / f"{stem}-claude-stream.jsonl"
     live_path = logs / f"{stem}-claude-live.log"
-    settings_path = build_claude_settings(project, config)
+    settings_path = build_claude_settings(project, config, read_only=read_only)
+    selected_tools = str(
+        tools_override
+        or config.get("claude_tools")
+        or "Bash,Read,Edit,Write,Glob,Grep"
+    )
+    selected_system_prompt = (
+        system_prompt_override or WORKER_BOUNDARIES
+    )
     selected_model = str(model_override or config.get("claude_model") or "sonnet")
     selected_effort = str(effort_override or config.get("claude_effort") or "").strip()
     selected_max_turns = int(max_turns_override or config.get("claude_max_turns", 45))
@@ -6955,10 +7017,10 @@ def run_claude(
         cmd.append("--strict-mcp-config")
     cmd.extend([
         "--disable-slash-commands",
-        "--append-system-prompt", WORKER_BOUNDARIES,
+        "--append-system-prompt", selected_system_prompt,
         "--settings", str(settings_path),
-        "--tools", str(config.get("claude_tools") or "Bash,Read,Edit,Write,Glob,Grep"),
-        "--allowedTools", str(config.get("claude_tools") or "Bash,Read,Edit,Write,Glob,Grep"),
+        "--tools", selected_tools,
+        "--allowedTools", selected_tools,
         "--output-format", "stream-json",
         "--verbose",
         "--include-partial-messages",
@@ -7222,6 +7284,10 @@ def run_claude_routed(
     max_worker_calls_remaining: int,
     max_premium_calls_remaining: int,
     log_stem: str | None = None,
+    prompt_override: str | None = None,
+    tools_override: str | None = None,
+    system_prompt_override: str | None = None,
+    read_only: bool = False,
 ) -> RoutedWorkerOutcome:
     """Execute one logical packet through the common subscription-safe router."""
     unavailable = {
@@ -7328,6 +7394,10 @@ def run_claude_routed(
                 effective_timeout_override=routing.effective_timeout,
                 escalated=profile == "rescue",
                 log_stem=attempt_stem,
+                prompt_override=prompt_override,
+                tools_override=tools_override,
+                system_prompt_override=system_prompt_override,
+                read_only=read_only,
             )
         except SubscriptionLimitError as exc:
             setattr(exc, "worker_calls", worker_calls)
@@ -7406,6 +7476,99 @@ def run_claude_routed(
     )
 
 
+def run_read_only_claude_review(
+    project: Path,
+    goal: str,
+    packet: WorkPacket,
+    checks: list[CheckResult],
+    config: dict,
+    *,
+    iteration: int,
+    logs: Path,
+    status: StatusTracker | None,
+    unavailable_models: dict[str, str],
+    max_worker_calls_remaining: int,
+    max_premium_calls_remaining: int,
+) -> tuple[ClaudeReviewVerdict, RoutedWorkerOutcome]:
+    """Run the optional milestone reviewer through the shared safe router."""
+    review_prompt = textwrap.dedent(
+        f"""
+        READ-ONLY CLAUDE ROUTINE REVIEW
+
+        You are not an implementation worker. Do not modify files and do not
+        run shell commands. Use only Read, Glob, and Grep to inspect the packet
+        and the green deterministic evidence.
+
+        OVERALL GOAL:
+        {goal}
+
+        PACKET:
+        {json.dumps(packet.model_dump(mode="json"), ensure_ascii=False, indent=2)}
+
+        GREEN CHECK EVIDENCE:
+        {checks_as_text(checks, config)}
+
+        Return only one compact JSON object with this exact shape:
+        {{"approve": true|false, "issues": [
+          {{"file_path": "relative/path", "description": "grounded issue"}}
+        ]}}
+        List every grounded issue at once. An approval closes only this packet;
+        it can never approve project status done.
+        """
+    ).strip()
+    review_decision = Decision(
+        status="continue",
+        decision_kind="verify_packet",
+        assessment="Read-only Claude packet review.",
+        active_packet_id=packet.packet_id,
+        next_prompt=review_prompt,
+        acceptance_criteria=packet.acceptance_criteria,
+        risks=[],
+        recommended_worker_profile="standard",
+        recommended_worker_max_turns=10,
+        recommended_review_profile="routine_review",
+        check_tier=packet.check_tier,
+        routing_reason="Optional read-only Claude milestone reviewer.",
+    )
+    routed = run_claude_routed(
+        project,
+        goal,
+        review_decision,
+        config,
+        profile="claude_reviewer",
+        routing_reason="Read-only structured milestone review.",
+        iteration=iteration,
+        logs=logs,
+        status=status,
+        unavailable_models=unavailable_models,
+        max_worker_calls_remaining=max_worker_calls_remaining,
+        max_premium_calls_remaining=max_premium_calls_remaining,
+        log_stem=f"{iteration:02d}R",
+        prompt_override=review_prompt,
+        tools_override="Read,Glob,Grep",
+        system_prompt_override=(
+            "You are a read-only packet reviewer. Never implement, write, edit, "
+            "or run Bash. Return only the requested JSON verdict."
+        ),
+        read_only=True,
+    )
+    worker = routed.worker
+    if not worker.valid_worker_outcome or worker.exit_code != 0:
+        raise RuntimeError(
+            "Read-only Claude reviewer did not produce a valid outcome: "
+            + worker.summary
+        )
+    try:
+        payload = json.loads(worker.summary)
+        verdict = ClaudeReviewVerdict.model_validate(payload)
+    except Exception as exc:
+        raise RuntimeError(
+            "Read-only Claude reviewer returned an invalid structured verdict."
+        ) from exc
+    save_json(logs / f"{iteration:02d}-claude-review-verdict.json", verdict)
+    return verdict, routed
+
+
 def save_json(path: Path, data: object) -> None:
     if isinstance(data, BaseModel):
         payload = data.model_dump(mode="json")
@@ -7428,6 +7591,14 @@ def validate_config(config: dict) -> None:
     if config.get("orchestration_style", "classic") not in {"lean", "classic"}:
         raise RuntimeError(
             "orchestration_style must be either 'lean' or 'classic'."
+        )
+    if config.get("routine_reviewer", "codex") not in {
+        "none",
+        "claude",
+        "codex",
+    }:
+        raise RuntimeError(
+            "routine_reviewer must be 'none', 'claude', or 'codex'."
         )
     if not 1 <= int(config.get("max_iterations", 0)) <= 10:
         raise RuntimeError("max_iterations musí byť v rozsahu 1 až 10.")
@@ -7488,13 +7659,20 @@ def validate_config(config: dict) -> None:
         if not isinstance(profiles, dict):
             raise RuntimeError("adaptive_profiles musí byť JSON objekt.")
         claude_profiles = profiles.get("claude", {})
-        required_profiles = {"economy", "standard", "complex", "frontier", "rescue"}
+        required_profiles = {
+            "economy",
+            "standard",
+            "complex",
+            "frontier",
+            "rescue",
+            "claude_reviewer",
+        }
         if not isinstance(claude_profiles, dict) or not required_profiles.issubset(
             claude_profiles
         ):
             raise RuntimeError(
                 "Adaptive Claude policy musí definovať economy, standard, complex, "
-                "frontier a rescue profily."
+                "frontier, rescue a claude_reviewer profily."
             )
         for profile_name in sorted(required_profiles):
             resolve_worker_runtime(profile_name, config)
@@ -8132,6 +8310,52 @@ def record_lean_check_evidence(
         )[-2:]
     updated.updated_at = utc_now()
     return ProjectPlan.model_validate(updated.model_dump(mode="json"))
+
+
+def prepare_claude_review_repair(
+    plan: ProjectPlan,
+    packet_id: str,
+    verdict: ClaudeReviewVerdict,
+) -> tuple[ProjectPlan, Decision | None]:
+    """Authorize exactly one packet repair after a read-only Claude rejection."""
+    updated = plan.model_copy(deep=True)
+    packet = next(
+        (
+            item
+            for item in updated.work_packets
+            if item.packet_id == packet_id
+        ),
+        None,
+    )
+    if packet is None:
+        raise ValueError(f"Unknown reviewed packet {packet_id}.")
+    if packet.claude_review_repair_used:
+        return plan, None
+    packet.claude_review_repair_used = True
+    updated.updated_at = utc_now()
+    updated = ProjectPlan.model_validate(updated.model_dump(mode="json"))
+    repair = lean_packet_decision(
+        packet,
+        updated,
+        assessment=(
+            "Read-only Claude review rejected the milestone; one bounded "
+            "repair is allowed before Codex review."
+        ),
+        decision_kind="repair_packet",
+    )
+    issue_text = "\n".join(
+        (
+            f"- {issue.file_path}: {issue.description}"
+            if issue.file_path
+            else f"- {issue.description}"
+        )
+        for issue in verdict.issues
+    )
+    repair.next_prompt = (
+        f"{repair.next_prompt}\n\nREAD-ONLY REVIEW ISSUES "
+        f"(repair all together):\n{issue_text}"
+    )
+    return updated, repair
 
 
 def maybe_authorize_final_review_recovery(
@@ -10740,17 +10964,95 @@ def _run_forge_locked(
                         for packet in project_plan.work_packets
                         if packet.packet_id == packet_for_worker.packet_id
                     )
+                claude_review_approved = False
+                claude_review_candidate = bool(
+                    reviewed_packet is not None
+                    and checks_passed(checks)
+                    and config.get("routine_reviewer", "none") == "claude"
+                    and (
+                        reviewed_packet.check_tier == "milestone"
+                        or reviewed_packet.closes_milestone
+                    )
+                )
+                if claude_review_candidate and reviewed_packet is not None:
+                    increment_count(worker_profile_counts, "claude_reviewer")
+                    verdict, reviewer_outcome = run_read_only_claude_review(
+                        project,
+                        compact_goal(goal, max(iteration, 2), config),
+                        reviewed_packet,
+                        checks,
+                        config,
+                        iteration=iteration,
+                        logs=logs,
+                        status=status,
+                        unavailable_models=unavailable_models,
+                        max_worker_calls_remaining=max(
+                            0,
+                            chain_budgets.max_worker_calls
+                            - chain_worker_calls,
+                        ),
+                        max_premium_calls_remaining=max(
+                            0,
+                            chain_budgets.max_premium_escalations
+                            - escalations_used,
+                        ),
+                    )
+                    chain_worker_calls += reviewer_outcome.worker_calls
+                    escalations_used += reviewer_outcome.premium_calls
+                    run_premium_escalations += reviewer_outcome.premium_calls
+                    model_fallbacks += reviewer_outcome.model_fallbacks
+                    chain_model_fallbacks += reviewer_outcome.model_fallbacks
+                    unavailable_models = dict(
+                        reviewer_outcome.unavailable_models
+                    )
+                    turn_budget_records.extend(
+                        reviewer_outcome.routing_records
+                    )
+                    if verdict.approve:
+                        claude_review_approved = True
+                    else:
+                        project_plan, repair = prepare_claude_review_repair(
+                            project_plan,
+                            reviewed_packet.packet_id,
+                            verdict,
+                        )
+                        if repair is not None:
+                            lean_pending_decision = repair
+                            final_decision = repair
+                            packet_transition_ready = True
+                        save_plan(
+                            project,
+                            project_plan,
+                            snapshot_path=(
+                                run_directory
+                                / (
+                                    "project-plan.claude-review-repair-"
+                                    f"{iteration:02d}.json"
+                                )
+                            ),
+                        )
                 routine_check_close = bool(
                     reviewed_packet is not None
-                    and reviewed_packet.packet_type in {"code", "docs"}
-                    and reviewed_packet.check_tier in {"smoke", "targeted"}
-                    and not reviewed_packet.closes_milestone
-                    and not reviewed_packet.requires_fresh_release_check
+                    and (
+                        (
+                            reviewed_packet.packet_type in {"code", "docs"}
+                            and reviewed_packet.check_tier
+                            in {"smoke", "targeted"}
+                            and not reviewed_packet.closes_milestone
+                            and not reviewed_packet.requires_fresh_release_check
+                        )
+                        or claude_review_approved
+                    )
                 )
                 if routine_check_close and checks_passed(checks):
                     project_plan = complete_lean_packet_by_checks(
                         project_plan,
                         reviewed_packet.packet_id,
+                        completed_by=(
+                            "claude_review"
+                            if claude_review_approved
+                            else "forge_checks"
+                        ),
                     )
                     save_plan(
                         project,

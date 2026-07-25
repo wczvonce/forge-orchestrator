@@ -126,6 +126,7 @@ class WorkPacket(StrictModel):
         default_factory=list,
         max_length=2,
     )
+    claude_review_repair_used: bool = False
 
     @model_validator(mode="after")
     def validate_packet(self) -> "WorkPacket":

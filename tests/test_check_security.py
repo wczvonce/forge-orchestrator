@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 import os
 import sys
 import tempfile
@@ -151,6 +152,43 @@ class CheckSecurityTests(unittest.TestCase):
             env = forge.subscription_only_env()
         self.assertEqual(env["PATH"], "transport-path")
         self.assertNotIn("ANTHROPIC_API_KEY", env)
+
+    def test_runtime_temp_directory_is_private_and_socket_capable_on_wsl(self):
+        runtime_dir = forge.project_runtime_temp_dir(self.project, "checks")
+        self.assertTrue(runtime_dir.is_dir())
+        if forge.running_in_wsl():
+            self.assertTrue(str(runtime_dir).startswith("/tmp/gpt-claude-forge/"))
+            self.assertFalse(str(runtime_dir).startswith("/mnt/"))
+            self.assertEqual(runtime_dir.stat().st_mode & 0o777, 0o700)
+
+    def test_claude_wsl_environment_uses_native_runtime_paths(self):
+        env = forge.claude_subprocess_env(self.project)
+        if forge.running_in_wsl():
+            self.assertTrue(env["TMPDIR"].startswith("/tmp/gpt-claude-forge/"))
+
+    def test_outer_claude_srt_policy_limits_secrets_and_writes(self):
+        config = {**forge.DEFAULT_CONFIG, "security_profile": "strict"}
+        with mock.patch.object(forge, "running_in_wsl", return_value=True):
+            with mock.patch.object(forge.shutil, "which", return_value="/usr/local/bin/srt"):
+                self.assertTrue(forge.use_outer_claude_srt(config))
+                path = forge.build_claude_srt_settings(self.project, config)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        filesystem = payload["filesystem"]
+        self.assertIn("/mnt/c/Users", filesystem["denyRead"])
+        self.assertIn(".", filesystem["allowWrite"])
+        self.assertIn(".git/config", filesystem["denyWrite"])
+        self.assertTrue(payload["network"]["strictAllowlist"])
+        self.assertEqual(payload["network"]["tlsTerminate"], {})
+        credential = payload["credentials"]["files"][0]
+        self.assertEqual(
+            credential["path"],
+            str(Path.home().resolve() / ".claude" / ".credentials.json"),
+        )
+        self.assertIn(credential["path"], filesystem["allowRead"])
+        self.assertIn(credential["path"], filesystem["denyWrite"])
+        self.assertEqual(credential["mode"], "mask")
+        self.assertEqual(credential["onExtractNoMatch"], "error")
+        self.assertIn("api.anthropic.com", credential["injectHosts"])
 
 
 if __name__ == "__main__":

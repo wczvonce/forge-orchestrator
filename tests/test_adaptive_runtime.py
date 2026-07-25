@@ -129,12 +129,21 @@ class AdaptiveRuntimeTests(unittest.TestCase):
         self._launcher("claude", script)
 
     @staticmethod
-    def _packet(number: int, tier: str = "targeted") -> dict:
+    def _packet(
+        number: int,
+        tier: str = "targeted",
+        packet_type: str = "code",
+    ) -> dict:
         return {
             "packet_id": f"packet-{number:03d}",
             "title": f"Packet {number}",
             "objective": f"Implement coherent packet {number}.",
             "context": "Fake multi-packet E2E.",
+            "packet_type": packet_type,
+            "worker_prompt": (
+                f"Implement coherent packet {number}. Change only the expected "
+                f"fake output path and pass the {tier} checks."
+            ),
             "dependencies": [] if number == 1 else [f"packet-{number - 1:03d}"],
             "acceptance_criteria": [f"Packet {number} works"],
             "status": "pending",
@@ -148,7 +157,13 @@ class AdaptiveRuntimeTests(unittest.TestCase):
             "recommended_review_profile": "routine_review",
             "check_tier": tier,
             "max_worker_turns": 10 if number == 1 else 20,
-            "expected_paths": [],
+            "expected_paths": [
+                (
+                    f"packet-output-{number}.txt"
+                    if packet_type == "docs"
+                    else f"src/packet-{number}.txt"
+                )
+            ],
             "forbidden_scope": [],
             "attempts": 0,
             "last_fingerprint": None,
@@ -227,6 +242,41 @@ class AdaptiveRuntimeTests(unittest.TestCase):
             self._complete(2, "targeted"),
             self._complete(3, "milestone"),
             self._complete(4, "targeted"),
+            final,
+        ]
+
+    def lean_decisions(self) -> list[dict]:
+        architecture = self._continue(1, "targeted")
+        architecture["plan_patch"] = {
+            "add_packets": [
+                self._packet(1, "targeted"),
+                self._packet(2, "targeted", "docs"),
+                self._packet(3, "milestone"),
+                self._packet(4, "targeted"),
+                self._packet(5, "targeted"),
+            ],
+            "update_packets": [],
+            "active_packet_id": "packet-001",
+            "append_milestones": ["Packet 3 is the milestone"],
+            "append_release_gates": ["Fresh release checks and final Codex approval"],
+            "append_architectural_decisions": ["Use deterministic fake outputs"],
+            "append_safe_assumptions": ["The fake project remains offline."],
+            "append_risks": [],
+            "explanation": "Five dependency-ordered lean packets.",
+        }
+        final = self._complete(5, "release")
+        final.update(
+            {
+                "decision_kind": "complete_project",
+                "assessment": "All lean packets and release evidence are complete.",
+                "recommended_review_profile": "final_review",
+                "check_tier": "release",
+                "requires_release_check": True,
+            }
+        )
+        return [
+            architecture,
+            self._complete(3, "milestone"),
             final,
         ]
 
@@ -323,6 +373,8 @@ class AdaptiveRuntimeTests(unittest.TestCase):
             forge, "WORKER_BOUNDARIES", "TEST BOUNDARIES"
         ), mock.patch.object(
             forge, "sandbox_runtime_available", return_value=True
+        ), mock.patch.object(
+            forge, "running_in_wsl", return_value=False
         ):
             exit_code = forge.run_chain(
                 self.project, "Build a four-packet fake application", config_path
@@ -394,6 +446,75 @@ class AdaptiveRuntimeTests(unittest.TestCase):
             )
             self.assertFalse(telemetry["raw_prompts_stored"])
             self.assertFalse(telemetry["private_reasoning_stored"])
+
+    def test_lean_fake_cli_chain_skips_routine_codex_reviews(self):
+        self.decisions_path.write_text(
+            json.dumps(self.lean_decisions()), encoding="utf-8"
+        )
+        config = self.config()
+        config["orchestration_style"] = "lean"
+        config["adaptive_profiles"]["claude"]["economy"]["candidates"] = [
+            {"model": "sonnet", "effort": "low"}
+        ]
+        config["confirmed_subscription_models"] = []
+        config_path = self.root / "lean.config.json"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        env = {
+            "PATH": str(self.fake_bin) + os.pathsep + os.environ.get("PATH", ""),
+            "FAKE_CODEX_DECISIONS": str(self.decisions_path),
+            "FAKE_CODEX_COUNTER": str(self.codex_counter),
+            "FAKE_CLAUDE_COUNTER": str(self.claude_counter),
+        }
+        with mock.patch.dict(os.environ, env, clear=False), mock.patch.object(
+            forge, "codex_auth_status", return_value=(True, "Logged in using ChatGPT")
+        ), mock.patch.object(
+            forge,
+            "claude_auth_status",
+            return_value=(True, '{"loggedIn":true,"subscriptionType":"max"}'),
+        ), mock.patch.object(
+            forge, "WORKER_BOUNDARIES", "TEST BOUNDARIES"
+        ), mock.patch.object(
+            forge, "sandbox_runtime_available", return_value=True
+        ), mock.patch.object(
+            forge, "running_in_wsl", return_value=False
+        ):
+            exit_code = forge.run_chain(
+                self.project,
+                "Build a five-packet lean fake application",
+                config_path,
+            )
+        self.assertEqual(exit_code, forge.EXIT_DONE)
+        plan = json.loads(
+            (self.project / ".forge" / "project-plan.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(int(self.codex_counter.read_text(encoding="utf-8")), 3)
+        self.assertLessEqual(
+            int(self.codex_counter.read_text(encoding="utf-8")),
+            4,
+        )
+        self.assertEqual(int(self.claude_counter.read_text(encoding="utf-8")), 5)
+        self.assertEqual(len(plan["completed_packet_ids"]), 5)
+        self.assertEqual(plan["work_packets"][0]["completed_by"], "forge_checks")
+        self.assertEqual(plan["work_packets"][1]["completed_by"], "forge_checks")
+        self.assertEqual(plan["work_packets"][2]["completed_by"], "codex_review")
+        first_run = sorted(
+            (self.project / ".forge" / "runs").iterdir()
+        )[0]
+        docs_checks = json.loads(
+            (first_run / "logs" / "02-checks.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertTrue(docs_checks)
+        self.assertTrue(
+            all(check["tier"] == "smoke" for check in docs_checks)
+        )
+        self.assertIn(
+            "forge-lean-docs-scope",
+            {check["check_id"] for check in docs_checks},
+        )
 
     def test_self_installation_is_rejected(self):
         with self.assertRaises(SystemExit):
@@ -493,6 +614,9 @@ class SupervisorTerminalTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.project = Path(self.temp.name) / "project"
         self.project.mkdir()
+        self.strict_config = Path(forge.__file__).with_name(
+            "forge.strict.config.json"
+        )
         self.sandbox = mock.patch.object(
             forge, "sandbox_runtime_available", return_value=True
         )
@@ -502,6 +626,10 @@ class SupervisorTerminalTests(unittest.TestCase):
         self.sandbox.stop()
         self.temp.cleanup()
 
+    def test_strict_config_explicitly_enables_outer_srt_on_wsl(self):
+        raw_config = json.loads(self.strict_config.read_text(encoding="utf-8"))
+        self.assertIs(raw_config.get("claude_outer_srt_on_wsl"), True)
+
     def _terminal(self, code: int) -> tuple[int, mock.Mock]:
         resume = mock.Mock()
         with mock.patch.object(forge, "run_forge", return_value=code), mock.patch.object(
@@ -510,7 +638,7 @@ class SupervisorTerminalTests(unittest.TestCase):
             result = forge.run_chain(
                 self.project,
                 "Goal",
-                Path(forge.__file__).with_name("forge.config.json"),
+                self.strict_config,
             )
         return result, resume
 
@@ -567,7 +695,7 @@ class SupervisorTerminalTests(unittest.TestCase):
             result = forge.run_chain(
                 self.project,
                 "Goal",
-                Path(forge.__file__).with_name("forge.config.json"),
+                self.strict_config,
             )
         self.assertEqual(result, forge.EXIT_FAILED)
         run.assert_not_called()
@@ -577,6 +705,25 @@ class SupervisorTerminalTests(unittest.TestCase):
             )
         )
         self.assertEqual(state["stop_reason_code"], "technical_failure")
+
+    def test_unattended_chain_on_wsl_requires_strict_profile(self):
+        run = mock.Mock(return_value=forge.EXIT_DONE)
+        config_path = Path(forge.__file__).with_name("forge.config.json")
+        with mock.patch.object(
+            forge, "running_in_wsl", return_value=True
+        ), mock.patch.object(
+            forge, "sandbox_runtime_available", return_value=True
+        ), mock.patch.object(forge, "run_forge", run):
+            result = forge.run_chain(self.project, "Goal", config_path)
+        self.assertEqual(result, forge.EXIT_FAILED)
+        run.assert_not_called()
+        state = json.loads(
+            (self.project / ".forge" / "chain-supervisor.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(state["stop_reason_code"], "technical_failure")
+        self.assertIn("security_profile=strict", state["stop_reason"])
 
     def test_budget_exhaustion_stops_without_another_child(self):
         self._write_needs_result(
@@ -589,7 +736,7 @@ class SupervisorTerminalTests(unittest.TestCase):
             result = forge.run_chain(
                 self.project,
                 "Goal",
-                Path(forge.__file__).with_name("forge.config.json"),
+                self.strict_config,
             )
         self.assertEqual(result, forge.EXIT_NEEDS_CONTINUATION)
         resume.assert_not_called()
@@ -608,7 +755,7 @@ class SupervisorTerminalTests(unittest.TestCase):
             result = forge.run_chain(
                 self.project,
                 "Goal",
-                Path(forge.__file__).with_name("forge.config.json"),
+                self.strict_config,
             )
         self.assertEqual(result, forge.EXIT_NEEDS_CONTINUATION)
         resume.assert_not_called()
@@ -628,10 +775,14 @@ class SupervisorTerminalTests(unittest.TestCase):
             result = forge.run_chain(
                 self.project,
                 "Goal",
-                Path(forge.__file__).with_name("forge.config.json"),
+                self.strict_config,
             )
         self.assertEqual(result, forge.EXIT_DONE)
-        resume.assert_called_once_with(self.project.resolve(), "source-run")
+        resume.assert_called_once()
+        args, kwargs = resume.call_args
+        self.assertEqual(args, (self.project.resolve(), "source-run"))
+        self.assertEqual(kwargs["resume_kind"], "internal_automatic")
+        self.assertEqual(kwargs["supervisor_config"]["security_profile"], "strict")
 
     def test_next_packet_and_reviewer_continue_are_resumable(self):
         for reason in ("next_packet_ready", "reviewer_continue"):
@@ -651,7 +802,7 @@ class SupervisorTerminalTests(unittest.TestCase):
                     result = forge.run_chain(
                         self.project,
                         "Goal",
-                        Path(forge.__file__).with_name("forge.config.json"),
+                        self.strict_config,
                     )
                 self.assertEqual(result, forge.EXIT_DONE)
                 resume.assert_called_once()
@@ -669,7 +820,7 @@ class SupervisorTerminalTests(unittest.TestCase):
             result = forge.run_chain(
                 self.project,
                 "Goal",
-                Path(forge.__file__).with_name("forge.config.json"),
+                self.strict_config,
             )
         self.assertEqual(result, forge.EXIT_NEEDS_CONTINUATION)
         resume.assert_not_called()
@@ -695,7 +846,7 @@ class SupervisorTerminalTests(unittest.TestCase):
             result = forge.run_chain(
                 self.project,
                 "Goal",
-                Path(forge.__file__).with_name("forge.config.json"),
+                self.strict_config,
             )
         self.assertEqual(result, forge.EXIT_FAILED)
         resume.assert_not_called()
@@ -709,7 +860,7 @@ class SupervisorTerminalTests(unittest.TestCase):
             result = forge.run_chain(
                 self.project,
                 "Goal",
-                Path(forge.__file__).with_name("forge.config.json"),
+                self.strict_config,
             )
         self.assertEqual(result, forge.EXIT_FAILED)
         resume.assert_not_called()
@@ -724,10 +875,14 @@ class SupervisorTerminalTests(unittest.TestCase):
             result = forge.run_chain(
                 self.project,
                 "Generic goal that must not be restarted",
-                Path(forge.__file__).with_name("forge.config.json"),
+                self.strict_config,
             )
         self.assertEqual(result, forge.EXIT_DONE)
-        resume.assert_called_once_with(self.project.resolve(), "source-run")
+        resume.assert_called_once()
+        args, kwargs = resume.call_args
+        self.assertEqual(args, (self.project.resolve(), "source-run"))
+        self.assertEqual(kwargs["resume_kind"], "internal_automatic")
+        self.assertEqual(kwargs["supervisor_config"]["security_profile"], "strict")
 
 
 if __name__ == "__main__":

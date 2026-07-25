@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import forge_adaptive as adaptive
 import forge
@@ -54,6 +55,152 @@ class AdaptiveSchemaTests(unittest.TestCase):
     def test_continue_requires_prompt(self):
         with self.assertRaises(ValidationError):
             adaptive.AdaptiveDecision(status="continue", assessment="Missing prompt")
+
+    def test_contract_drift_approval_is_explicit_and_reasoned(self):
+        ordinary = adaptive.AdaptiveDecision(
+            status="continue",
+            assessment="Continue normally",
+            next_prompt="Implement packet.",
+        )
+        self.assertFalse(ordinary.approve_check_contract_drift)
+        self.assertEqual(ordinary.check_contract_approval_reason, "")
+        with self.assertRaises(ValidationError):
+            adaptive.AdaptiveDecision(
+                status="continue",
+                assessment="Approve without evidence reason",
+                next_prompt="Implement packet.",
+                approve_check_contract_drift=True,
+            )
+        normalized = adaptive.AdaptiveDecision(
+            status="continue",
+            assessment="Ambiguous reason",
+            next_prompt="Implement packet.",
+            check_contract_approval_reason="Looks fine.",
+        )
+        self.assertEqual(normalized.check_contract_approval_reason, "")
+        self.assertTrue(normalized.normalization_warnings)
+
+    def test_lean_architecture_requires_every_worker_prompt(self):
+        packets = [
+            self.packet(
+                packet_id=f"packet-{index:03d}",
+                expected_paths=(
+                    ["src/app.py"] if index == 2 else ["docs/packet.md"]
+                ),
+                worker_prompt=(
+                    "Implement the bounded packet and run targeted checks."
+                    if index != 3
+                    else None
+                ),
+            )
+            for index in range(1, 5)
+        ]
+        with self.assertRaisesRegex(ValueError, "packet-003"):
+            adaptive.validate_lean_initial_plan(packets)
+        packets[2].worker_prompt = "Implement packet 3 and run its checks."
+        adaptive.validate_lean_initial_plan(packets)
+
+    def test_lean_plan_rejects_document_heavy_start(self):
+        packets = [
+            self.packet(
+                packet_id=f"packet-{index:03d}",
+                packet_type=("code" if index == 3 else "docs"),
+                worker_prompt=f"Complete packet {index}.",
+                expected_paths=(
+                    ["src/app.py"] if index == 3 else [f"docs/{index}.md"]
+                ),
+            )
+            for index in range(1, 6)
+        ]
+        with self.assertRaisesRegex(ValueError, "at most two"):
+            adaptive.validate_lean_initial_plan(packets)
+
+    def test_lean_plan_accepts_walking_skeleton_in_packet_two(self):
+        packets = [
+            self.packet(
+                packet_id=f"packet-{index:03d}",
+                packet_type=("docs" if index == 1 else "code"),
+                worker_prompt=f"Complete packet {index}.",
+                expected_paths=(
+                    ["docs/plan.md"]
+                    if index == 1
+                    else ["src/main.py"]
+                    if index == 2
+                    else [f"src/feature_{index}.py"]
+                ),
+            )
+            for index in range(1, 5)
+        ]
+        adaptive.validate_lean_initial_plan(packets)
+
+    def test_worker_prompt_and_packet_type_are_backward_compatible(self):
+        legacy = self.packet()
+        self.assertEqual(legacy.packet_type, "code")
+        self.assertIsNone(legacy.worker_prompt)
+        docs = self.packet(
+            packet_type="docs",
+            worker_prompt="Update README.md only and run git diff --check.",
+        )
+        self.assertEqual(docs.packet_type, "docs")
+        self.assertIn("README.md", docs.worker_prompt or "")
+
+    def test_read_only_claude_reviewer_uses_shared_router_without_write_tools(self):
+        packet = self.packet(
+            worker_prompt="Implement packet.",
+            check_tier="milestone",
+        )
+        worker = forge.WorkerResult(
+            exit_code=0,
+            summary=json.dumps(
+                {
+                    "approve": False,
+                    "issues": [
+                        {
+                            "file_path": "src/app.py",
+                            "description": "Handle the empty state.",
+                        }
+                    ],
+                }
+            ),
+            raw_output="",
+            duration_seconds=0.1,
+            termination_reason="success",
+            valid_worker_outcome=True,
+        )
+        routed = forge.RoutedWorkerOutcome(worker=worker, worker_calls=1)
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(
+            forge,
+            "run_claude_routed",
+            return_value=routed,
+        ) as mocked:
+            verdict, outcome = forge.run_read_only_claude_review(
+                Path(temp),
+                "Build app",
+                packet,
+                [
+                    forge.CheckResult(
+                        command="test",
+                        exit_code=0,
+                        output="Ran 1 tests",
+                    )
+                ],
+                forge.DEFAULT_CONFIG,
+                iteration=1,
+                logs=Path(temp) / "logs",
+                status=None,
+                unavailable_models={},
+                max_worker_calls_remaining=2,
+                max_premium_calls_remaining=1,
+            )
+        self.assertFalse(verdict.approve)
+        self.assertEqual(outcome.worker_calls, 1)
+        kwargs = mocked.call_args.kwargs
+        self.assertEqual(kwargs["profile"], "claude_reviewer")
+        self.assertEqual(kwargs["tools_override"], "Read,Glob,Grep")
+        self.assertTrue(kwargs["read_only"])
+        self.assertNotIn("Write", kwargs["tools_override"])
+        self.assertNotIn("Edit", kwargs["tools_override"])
+        self.assertNotIn("Bash", kwargs["tools_override"])
 
 
 class ProjectPlanTests(unittest.TestCase):
@@ -164,6 +311,258 @@ class ProjectPlanTests(unittest.TestCase):
         updated = adaptive.apply_plan_patch(base, patch, checks_passed=True)
         self.assertEqual(updated.completed_packet_ids, ["packet-001"])
 
+    def test_dependency_ready_packet_uses_persistent_plan_order(self):
+        first = self.packet("packet-001", status="completed")
+        second = self.packet(
+            "packet-002",
+            dependencies=["packet-001"],
+        )
+        third = self.packet(
+            "packet-003",
+            dependencies=["packet-001"],
+        )
+        plan = adaptive.ProjectPlan(
+            plan_id="plan-1",
+            project_id="project-1",
+            goal_hash="g",
+            spec_hash="s",
+            created_at=adaptive.utc_now(),
+            updated_at=adaptive.utc_now(),
+            work_packets=[first, second, third],
+            completed_packet_ids=["packet-001"],
+        )
+        self.assertEqual(
+            adaptive.dependency_ready_packet(plan).packet_id,
+            "packet-002",
+        )
+
+    def test_green_lean_packet_is_closed_and_next_is_activated(self):
+        first = self.packet(
+            "packet-001",
+            worker_prompt="Implement packet 1.",
+            status="in_progress",
+        )
+        second = self.packet(
+            "packet-002",
+            worker_prompt="Implement packet 2.",
+            dependencies=["packet-001"],
+        )
+        plan = adaptive.ProjectPlan(
+            plan_id="plan-1",
+            project_id="project-1",
+            goal_hash="g",
+            spec_hash="s",
+            created_at=adaptive.utc_now(),
+            updated_at=adaptive.utc_now(),
+            status="active",
+            active_packet_id="packet-001",
+            work_packets=[first, second],
+        )
+        updated = forge.complete_lean_packet_by_checks(plan, "packet-001")
+        self.assertEqual(updated.completed_packet_ids, ["packet-001"])
+        self.assertEqual(updated.work_packets[0].completed_by, "forge_checks")
+        self.assertEqual(updated.active_packet_id, "packet-002")
+        self.assertEqual(updated.work_packets[1].status, "in_progress")
+
+    def test_lean_packet_keeps_both_consecutive_check_failures_for_review(self):
+        packet = self.packet(
+            "packet-001",
+            worker_prompt="Repair the packet.",
+            status="in_progress",
+        )
+        plan = adaptive.ProjectPlan(
+            plan_id="plan-1",
+            project_id="project-1",
+            goal_hash="g",
+            spec_hash="s",
+            created_at=adaptive.utc_now(),
+            updated_at=adaptive.utc_now(),
+            status="active",
+            active_packet_id=packet.packet_id,
+            work_packets=[packet],
+        )
+        first = forge.CheckResult(
+            command="first",
+            check_id="targeted",
+            exit_code=1,
+            output="first grounded failure",
+        )
+        second = forge.CheckResult(
+            command="second",
+            check_id="targeted",
+            exit_code=1,
+            output="second grounded failure",
+        )
+        plan = forge.record_lean_check_evidence(plan, packet.packet_id, [first])
+        plan = forge.record_lean_check_evidence(plan, packet.packet_id, [second])
+        history = plan.work_packets[0].consecutive_check_failures
+        self.assertEqual(len(history), 2)
+        prompt = forge.build_review_prompt(
+            "Repair app",
+            3,
+            "repository evidence",
+            None,
+            [second],
+            0,
+            project_plan=plan,
+            active_packet=plan.work_packets[0],
+        )
+        self.assertIn("first grounded failure", prompt)
+        self.assertIn("second grounded failure", prompt)
+
+    def test_claude_reviewer_rejection_allows_one_repair_then_codex(self):
+        packet = self.packet(
+            "packet-001",
+            worker_prompt="Implement the milestone.",
+            status="in_progress",
+            check_tier="milestone",
+            attempts=1,
+        )
+        plan = adaptive.ProjectPlan(
+            plan_id="plan-1",
+            project_id="project-1",
+            goal_hash="g",
+            spec_hash="s",
+            created_at=adaptive.utc_now(),
+            updated_at=adaptive.utc_now(),
+            status="active",
+            active_packet_id=packet.packet_id,
+            work_packets=[packet],
+        )
+        verdict = forge.ClaudeReviewVerdict(
+            approve=False,
+            issues=[
+                forge.ClaudeReviewIssue(
+                    file_path="src/app.py",
+                    description="Handle the empty state.",
+                )
+            ],
+        )
+        updated, repair = forge.prepare_claude_review_repair(
+            plan,
+            packet.packet_id,
+            verdict,
+        )
+        self.assertIsNotNone(repair)
+        self.assertIn("Handle the empty state", repair.next_prompt or "")
+        self.assertEqual(updated.work_packets[0].attempts, 1)
+        self.assertTrue(updated.work_packets[0].claude_review_repair_used)
+        second, second_repair = forge.prepare_claude_review_repair(
+            updated,
+            packet.packet_id,
+            verdict,
+        )
+        self.assertIsNone(second_repair)
+        self.assertEqual(second.work_packets[0].attempts, 1)
+
+    def test_second_review_issue_on_unchanged_file_is_late_without_attempt(self):
+        packet = self.packet(
+            "packet-001",
+            worker_prompt="Repair the packet.",
+            status="in_progress",
+            attempts=2,
+        )
+        plan = adaptive.ProjectPlan(
+            plan_id="plan-1",
+            project_id="project-1",
+            goal_hash="g",
+            spec_hash="s",
+            created_at=adaptive.utc_now(),
+            updated_at=adaptive.utc_now(),
+            status="active",
+            active_packet_id=packet.packet_id,
+            work_packets=[packet],
+        )
+        manifest = {"src/app.py": "same-sha256"}
+        plan, first_late = forge.record_review_snapshot(
+            plan,
+            packet.packet_id,
+            manifest=manifest,
+            reviewed_paths=["src/app.py"],
+            issues=[],
+        )
+        self.assertEqual(first_late, [])
+        plan, second_late = forge.record_review_snapshot(
+            plan,
+            packet.packet_id,
+            manifest=manifest,
+            reviewed_paths=["src/app.py"],
+            issues=[
+                adaptive.ReviewIssue(
+                    file_path="src/app.py",
+                    description="Previously omitted grounded issue.",
+                )
+            ],
+        )
+        self.assertEqual(len(second_late), 1)
+        self.assertEqual(
+            second_late[0]["file_path"],
+            "src/app.py",
+        )
+        self.assertEqual(plan.work_packets[0].attempts, 2)
+        self.assertEqual(len(plan.work_packets[0].late_findings), 1)
+
+    def test_normal_content_attempt_increments_and_technical_refund_restores_it(self):
+        packet = self.packet(
+            "packet-001",
+            worker_prompt="Implement packet.",
+            status="in_progress",
+            attempts=0,
+        )
+        plan = adaptive.ProjectPlan(
+            plan_id="plan-1",
+            project_id="project-1",
+            goal_hash="g",
+            spec_hash="s",
+            created_at=adaptive.utc_now(),
+            updated_at=adaptive.utc_now(),
+            status="active",
+            active_packet_id=packet.packet_id,
+            work_packets=[packet],
+        )
+        attempted, recovery = adaptive.begin_packet_attempt(
+            plan,
+            packet.packet_id,
+            forge.DEFAULT_CONFIG,
+        )
+        self.assertFalse(recovery)
+        self.assertEqual(attempted.work_packets[0].attempts, 1)
+        refunded = adaptive.refund_packet_attempt(
+            attempted,
+            packet.packet_id,
+            recovery_attempt=False,
+        )
+        self.assertEqual(refunded.work_packets[0].attempts, 0)
+
+    def test_docs_scope_allows_docs_readme_and_explicit_paths_only(self):
+        packet = self.packet(
+            "packet-docs",
+            packet_type="docs",
+            worker_prompt="Update the documentation.",
+            expected_paths=["CHANGELOG.md"],
+        )
+        before = {
+            "docs/guide.md": "old",
+            "README.md": "old",
+            "CHANGELOG.md": "old",
+            "src/app.py": "old",
+        }
+        allowed_after = {
+            **before,
+            "docs/guide.md": "new",
+            "README.md": "new",
+            "CHANGELOG.md": "new",
+        }
+        self.assertEqual(
+            forge.lean_docs_scope_violations(packet, before, allowed_after),
+            [],
+        )
+        forbidden_after = {**allowed_after, "src/app.py": "new"}
+        self.assertEqual(
+            forge.lean_docs_scope_violations(packet, before, forbidden_after),
+            ["src/app.py"],
+        )
+
     def test_replan_preserves_completed_packets_and_safe_assumptions(self):
         completed = self.packet("packet-001", status="completed")
         pending = self.packet(
@@ -200,6 +599,69 @@ class ProjectPlanTests(unittest.TestCase):
             ).read_text(encoding="utf-8")
         self.assertIn("Use a local offline database.", assumptions)
         self.assertIn("Prefer a reversible MVP.", assumptions)
+
+    def test_blocking_only_reachable_packet_derives_blocked_plan(self):
+        base = adaptive.ProjectPlan(
+            plan_id="plan-1",
+            project_id="project-1",
+            goal_hash="g",
+            spec_hash="s",
+            created_at=adaptive.utc_now(),
+            updated_at=adaptive.utc_now(),
+            status="active",
+            active_packet_id="packet-001",
+            work_packets=[
+                self.packet("packet-001", status="in_progress"),
+                self.packet("packet-002", dependencies=["packet-001"]),
+            ],
+        )
+        patch = adaptive.PlanPatch(
+            update_packets=[
+                adaptive.PacketUpdate(
+                    packet_id="packet-001",
+                    status="blocked",
+                    justification="A required external account is unavailable.",
+                )
+            ],
+            explanation="Persist the real dependency blocker.",
+        )
+
+        updated = adaptive.apply_plan_patch(base, patch, checks_passed=False)
+
+        self.assertEqual(updated.status, "blocked")
+        self.assertEqual(updated.work_packets[0].status, "blocked")
+
+    def test_blocked_packet_does_not_hide_independent_ready_work(self):
+        base = adaptive.ProjectPlan(
+            plan_id="plan-1",
+            project_id="project-1",
+            goal_hash="g",
+            spec_hash="s",
+            created_at=adaptive.utc_now(),
+            updated_at=adaptive.utc_now(),
+            status="active",
+            active_packet_id="packet-001",
+            work_packets=[
+                self.packet("packet-001", status="in_progress"),
+                self.packet("packet-002"),
+            ],
+        )
+        patch = adaptive.PlanPatch(
+            update_packets=[
+                adaptive.PacketUpdate(
+                    packet_id="packet-001",
+                    status="blocked",
+                    justification="Only this external integration is blocked.",
+                )
+            ],
+            explanation="Continue independent local work.",
+        )
+
+        updated = adaptive.apply_plan_patch(base, patch, checks_passed=False)
+
+        self.assertEqual(updated.status, "active")
+        self.assertEqual(updated.active_packet_id, "packet-002")
+        self.assertEqual(updated.work_packets[1].status, "in_progress")
 
 
 class AdaptiveRouterTests(unittest.TestCase):

@@ -7,6 +7,117 @@ Forge používa existujúce ChatGPT a Claude.ai predplatné, nie API kľúče:
 - **Forge** je lokálna Python slučka, ktorá vyberá správny model podľa fázy, zbiera iba potrebné dôkazy, spúšťa kontroly a bezpečne zastavuje proces.
 - **Live Monitor** je obyčajný lokálny PowerShell. Jeho obnovovanie nespotrebúva modelové tokeny.
 
+## Lean orchestration — predvolený auditovaný tok
+
+Aktívne konfiguračné profily používajú `orchestration_style: "lean"`.
+Kompatibilný `classic` tok zostáva dostupný pre staré alebo explicitne
+klasické konfigurácie. Pri načítaní legacy konfigurácie bez nového kľúča Forge
+bezpečne zachová pôvodný `classic` tok, aby sa existujúci beh potichu nezmenil.
+
+Rozdiel je v počte strategických review, nie v bezpečnostných kontrolách:
+
+- `lean`: prvý Codex architecture call pripraví pre každý packet úplný
+  `worker_prompt`; Forge potom vyberá dependency-ready packety v stabilnom
+  poradí. Bežný `smoke` alebo `targeted` packet uzavrú zelené lokálne kontroly
+  a zapíšu `completed_by: "forge_checks"`. Codex sa vracia pri míľniku,
+  opakovanom zlyhaní, zmene plánu/check kontraktu a pri finálnom release review.
+- `classic`: zachováva pôvodné Codex rozhodnutie medzi implementačnými
+  iteráciami a predvolený Codex routine review.
+
+Návrhovým cieľom lean toku je približne päť Codex volaní na bežný projekt:
+architektúra, niekoľko skutočných míľnikov a finálny review. Nie je to
+garancia ani tvrdenie o percentuálnej úspore. Skutočný počet rastie pri
+opravách, contract drifte, externých zmenách alebo bezpečnostnom riziku.
+Deterministický fake-CLI E2E s piatimi packetmi, jedným docs packetom a jedným
+míľnikom používa tri Codex volania: architektúru, míľnik a finál.
+
+### Kto rozhoduje čo
+
+| Vrstva | Rozhodnutia a zodpovednosť |
+|---|---|
+| Python Forge | vyberá dependency-ready packet, povoľuje modelový profil, vynucuje scope, budgety, stavové prechody, resume a bezpečnostné hranice |
+| Lokálne checky | poskytujú model-free dôkaz pre `smoke`, `targeted`, `milestone` a `release`; zelený výsledok môže v lean toku uzavrieť rutinný packet |
+| Claude Code | implementuje iba aktívny `worker_prompt`; voliteľný `claude_reviewer` je samostatný read-only reviewer bez Write/Edit/Bash |
+| Codex | vytvára plán, rieši míľniky, opakované zlyhania a zmeny kontraktu a ako jediný model schvaľuje konečný `done` po čerstvej release suite |
+
+### Pravidlá prvého lean plánu
+
+- plán má 4 až 12 koherentných packetov a každý má samostatne postačujúci
+  `worker_prompt`;
+- najneskôr prvý, druhý alebo tretí packet vytvorí spustiteľný walking
+  skeleton mimo `docs/`;
+- najviac dva z prvých piatich packetov môžu byť dokumentačné alebo procesné;
+- externé služby sa plánujú mock-first: nedostupný prístup blokuje pripojenie
+  reálnych dát, nie lokálne UI, doménovú logiku ani syntetický tok;
+- `docs` packet používa iba smoke/diff kontroly a smie meniť iba `docs/`,
+  `README.md` a svoje explicitné `expected_paths`;
+- zelené checks nenahrádzajú finálny gate: `done` stále vyžaduje všetky
+  dokončené packety, čerstvú release suite a silný read-only Codex review.
+
+Voliteľný `routine_reviewer` má hodnotu `none`, `claude` alebo `codex`.
+Lean profily používajú `none`; classic predvolene `codex`. Pri hodnote
+`claude` neschválený read-only verdikt povoľuje jeden repair cyklus a potom
+eskaluje na Codex, nikdy však sám nevydá projektový status `done`.
+
+## Recovery a bootstrap hardening — 24. júl 2026
+
+Technické zlyhanie transportu alebo neplatný worker výsledok už nespotrebuje
+logický pokus aktívneho packetu. Forge po takom výsledku vráti
+`packet.attempts` na predchádzajúcu hodnotu, ale zachová skutočne spotrebovaný
+worker call aj uplynutý čas v continuation chain budgete. Nejde teda o reset
+nákladov ani o neobmedzené opakovanie.
+
+Ak finálny Codex review nájde po čerstvých zelených kontrolách ešte jednu
+ohraničenú opravu, môže ju autorizovať výhradne Python supervisor. Pre packet
+existuje najviac jeden taký final-review recovery pokus v celom perzistentnom
+pláne; worker ani text modelu si ho nemôžu prideliť alebo obnoviť.
+
+`packet_attempts_exhausted` znamená vyčerpanie pokusov konkrétneho packetu, nie
+vyčerpanie globálneho chain budgetu. Tento stav zakazuje automatický aj slepý
+manuálny resume toho istého packetu. Monitor ponúkne manuálny resume príkaz iba
+pri skutočnom `chain_budget_exhausted`; explicitne zadaný packet resume wrapper
+prijme iba vtedy, keď model-free `resume-eligibility` preukáže presnú
+jednorazovú final-review recovery autorizáciu. Inak nastaví `needs_human` a
+vyžiada opravu plánu alebo príčiny.
+
+Každý nový run ukladá presný kanonický `config.snapshot.json` a jeho SHA-256 do
+runu, výsledku aj continuation payloadu. Interný automatický resume odmietne
+legacy run bez snapshotu; explicitný resume ho smie načítať iba pod trusted
+supervisor konfiguráciou. Unattended resume vždy vynúti prísnejší bezpečnostný
+obal (sandbox, runtime preflight, finálny review, inkrementálne dôkazy,
+run-scoped logy, adaptívny supervisor a vypnutú cache), nie slabšie pôvodné
+nastavenie.
+
+Po skutočnom `chain_budget_exhausted` pridá explicitný ľudský resume jeden
+ohraničený základný budget tranche. Všetky už spotrebované počítadlá zostanú
+kumulatívne a prémiový limit sa nikdy nezvýši. Ďalšie tranche sú obmedzené
+absolútnymi limitmi schémy; interný child resume ich pridávať nesmie.
+
+Každý objavený check kontrakt obsahuje interný
+`forge internal bootstrap-integrity`. Pred projektovými checkmi vytvorí
+NUL-safe index untracked, unstaged aj staged zmien, skontroluje textové zmeny
+na konfliktové markery, trailing whitespace a bežné vzory tajomstiev a
+výstup rediguje na kategóriu, cestu a riadok bez hodnoty tajomstva.
+Samostatné `git diff --check` a `git diff --cached --check` pokrývajú pracovný
+strom aj index. Nový, odstránený alebo zmenený auto-discovered runner vyvolá
+viditeľný Codex consistency review. Bežné rozhodnutie `continue` kontrakt
+neuzamkne: re-lock vyžaduje osobitné štruktúrované schválenie, dôvod, presný
+redigovaný starý/nový rozdiel a opakovanú kontrolu tesne pred zápisom.
+Gradle/Android gate naďalej vyžaduje všetky čerstvé, platné a mimoprojektovo
+neunikajúce test reporty.
+
+Každý zapisujúci Forge run drží fail-fast projektový lock kompatibilný s
+Windows aj WSL/POSIX. Súbežný druhý Forge proces sa zastaví skôr, než by mohol
+prepísať ProjectPlan. Resume navyše po Git baseline znovu overí identitu a hash
+plánu aj check kontraktu tesne pred prvým perzistentným zápisom.
+
+Wrapper kontroluje bezpečnostné a eligibility polia podľa natívnych JSON typov.
+`ResumeLatest` po model-free kontrole pokračuje už iba s presným
+`source_run_id`. Live Monitor filtruje staré stavy podľa času konkrétneho
+spustenia, rešpektuje terminálny supervisor aj bez platného statusu a manuálny
+resume zobrazí až po potvrdenom supervisor `needs_continuation` s exit kódom 4.
+Vyčerpaný prémiový strop alebo neplatná budget schéma resume príkaz nevytvoria.
+
 ## Verification hardening — 24. júl 2026
 
 Aktuálna schema 4 pridáva strojovo čitateľný koniec runu:
@@ -133,7 +244,20 @@ Aktuálne lokálne Claude Code 2.1.205 v `--help` neuvádza `--max-turns`. Forge
   -Mode EconomyMax
 ```
 
-Ďalšie režimy wrappera sú `Android` (povinné Gradle kontroly) a `Strict` (vyžaduje Sandbox Runtime).
+Ďalšie režimy wrappera sú `Android` (povinné Gradle kontroly) a `Strict`.
+Na Windows wrapper spúšťa predvolený `EconomySafe` aj explicitný `Strict` cez
+auditovaný WSL2 strict runtime
+`Ubuntu-24.04` pod používateľom `forge`. Pred doctorom aj prvým workerom:
+
+- overí zhodu SHA-256 súborov `forge.py`, `forge_adaptive.py`,
+  `forge_reports.py` a `forge.strict.config.json` medzi Windows inštaláciou a
+  WSL mirrorom,
+- overí WSL Python 3.11+ s `pydantic`,
+- overí `srt --version` a spustí funkčný model-free SRT canary,
+- bezpečne preloží samostatnú lokálnu Windows cestu projektu na `/mnt/<disk>/...`.
+
+Ak niektorá kontrola zlyhá, wrapper skončí pred modelovým volaním. Natívny
+Windows worker sa pre `EconomySafe` ani `Strict` nepoužije ako tichý fallback.
 
 ## Ako adaptívny cyklus funguje
 
@@ -175,6 +299,10 @@ Priamy CLI tvar:
 ```
 
 Hard budget zahŕňa child runy, Codex calls, worker calls, elapsed time, full check suites, prémiové použitia a no-progress udalosti. Počítadlá sa resume procesom neresetujú.
+Explicitný resume po `chain_budget_exhausted` môže pridať jeden ďalší
+ohraničený base tranche pre ne-prémiové limity; ide o zvýšenie stropu so
+zachovanými kumulatívnymi počítadlami, nie o ich reset. Prémiový strop zostáva
+nemenný.
 
 Najnovší resumovateľný run možno vybrať aj pomocou `-ResumeLatest`. Pri priamom CLI je syntax:
 
@@ -186,7 +314,7 @@ Najnovší resumovateľný run možno vybrať aj pomocou `-ResumeLatest`. Pri pr
 
 Resume zachová pôvodné logy, nastaví `parent_run_id` a `continuation_chain_id` a prenesie časové, worker, check aj prémiové počítadlá. Ak sa fingerprint nezmenil, pokračuje presným uloženým `next_prompt` bez nového všeobecného architecture auditu. Ak sa repozitár zmenil mimo Forge, najprv prebehne krátky read-only Codex consistency review pôvodného promptu, externých zmien a posledných kontrol.
 
-Vonkajší Codex ani wrapper po stave `needs_continuation` nespúšťajú nový generický run. Jediný Python supervisor proces môže vykonať ďalší child run iba explicitným validovaným resume presného source runu. Keď sa vyčerpá chain budget, wrapper oznámi manuálny resume príkaz.
+Vonkajší Codex ani wrapper po stave `needs_continuation` nespúšťajú nový generický run. Jediný Python supervisor proces môže vykonať ďalší child run iba explicitným validovaným resume presného source runu. Keď sa vyčerpá chain budget, wrapper oznámi manuálny resume príkaz. Vyčerpanie pokusov jedného packetu je odlišný terminálny dôvod: resume sa neponúka a Forge nastaví `needs_human`, aby sa neopakoval už nefunkčný postup.
 
 Stavový a exit-code model:
 
@@ -235,7 +363,7 @@ Wrapper automaticky otvorí Live Monitor. Predvolené zobrazenie je laická **Va
 - `Nasleduje`,
 - `Váš zásah`.
 
-Ak existuje ProjectPlan, percento sa počíta z dokončených packetov. Staršie projekty môžu použiť Markdown checkboxy v `SPEC.md`; až potom monitor použije odhad fázy. Lokálny heartbeat odlišuje aktívnu prácu, dlhý test, tichý subprocess a pravdepodobný hang bez modelového pollingu. Technické príkazy, Git diff a surový live denník sa v predvolenom zobrazení nezobrazujú.
+Ak existuje ProjectPlan, percento sa počíta z dokončených packetov. Staršie projekty môžu použiť Markdown checkboxy v `SPEC.md`; až potom monitor použije odhad fázy. Lokálny heartbeat odlišuje aktívnu prácu, dlhý test, tichý subprocess a pravdepodobný hang bez modelového pollingu. Terminálny stav sa už nezobrazuje ako nečinný alebo zaseknutý heartbeat: monitor číta `stop_reason_code`, `automatic_resume_allowed`, `needs_human` aj terminálny stav chain supervisora, rozlíši packet limit od chain budgetu a v poli `Váš zásah` zobrazí správny ďalší krok. Pri novom wrapper spustení ignoruje starú generáciu stavových súborov. Technické príkazy, Git diff a surový live denník sa v predvolenom zobrazení nezobrazujú.
 
 Manuálny príkaz:
 
@@ -262,7 +390,9 @@ Každá worker iterácia vytvára redigované súbory `NN-claude-prompt.txt`, `N
 - Claude používa `--safe-mode`, strict MCP, obmedzené tools, redigované settings a vypnutú session persistence.
 - Codex pracuje v read-only sandboxe a ignoruje používateľský config aj projektové rules.
 - Zakázané zostávajú push, publish, deploy, produkčné migrácie, cloud CLI, platené nákupy a práca s produkčnými tajomstvami.
-- Natívny Windows nemá plný Claude Bash sandbox. Pre najvyššiu izoláciu použi WSL2/Linux a režim `Strict`.
+- Natívny Windows nemá plný Claude Bash sandbox. Predvolený Windows
+  `EconomySafe` preto rovnako ako `Strict` používa auditovaný WSL2 strict
+  runtime; zlyhanie izolácie nemá natívny fallback.
 - Bezobslužný `run-chain` bez overeného `srt` sa nespustí; natívny Windows bez `srt` podporuje iba priamo dohliadaný manuálny `run`.
 
 ## Inštalácia a doctor
@@ -289,11 +419,14 @@ python -m py_compile .\forge.py
 python -m unittest discover -s .\tests -v
 ```
 
-Testy používajú falošné Codex a Claude CLI procesy. Aktuálna sada obsahuje 188
-unit, integračných, bezpečnostných, reportových a canary scenárov.
-Multi-packet fake E2E simuluje odmietnutý economy model, bezpečný
+Testy používajú falošné Codex a Claude CLI procesy a pokrývajú unit,
+integračné, bezpečnostné, reportové a canary scenáre. Multi-packet fake E2E
+simuluje odmietnutý economy model, bezpečný
 fallback, economy aj complex packet, reportované test counts, automatické
 resume, čerstvú release suite a `done` — bez reálneho modelového volania.
+Maintainer validácia 24. júla 2026 prešla v rozsahu 278/278 testov; zahŕňa aj
+resume race, supervisor terminalizáciu, wrapper JSON typy, monitor stale/dead
+stavy, bootstrap tajomstvá a staged/symlink scenáre.
 
 Model-free fixtures v `canaries/` pokrývajú pytest, Vitest, Playwright a
 multi-module Android unit reporty. Android instrumentation zostáva manuálnym

@@ -46,6 +46,13 @@ class CheckContractTests(unittest.TestCase):
         second = self.contract()
         self.assertEqual(first.contract_hash, second.contract_hash)
 
+    def test_contract_rejects_duplicate_check_ids(self):
+        duplicate = self.definition.model_copy(
+            update={"command": "npm run test -- --coverage"}
+        )
+        with self.assertRaisesRegex(ValueError, "duplicate check IDs: unit"):
+            self.contract([self.definition, duplicate])
+
     def test_json_key_order_does_not_change_hash(self):
         contract = self.contract()
         payload = contract.model_dump(mode="json")
@@ -99,6 +106,115 @@ class CheckContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cannot be disabled"):
             adaptive.validate_contract_update(
                 previous, proposed, justification="Worker proposal."
+            )
+
+    def test_command_cannot_be_substituted_under_same_id(self):
+        previous = self.contract()
+        substituted = self.definition.model_copy(
+            update={"command": "npm run lint"}
+        )
+        proposed = self.contract([substituted])
+        with self.assertRaisesRegex(ValueError, "cannot be substituted"):
+            adaptive.validate_contract_update(
+                previous, proposed, justification="Codex proposal."
+            )
+
+    def test_report_semantics_cannot_be_weakened_under_same_id(self):
+        previous = self.contract()
+        weakened = self.definition.model_copy(
+            update={"report_format": "text", "report_path": None}
+        )
+        proposed = self.contract([weakened])
+        with self.assertRaisesRegex(ValueError, "report_format|report_path"):
+            adaptive.validate_contract_update(
+                previous, proposed, justification="Codex proposal."
+            )
+
+    def test_legacy_positional_auto_ids_migrate_only_by_exact_semantics(self):
+        config = {
+            **forge.DEFAULT_CONFIG,
+            "adaptive_orchestration": True,
+            "check_definitions": [],
+        }
+        semantic = forge.discover_check_definitions(
+            self.project, config, "release"
+        )
+        legacy = [
+            item.model_copy(update={"check_id": f"auto-{index:02d}"})
+            for index, item in enumerate(semantic, start=1)
+        ]
+        previous = adaptive.build_check_contract(
+            self.project,
+            legacy,
+            source="validated_auto_discovery",
+            stacks=["any"],
+            change_reason="Legacy positional IDs.",
+        )
+        proposed = adaptive.build_check_contract(
+            self.project,
+            semantic,
+            source="validated_auto_discovery",
+            stacks=["any"],
+            change_reason="Stable semantic IDs.",
+        )
+        adaptive.validate_contract_update(
+            previous,
+            proposed,
+            justification="Reviewed one-time bijective identity migration.",
+        )
+
+        substituted = list(semantic)
+        target = next(
+            item for item in substituted if item.command == "git diff --check"
+        )
+        substituted[substituted.index(target)] = target.model_copy(
+            update={"command": "git diff --stat"}
+        )
+        weakened = adaptive.build_check_contract(
+            self.project,
+            substituted,
+            source="validated_auto_discovery",
+            stacks=["any"],
+            change_reason="Unsafe migration.",
+        )
+        with self.assertRaises(ValueError):
+            adaptive.validate_contract_update(
+                previous,
+                weakened,
+                justification="Must not migrate changed semantics.",
+            )
+
+        legacy_pytest = adaptive.CheckDefinition(
+            check_id="auto-01",
+            command="python -m pytest",
+            tier="release",
+            required_before_done=True,
+            check_kind="test",
+            require_test_execution=True,
+        )
+        legacy_contract = adaptive.build_check_contract(
+            self.project,
+            [legacy_pytest],
+            source="explicit_project_config",
+            stacks=["any"],
+            change_reason="Legacy positional ID.",
+        )
+        arbitrary_identity = adaptive.build_check_contract(
+            self.project,
+            [
+                legacy_pytest.model_copy(
+                    update={"check_id": "auto-arbitrary-pytest"}
+                )
+            ],
+            source="explicit_project_config",
+            stacks=["any"],
+            change_reason="Non-canonical identity.",
+        )
+        with self.assertRaises(ValueError):
+            adaptive.validate_contract_update(
+                legacy_contract,
+                arbitrary_identity,
+                justification="Exact semantics alone cannot choose an arbitrary ID.",
             )
 
     def test_structured_allowlisted_codex_proposal_is_materialized(self):

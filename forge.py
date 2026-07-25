@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import platform
 import queue
@@ -14,9 +15,10 @@ import tempfile
 import textwrap
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, TextIO
+from typing import Any, Iterator, Literal, TextIO
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -30,16 +32,22 @@ from forge_adaptive import (
     PacketUpdate,
     PlanPatch,
     ProjectPlan,
+    ReviewIssue,
     WorkPacket,
     apply_plan_patch,
+    atomic_json,
+    authorize_final_review_recovery,
+    begin_packet_attempt,
     bootstrap_packet,
     build_check_contract,
-    budget_exhaustion,
     build_evidence_index,
     choose_codex_profile,
     choose_worker_profile,
     classify_worker_termination,
     collect_indirect_check_sources,
+    collision_safe_auto_check_id,
+    config_hash,
+    dependency_ready_packet,
     detect_test_count,
     export_schemas,
     git_baseline,
@@ -47,11 +55,13 @@ from forge_adaptive import (
     normalize_check_definitions,
     packet_attempt_budget_exhausted,
     plan_hash,
+    refund_packet_attempt,
     resolve_worker_runtime,
     MODEL_FALLBACK_REASONS,
     save_plan,
     select_check_definitions,
     stable_project_identity,
+    validate_lean_initial_plan,
     validate_check_report,
     validate_contract_update,
     write_assumptions,
@@ -65,16 +75,115 @@ EXIT_BLOCKED = 2
 EXIT_SUBSCRIPTION_LIMIT = 3
 EXIT_NEEDS_CONTINUATION = 4
 
+_PROJECT_RUN_LOCKS_GUARD = threading.Lock()
+_PROJECT_RUN_LOCKS: dict[str, threading.Lock] = {}
+
 
 TEXT_EXTENSIONS = {
     ".py", ".js", ".jsx", ".ts", ".tsx", ".json", ".md", ".toml", ".yaml", ".yml",
     ".html", ".css", ".scss", ".sql", ".sh", ".ps1", ".bat", ".txt", ".env.example",
-    ".java", ".kt", ".go", ".rs", ".php", ".rb", ".cs", ".xml", ".graphql",
+    ".java", ".kt", ".kts", ".gradle", ".properties", ".go", ".rs", ".php", ".rb",
+    ".cs", ".xml", ".graphql", ".c", ".cc", ".cpp", ".h", ".hpp", ".swift", ".dart",
+    ".ini", ".cfg", ".conf", ".csv",
 }
+
+FORGE_BOOTSTRAP_CHECK_COMMAND = "forge internal bootstrap-integrity"
+BOOTSTRAP_SCAN_MAX_FILES = 5_000
+BOOTSTRAP_SCAN_MAX_FILE_BYTES = 2_000_000
+BOOTSTRAP_SCAN_MAX_TOTAL_BYTES = 50_000_000
+BOOTSTRAP_SCAN_MAX_ISSUES = 100
+BOOTSTRAP_TEXT_FILENAMES = {
+    ".dockerignore",
+    ".editorconfig",
+    ".gitattributes",
+    ".gitignore",
+    ".npmrc",
+    "dockerfile",
+    "gemfile",
+    "gradlew",
+    "makefile",
+    "procfile",
+}
+BOOTSTRAP_FIXTURE_PARTS = {
+    "__snapshots__",
+    "fixture",
+    "fixtures",
+    "golden",
+    "snapshot",
+    "snapshots",
+    "test-data",
+    "testdata",
+}
+BOOTSTRAP_CONFLICT_OPEN_RE = re.compile(r"^<{7}(?: .*)?$")
+BOOTSTRAP_CONFLICT_BASE_RE = re.compile(r"^\|{7}(?: .*)?$")
+BOOTSTRAP_CONFLICT_CLOSE_RE = re.compile(r"^>{7}(?: .*)?$")
+BOOTSTRAP_PRIVATE_KEY_RE = re.compile(
+    r"-----BEGIN (?:[A-Z0-9]+ )?PRIVATE KEY-----"
+    r".{32,}?"
+    r"-----END (?:[A-Z0-9]+ )?PRIVATE KEY-----",
+    re.DOTALL,
+)
+BOOTSTRAP_KNOWN_SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "aws-access-key",
+        re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
+    ),
+    (
+        "github-token",
+        re.compile(
+            r"\b(?:gh[pousr]_[A-Za-z0-9]{36,255}|"
+            r"github_pat_[A-Za-z0-9_]{22,255})\b"
+        ),
+    ),
+    (
+        "slack-token",
+        re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{20,255}\b"),
+    ),
+    (
+        "provider-secret-key",
+        re.compile(
+            r"\b(?:sk-(?:ant-)?[A-Za-z0-9_-]{20,255}|"
+            r"sk_live_[A-Za-z0-9]{20,255})\b"
+        ),
+    ),
+)
+BOOTSTRAP_SECRET_ASSIGNMENT_RE = re.compile(
+    r"""(?ix)
+    ["']?\b(api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|
+       password|passwd)\b["']?
+    \s*[:=]\s*
+    ["']?([A-Za-z0-9_./+@=-]{16,255})
+    """
+)
 
 
 class Decision(AdaptiveDecision):
     """Versioned strict Codex decision with legacy fields kept readable."""
+
+
+def normalize_codex_decision_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Drop only an ineffective drift reason paired with native JSON false.
+
+    The approval boolean is security-sensitive.  This normalization never
+    coerces it, never changes ``true``, and rejects non-boolean JSON values
+    before Pydantic can coerce them.  The strict Decision model remains
+    unchanged; this is the single transport normalization permitted between a
+    Codex JSON artifact and model validation.
+    """
+
+    if not isinstance(payload, dict):
+        raise ValueError("Codex decision payload must be a JSON object.")
+    normalized = dict(payload)
+    if "approve_check_contract_drift" in payload:
+        approval = payload["approve_check_contract_drift"]
+        if type(approval) is not bool:
+            raise ValueError(
+                "approve_check_contract_drift must be a native JSON boolean."
+            )
+        reason = payload.get("check_contract_approval_reason")
+        if approval is False and isinstance(reason, str) and reason.strip():
+            normalized["check_contract_approval_reason"] = ""
+    return normalized
 
 
 class CheckResult(BaseModel):
@@ -110,6 +219,7 @@ class WorkerResult(BaseModel):
     effort: str = ""
     escalated: bool = False
     termination_reason: str = "unknown"
+    valid_worker_outcome: bool = True
     requested_turn_budget: int | None = None
     cli_turn_limit_enforced: bool = False
     effective_timeout: int | None = None
@@ -122,6 +232,26 @@ class RoutedWorkerOutcome(BaseModel):
     premium_calls: int = 0
     model_fallbacks: int = 0
     unavailable_models: dict[str, str] = Field(default_factory=dict)
+
+
+class ClaudeReviewIssue(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    file_path: str = ""
+    description: str = Field(min_length=1)
+
+
+class ClaudeReviewVerdict(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    approve: bool
+    issues: list[ClaudeReviewIssue] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def require_issues_when_rejected(self) -> "ClaudeReviewVerdict":
+        if not self.approve and not self.issues:
+            raise ValueError("A rejected Claude review requires at least one issue.")
+        return self
 
 
 class ContinuationPayload(BaseModel):
@@ -153,6 +283,15 @@ class ContinuationPayload(BaseModel):
     unavailable_models: dict[str, str] = Field(default_factory=dict)
     chain_model_fallbacks: int = 0
     check_contract_hash: str | None = None
+    config_hash: str | None = None
+    base_chain_budgets: ChainBudgets | None = None
+    effective_chain_budgets: ChainBudgets | None = None
+    budget_extension_count: int = Field(default=0, ge=0)
+    last_budget_extension_source_run_id: str | None = None
+
+
+ResumeKind = Literal["direct_manual", "explicit_human", "internal_automatic"]
+CONFIG_INTEGRITY_VERSION = 1
 
 
 StopReasonCode = Literal[
@@ -294,6 +433,10 @@ def redact_text(text: str) -> str:
             r"(?i)\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|passwd|"
             r"secret|client[_-]?secret|connection[_-]?string)\b\s*[:=]\s*"
             r"(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+        ),
+        re.compile(
+            r"(?i)--(?:api[-_]?key|access[-_]?token|token|password|secret|"
+            r"client[-_]?secret)(?:=|\s+)(?:\"[^\"]*\"|'[^']*'|[^\s]+)"
         ),
         re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}"),
         re.compile(
@@ -621,6 +764,7 @@ DEFAULT_CONFIG = {
     "claude_bare_mode": False,
     "claude_safe_mode": True,
     "claude_strict_mcp": True,
+    "claude_outer_srt_on_wsl": True,
     "claude_tools": "Bash,Read,Edit,Write,Glob,Grep",
     "security_profile": "balanced",
     "final_review_after_last_worker": True,
@@ -632,6 +776,10 @@ DEFAULT_CONFIG = {
     # construct DEFAULT_CONFIG directly.
     "adaptive_orchestration": False,
     "adaptive_auto_supervisor": False,
+    # Audited JSON profiles opt into lean.  Keeping the in-code fallback
+    # classic preserves callers that construct DEFAULT_CONFIG directly.
+    "orchestration_style": "classic",
+    "routine_reviewer": "codex",
     "claude_supports_model": True,
     "claude_supports_effort": True,
     # Claude Code 2.1.205 does not advertise --max-turns. Forge therefore
@@ -686,6 +834,11 @@ DEFAULT_CONFIG = {
                     {"model": "sonnet", "effort": "high"},
                 ],
             },
+            "claude_reviewer": {
+                "max_turns": 10,
+                "reason": "Read-only structured review after green milestone checks.",
+                "candidates": [{"model": "sonnet", "effort": "low"}],
+            },
         },
         "codex": {
             "architecture": {"phase": "architecture"},
@@ -730,6 +883,11 @@ Pravidlá:
 18. Rescue alebo frontier odporuč iba s konkrétnym dôkazom náročnosti alebo zaseknutia. Samotný max-turns alebo non-zero exit nestačí.
 19. complete_project povoľ iba po čerstvej úspešnej release suite; done zostáva výhradne na finálny read-only review.
 20. plan_patch musí byť minimálny, vysvetlený a nesmie potichu meniť pôvodný cieľ.
+21. approve_check_contract_drift ponechaj false, pokiaľ prompt neobsahuje presný
+    CHECK-CONTRACT SEMANTIC DIFF a neporovnal si každé staré/nové pole aj hash
+    nepriameho zdroja. True smieš nastaviť iba ak sa žiadna povinná bezpečnostná,
+    testovacia ani reportovacia kontrola neoslabuje; vždy pridaj konkrétny
+    check_contract_approval_reason.
 """.strip()
 
 
@@ -1128,6 +1286,91 @@ def validate_existing_project_path(project: Path) -> Path:
     return project
 
 
+@contextmanager
+def project_run_lock(
+    project: Path,
+    *,
+    create_forge_directory: bool,
+) -> Iterator[None]:
+    """Hold one fail-fast Forge writer lock for a project across platforms."""
+    project = project.resolve()
+    forge_dir = project / ".forge"
+    if create_forge_directory:
+        forge_dir.mkdir(parents=True, exist_ok=True)
+    elif not forge_dir.is_dir():
+        raise RuntimeError(
+            "Project has no .forge state directory; a resume lock cannot be acquired."
+        )
+
+    key = str(project).casefold()
+    with _PROJECT_RUN_LOCKS_GUARD:
+        process_lock = _PROJECT_RUN_LOCKS.setdefault(key, threading.Lock())
+    if not process_lock.acquire(blocking=False):
+        raise RuntimeError(
+            "Another Forge run is already active for this project. "
+            "Wait for its terminal state instead of starting a concurrent writer."
+        )
+
+    lock_path = forge_dir / "project-run.lock"
+    descriptor: int | None = None
+    os_lock_acquired = False
+    try:
+        descriptor = os.open(
+            str(lock_path),
+            os.O_CREAT | os.O_RDWR,
+            0o600,
+        )
+        if os.fstat(descriptor).st_size < 1:
+            os.write(descriptor, b"\0")
+            os.fsync(descriptor)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.lockf(
+                    descriptor,
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    1,
+                    0,
+                    os.SEEK_SET,
+                )
+            os_lock_acquired = True
+        except (OSError, BlockingIOError) as exc:
+            raise RuntimeError(
+                "Another Forge process is already active for this project. "
+                "Concurrent project-plan writers are not allowed."
+            ) from exc
+        yield
+    finally:
+        if descriptor is not None:
+            if os_lock_acquired:
+                try:
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    if os.name == "nt":
+                        import msvcrt
+
+                        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.lockf(
+                            descriptor,
+                            fcntl.LOCK_UN,
+                            1,
+                            0,
+                            os.SEEK_SET,
+                        )
+                except OSError:
+                    pass
+            os.close(descriptor)
+        process_lock.release()
+
+
 def load_json_object(path: Path, label: str) -> dict[str, Any]:
     if not path.is_file():
         raise RuntimeError(f"{label} sa nenašiel: {path}")
@@ -1226,15 +1469,2662 @@ def resolve_resume_run_directory(project: Path, requested_run_id: str) -> Path:
     return candidates[0]
 
 
-def load_resume_context(project: Path, requested_run_id: str) -> dict[str, Any]:
+def _validate_resume_kind(resume_kind: str) -> ResumeKind:
+    if resume_kind not in {
+        "direct_manual",
+        "explicit_human",
+        "internal_automatic",
+    }:
+        raise RuntimeError(f"Unsupported resume kind: {resume_kind!r}.")
+    return resume_kind
+
+
+def _canonical_config_snapshot(config: dict[str, Any]) -> dict[str, Any]:
+    try:
+        snapshot = json.loads(
+            json.dumps(
+                config,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "Forge config is not a canonical JSON object."
+        ) from exc
+    if not isinstance(snapshot, dict):
+        raise RuntimeError("Canonical Forge config snapshot is not a JSON object.")
+    return snapshot
+
+
+def _verified_resume_config(
+    source_directory: Path,
+    source_run: dict[str, Any],
+    source_result: dict[str, Any],
+    continuation: ContinuationPayload,
+    *,
+    resume_kind: ResumeKind,
+) -> tuple[dict[str, Any], str | None, bool]:
+    raw_config = source_run.get("config")
+    if not isinstance(raw_config, dict):
+        raise RuntimeError(
+            f"Run {source_directory.name} nemá čitateľnú použitú konfiguráciu."
+        )
+
+    integrity_version = int(source_run.get("config_integrity_version") or 0)
+    if integrity_version == 0:
+        if resume_kind == "internal_automatic":
+            raise RuntimeError(
+                "Legacy run without a canonical config snapshot cannot be resumed "
+                "automatically. An explicit supervised resume is required."
+            )
+        merged = DEFAULT_CONFIG.copy()
+        merged.update(raw_config)
+        validate_config(merged)
+        return merged, None, True
+
+    if integrity_version != CONFIG_INTEGRITY_VERSION:
+        raise RuntimeError(
+            f"Unsupported config integrity version {integrity_version}; resume "
+            "stopped safely."
+        )
+    snapshot_name = source_run.get("config_snapshot_file")
+    if snapshot_name != "config.snapshot.json":
+        raise RuntimeError(
+            "Source run does not reference the canonical config.snapshot.json."
+        )
+    snapshot_path = source_directory / "config.snapshot.json"
+    if (
+        not snapshot_path.is_file()
+        or snapshot_path.resolve().parent != source_directory.resolve()
+    ):
+        raise RuntimeError(
+            "Canonical config snapshot must be a regular file inside the source "
+            "run directory."
+        )
+    snapshot = load_json_object(
+        snapshot_path,
+        "Canonical Forge config snapshot",
+    )
+    if snapshot != raw_config:
+        raise RuntimeError(
+            "Source run config differs from its canonical snapshot; resume stopped "
+            "before worker execution."
+        )
+    expected_hash = source_run.get("config_hash")
+    if not isinstance(expected_hash, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", expected_hash
+    ):
+        raise RuntimeError("Source run has no valid canonical config hash.")
+    actual_hash = config_hash(snapshot)
+    if actual_hash != expected_hash:
+        raise RuntimeError(
+            "Canonical config snapshot hash mismatch; resume stopped before worker "
+            "execution."
+        )
+    if continuation.config_hash != expected_hash:
+        raise RuntimeError(
+            "Continuation config hash does not match the source run snapshot."
+        )
+    if (
+        int(source_result.get("config_integrity_version") or 0)
+        != CONFIG_INTEGRITY_VERSION
+        or source_result.get("config_hash") != expected_hash
+        or source_result.get("config_snapshot_file") != "config.snapshot.json"
+    ):
+        raise RuntimeError(
+            "Result config integrity metadata does not match the source run."
+        )
+    merged = DEFAULT_CONFIG.copy()
+    merged.update(snapshot)
+    validate_config(merged)
+    return merged, expected_hash, False
+
+
+def _chain_budget_exhaustion_reason(
+    counters: ChainCounters,
+    budgets: ChainBudgets,
+) -> str | None:
+    limits = (
+        ("child runs", counters.child_runs, budgets.max_child_runs),
+        ("Codex calls", counters.codex_calls, budgets.max_codex_calls),
+        ("worker calls", counters.worker_calls, budgets.max_worker_calls),
+        (
+            "elapsed seconds",
+            counters.elapsed_seconds,
+            budgets.max_elapsed_seconds,
+        ),
+        (
+            "full check suites",
+            counters.full_check_suites,
+            budgets.max_full_check_suites,
+        ),
+        (
+            "no-progress events",
+            counters.no_progress_events,
+            budgets.max_no_progress_events,
+        ),
+    )
+    for label, current, maximum in limits:
+        if current >= maximum:
+            return (
+                f"Continuation chain budget exhausted: {label}={current}, "
+                f"limit={maximum}."
+            )
+    return None
+
+
+def _extend_chain_budget_tranche(
+    base: ChainBudgets,
+    effective: ChainBudgets,
+) -> ChainBudgets:
+    payload = effective.model_dump(mode="json")
+    for field in (
+        "max_child_runs",
+        "max_codex_calls",
+        "max_worker_calls",
+        "max_elapsed_seconds",
+        "max_full_check_suites",
+        "max_no_progress_events",
+    ):
+        payload[field] = int(payload[field]) + int(getattr(base, field))
+    # A human budget tranche may buy more bounded routine work, never another
+    # premium escalation.
+    payload["max_premium_escalations"] = effective.max_premium_escalations
+    try:
+        return ChainBudgets.model_validate(payload)
+    except Exception as exc:
+        raise RuntimeError(
+            "Another bounded budget tranche would exceed Forge's absolute chain "
+            "limits; resume stopped safely."
+        ) from exc
+
+
+def _resolve_resume_budgets(
+    source_run: dict[str, Any],
+    source_result: dict[str, Any],
+    continuation: ContinuationPayload,
+    config: dict[str, Any],
+    *,
+    source_run_id: str,
+    source_stop_reason: str,
+    resume_kind: ResumeKind,
+    legacy_config_compatibility: bool,
+) -> tuple[ChainBudgets, ChainBudgets, int, bool]:
+    configured = ChainBudgets.model_validate(config.get("chain_budgets", {}))
+    base = continuation.base_chain_budgets
+    effective = continuation.effective_chain_budgets
+    extension_count = continuation.budget_extension_count
+
+    if base is None and effective is None and legacy_config_compatibility:
+        base = configured
+        effective = configured
+        extension_count = 0
+    elif base is None or effective is None:
+        raise RuntimeError(
+            "Continuation has incomplete persisted chain budget metadata."
+        )
+
+    assert base is not None and effective is not None
+    if effective.max_premium_escalations != base.max_premium_escalations:
+        raise RuntimeError(
+            "Persisted effective premium ceiling differs from the immutable base "
+            "premium ceiling."
+        )
+    scalable_budget_fields = (
+        "max_child_runs",
+        "max_codex_calls",
+        "max_worker_calls",
+        "max_elapsed_seconds",
+        "max_full_check_suites",
+        "max_no_progress_events",
+    )
+    multiplier = extension_count + 1
+    if any(
+        int(getattr(effective, field))
+        != int(getattr(base, field)) * multiplier
+        for field in scalable_budget_fields
+    ):
+        raise RuntimeError(
+            "Persisted effective chain budgets violate the cumulative tranche "
+            "algebra: effective must equal base * (extension_count + 1)."
+        )
+    extension_source = continuation.last_budget_extension_source_run_id
+    if extension_count == 0 and extension_source is not None:
+        raise RuntimeError(
+            "A zero-extension continuation cannot name a budget extension source."
+        )
+    if extension_count > 0 and (
+        not isinstance(extension_source, str)
+        or not re.fullmatch(r"[A-Za-z0-9_.-]+", extension_source)
+    ):
+        raise RuntimeError(
+            "An extended continuation must preserve a valid last budget extension "
+            "source run ID."
+        )
+    if configured != effective:
+        raise RuntimeError(
+            "Source config chain budgets do not match the persisted effective "
+            "chain budgets."
+        )
+
+    if not legacy_config_compatibility:
+        expected_base = base.model_dump(mode="json")
+        expected_effective = effective.model_dump(mode="json")
+        if (
+            source_run.get("base_chain_budgets") != expected_base
+            or source_run.get("effective_chain_budgets") != expected_effective
+            or int(source_run.get("budget_extension_count") or 0)
+            != extension_count
+            or source_result.get("base_chain_budgets") != expected_base
+            or source_result.get("effective_chain_budgets") != expected_effective
+            or int(source_result.get("budget_extension_count") or 0)
+            != extension_count
+            or source_run.get("last_budget_extension_source_run_id")
+            != continuation.last_budget_extension_source_run_id
+            or source_result.get("last_budget_extension_source_run_id")
+            != continuation.last_budget_extension_source_run_id
+        ):
+            raise RuntimeError(
+                "Persisted chain budget metadata differs between run, result, and "
+                "continuation."
+            )
+
+    counters = ChainCounters(
+        child_runs=continuation.chain_child_runs,
+        codex_calls=continuation.chain_codex_calls,
+        worker_calls=continuation.chain_worker_calls,
+        elapsed_seconds=continuation.chain_elapsed_seconds,
+        full_check_suites=continuation.chain_full_check_suites,
+        premium_escalations=continuation.chain_premium_escalations,
+        no_progress_events=continuation.chain_no_progress_events,
+    )
+    budget_reason = _chain_budget_exhaustion_reason(counters, effective)
+    extended = False
+    if source_stop_reason == "chain_budget_exhausted":
+        if resume_kind == "internal_automatic":
+            raise RuntimeError(
+                "Automatic child resume cannot extend an exhausted chain budget."
+            )
+        if budget_reason is None:
+            raise RuntimeError(
+                "Source claims chain_budget_exhausted but persisted counters do not "
+                "reach an effective chain ceiling."
+            )
+        effective = _extend_chain_budget_tranche(base, effective)
+        extension_count += 1
+        extended = True
+        config["chain_budgets"] = effective.model_dump(mode="json")
+    elif budget_reason is not None:
+        raise RuntimeError(
+            "Continuation counters already exhaust the chain budget, but the "
+            "structured stop reason is not chain_budget_exhausted."
+        )
+
+    continuation.base_chain_budgets = base
+    continuation.effective_chain_budgets = effective
+    continuation.budget_extension_count = extension_count
+    if extended:
+        continuation.last_budget_extension_source_run_id = source_run_id
+    return base, effective, extension_count, extended
+
+
+def _restricted_csv(source: Any, supervisor: Any) -> str:
+    source_items = [
+        item.strip() for item in str(source or "").split(",") if item.strip()
+    ]
+    supervisor_items = [
+        item.strip() for item in str(supervisor or "").split(",") if item.strip()
+    ]
+    supervisor_lookup = {item.casefold() for item in supervisor_items}
+    return ",".join(
+        item for item in source_items if item.casefold() in supervisor_lookup
+    )
+
+
+def enforce_unattended_resume_config(
+    source_config: dict[str, Any],
+    supervisor_config: dict[str, Any],
+    *,
+    in_wsl: bool | None = None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Keep source behavior while applying the stricter unattended safety envelope."""
+    validate_config(source_config)
+    validate_config(supervisor_config)
+    wsl = running_in_wsl() if in_wsl is None else in_wsl
+    if supervisor_config.get("unattended_requires_sandbox") is not True:
+        raise RuntimeError(
+            "Unattended run-chain cannot disable unattended_requires_sandbox."
+        )
+    if wsl and (
+        str(supervisor_config.get("security_profile", "")).lower() != "strict"
+        or supervisor_config.get("claude_outer_srt_on_wsl") is not True
+    ):
+        raise RuntimeError(
+            "Unattended WSL2 resume requires a strict supervisor config with "
+            "claude_outer_srt_on_wsl=true."
+        )
+
+    effective = dict(source_config)
+    original = _canonical_config_snapshot(effective)
+    for key in (
+        "require_chatgpt_auth",
+        "strict_subscription_auth",
+        "ignore_codex_user_config",
+        "ignore_codex_rules",
+        "claude_safe_mode",
+        "claude_strict_mcp",
+        "unattended_requires_sandbox",
+        "runtime_preflight",
+        "final_review_after_last_worker",
+        "incremental_evidence",
+        "run_scoped_logs",
+        "adaptive_orchestration",
+        "adaptive_auto_supervisor",
+    ):
+        effective[key] = True
+    effective["claude_bare_mode"] = False
+    effective["check_cache_enabled"] = False
+    effective["mode"] = supervisor_config.get("mode") or (
+        "economy-safe-strict"
+        if str(supervisor_config.get("security_profile", "")).lower() == "strict"
+        else source_config.get("mode", "economy-safe")
+    )
+
+    source_profile = str(source_config.get("security_profile", "")).lower()
+    supervisor_profile = str(
+        supervisor_config.get("security_profile", "")
+    ).lower()
+    effective["security_profile"] = (
+        "strict"
+        if "strict" in {source_profile, supervisor_profile} or wsl
+        else supervisor_config.get("security_profile", source_profile)
+    )
+    sandbox_rank = {"off": 0, "auto": 1, "required": 2}
+    source_sandbox = str(source_config.get("sandbox_checks", "auto")).lower()
+    supervisor_sandbox = str(
+        supervisor_config.get("sandbox_checks", "auto")
+    ).lower()
+    if source_sandbox not in sandbox_rank or supervisor_sandbox not in sandbox_rank:
+        raise RuntimeError("Invalid sandbox_checks value in resume config.")
+    selected_sandbox = max(
+        (source_sandbox, supervisor_sandbox),
+        key=lambda value: sandbox_rank[value],
+    )
+    effective["sandbox_checks"] = "required" if wsl else selected_sandbox
+    effective["claude_outer_srt_on_wsl"] = bool(
+        source_config.get("claude_outer_srt_on_wsl", True)
+        or supervisor_config.get("claude_outer_srt_on_wsl", True)
+        or wsl
+    )
+
+    supervisor_permission = str(
+        supervisor_config.get("permission_mode", "auto")
+    )
+    if supervisor_permission.casefold() in {
+        "bypasspermissions",
+        "dangerously-skip-permissions",
+    }:
+        raise RuntimeError(
+            "Unsafe unattended Claude permission mode is not allowed."
+        )
+    effective["permission_mode"] = supervisor_permission
+    effective["claude_tools"] = _restricted_csv(
+        source_config.get("claude_tools"),
+        supervisor_config.get("claude_tools"),
+    )
+    source_domains = {
+        str(item).strip().casefold()
+        for item in source_config.get("check_network_domains", [])
+        if str(item).strip()
+    }
+    effective["check_network_domains"] = [
+        str(item).strip()
+        for item in supervisor_config.get("check_network_domains", [])
+        if str(item).strip().casefold() in source_domains
+    ]
+    validate_config(effective)
+    canonical_effective = _canonical_config_snapshot(effective)
+    changed = sorted(
+        key
+        for key in set(original) | set(canonical_effective)
+        if original.get(key) != canonical_effective.get(key)
+    )
+    return effective, changed
+
+
+def load_verified_adaptive_resume_state(
+    project: Path,
+    continuation: ContinuationPayload,
+    *,
+    goal: str | None = None,
+) -> tuple[dict[str, str], ProjectPlan, CheckContract]:
+    """Read and cross-check adaptive resume state without creating or repairing it."""
+    required_identity = {
+        "project_id": continuation.project_id,
+        "plan_id": continuation.plan_id,
+        "plan_hash": continuation.plan_hash,
+        "check_contract_hash": continuation.check_contract_hash,
+    }
+    missing = sorted(
+        name
+        for name, value in required_identity.items()
+        if not isinstance(value, str) or not value.strip()
+    )
+    if missing:
+        raise RuntimeError(
+            "Adaptive continuation identity is incomplete; missing: "
+            + ", ".join(missing)
+        )
+
+    identity = stable_project_identity(project, create_if_missing=False)
+    if continuation.project_id != identity["project_id"]:
+        raise RuntimeError("Resume project identity does not match the source run.")
+
+    plan_path = project / ".forge" / "project-plan.json"
+    if not plan_path.is_file():
+        raise RuntimeError("Persistent project plan is missing; resume stopped safely.")
+    try:
+        current_plan = ProjectPlan.model_validate_json(
+            plan_path.read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Persistent project plan is invalid; resume stopped safely."
+        ) from exc
+    if current_plan.plan_id != continuation.plan_id:
+        raise RuntimeError("Persistent plan identity does not match the source run.")
+    if goal is not None:
+        expected_goal_hash = hashlib.sha256(goal.encode("utf-8")).hexdigest()
+        if current_plan.goal_hash != expected_goal_hash:
+            raise RuntimeError(
+                "Persistent project plan belongs to a different product goal."
+            )
+    if plan_hash(current_plan) != continuation.plan_hash:
+        raise RuntimeError(
+            "Persistent project plan changed outside the source run; resume stopped "
+            "instead of silently executing a stale packet."
+        )
+
+    contract_path = project / ".forge" / "check-contract.json"
+    if not contract_path.is_file():
+        raise RuntimeError(
+            "Forge-owned check contract is missing; resume stopped safely."
+        )
+    try:
+        current_contract = CheckContract.model_validate_json(
+            contract_path.read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Forge-owned check contract is invalid; resume stopped safely."
+        ) from exc
+    if current_contract.contract_hash != continuation.check_contract_hash:
+        raise RuntimeError(
+            "Check contract hash changed since the source run; resume requires "
+            "a consistency review and stopped before worker execution."
+        )
+    if current_plan.check_contract_hash != current_contract.contract_hash:
+        raise RuntimeError(
+            "Persistent project plan and Forge-owned check contract disagree; "
+            "resume stopped before worker execution."
+        )
+    return identity, current_plan, current_contract
+
+
+POST_WORKER_DECISION_RECOVERY_ACTION = (
+    "validated_post_worker_decision_recovery"
+)
+RECOVERY_ATTEMPT_BUDGET_NORMALIZATION_ACTION = (
+    "validated_recovery_attempt_budget_normalization"
+)
+MAX_PROJECT_WORK_PACKETS = 12
+
+
+def _strict_nonnegative_counter(
+    payload: dict[str, Any], field: str, *, floating: bool = False
+) -> int | float:
+    value = payload.get(field)
+    if floating:
+        if type(value) not in {int, float}:
+            raise RuntimeError(
+                f"Post-worker decision recovery counter {field} is not a native "
+                "JSON number."
+            )
+        numeric = float(value)
+        if not math.isfinite(numeric) or numeric < 0:
+            raise RuntimeError(
+                f"Post-worker decision recovery counter {field} is invalid."
+            )
+        return numeric
+    if type(value) is not int or value < 0:
+        raise RuntimeError(
+            f"Post-worker decision recovery counter {field} is not a "
+            "non-negative native JSON integer."
+        )
+    return value
+
+
+def _decision_recovery_packet_id(
+    source_packet_id: str, source_run_id: str, raw_sha256: str
+) -> str:
+    suffix = (
+        "-decision-recovery-"
+        + hashlib.sha256(
+            f"{source_run_id}:{raw_sha256}".encode("utf-8")
+        ).hexdigest()[:12]
+    )
+    prefix_limit = 80 - len(suffix)
+    prefix = source_packet_id[:prefix_limit].rstrip("._-") or "packet"
+    packet_id = prefix + suffix
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", packet_id):
+        raise RuntimeError(
+            "Deterministic post-worker decision recovery packet ID is invalid."
+        )
+    return packet_id
+
+
+def _validated_decision_recovery_sha256(value: str | None) -> str:
+    candidate = str(value or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", candidate):
+        raise RuntimeError(
+            "Post-worker decision recovery requires an explicit audited lowercase "
+            "SHA-256 value."
+        )
+    return candidate
+
+
+def _decision_recovery_journal_path(
+    project: Path, source_run_id: str
+) -> Path:
+    return (
+        project
+        / ".forge"
+        / "decision-recovery-journals"
+        / f"{_safe_run_id(source_run_id)}.json"
+    )
+
+
+def _load_decision_recovery_journal(
+    project: Path, source_run_id: str
+) -> dict[str, Any] | None:
+    path = _decision_recovery_journal_path(project, source_run_id)
+    parent = path.parent
+    if not parent.exists():
+        return None
+    if not parent.is_dir() or parent.is_symlink():
+        raise RuntimeError(
+            "Decision-recovery journal directory is not a direct Forge-owned "
+            "directory."
+        )
+    if not path.exists():
+        return None
+    if (
+        not path.is_file()
+        or path.is_symlink()
+        or path.resolve().parent != parent.resolve()
+    ):
+        raise RuntimeError(
+            "Decision-recovery journal is not a direct Forge-owned regular file."
+        )
+    return load_json_object(path, "Decision-recovery journal")
+
+
+def _prepare_recovery_plan_for_persistence(plan: ProjectPlan) -> ProjectPlan:
+    prepared = ProjectPlan.model_validate(plan.model_dump(mode="json"))
+    prepared.updated_at = utc_now()
+    prepared.last_validated_at = prepared.updated_at
+    prepared.last_validation_summary = (
+        "Pydantic schema and plan invariants passed."
+    )
+    return ProjectPlan.model_validate(prepared.model_dump(mode="json"))
+
+
+def _mark_decision_recovery_child_started(
+    project: Path,
+    source_run_id: str,
+    child_run_id: str,
+) -> None:
+    journal = _load_decision_recovery_journal(project, source_run_id)
+    if (
+        journal is None
+        or journal.get("phase") != "prepared"
+        or journal.get("child_run_id") is not None
+    ):
+        raise RuntimeError(
+            "Decision-recovery journal cannot authorize another child run."
+        )
+    updated = dict(journal)
+    updated["phase"] = "child_started"
+    updated["child_run_id"] = _safe_run_id(child_run_id)
+    atomic_json(
+        _decision_recovery_journal_path(project, source_run_id),
+        updated,
+    )
+
+
+def _recovery_attempt_budget_normalization_journal_path(
+    project: Path, source_run_id: str
+) -> Path:
+    return (
+        project
+        / ".forge"
+        / "recovery-attempt-budget-normalization-journals"
+        / f"{_safe_run_id(source_run_id)}.json"
+    )
+
+
+def _load_recovery_attempt_budget_normalization_journal(
+    project: Path, source_run_id: str
+) -> dict[str, Any] | None:
+    path = _recovery_attempt_budget_normalization_journal_path(
+        project, source_run_id
+    )
+    parent = path.parent
+    if not parent.exists():
+        return None
+    if not parent.is_dir() or parent.is_symlink():
+        raise RuntimeError(
+            "Recovery-attempt normalization journal directory is not a direct "
+            "Forge-owned directory."
+        )
+    if not path.exists():
+        return None
+    if (
+        not path.is_file()
+        or path.is_symlink()
+        or path.resolve().parent != parent.resolve()
+    ):
+        raise RuntimeError(
+            "Recovery-attempt normalization journal is not a direct Forge-owned "
+            "regular file."
+        )
+    return load_json_object(
+        path, "Recovery-attempt normalization journal"
+    )
+
+
+def _mark_recovery_attempt_budget_normalization_child_started(
+    project: Path,
+    source_run_id: str,
+    child_run_id: str,
+) -> None:
+    journal = _load_recovery_attempt_budget_normalization_journal(
+        project, source_run_id
+    )
+    if (
+        journal is None
+        or journal.get("phase") != "prepared"
+        or journal.get("child_run_id") is not None
+    ):
+        raise RuntimeError(
+            "Recovery-attempt normalization journal cannot authorize another "
+            "child run."
+        )
+    updated = dict(journal)
+    updated["phase"] = "child_started"
+    updated["child_run_id"] = _safe_run_id(child_run_id)
+    atomic_json(
+        _recovery_attempt_budget_normalization_journal_path(
+            project, source_run_id
+        ),
+        updated,
+    )
+
+
+def _runtime_decision_for_recovery(
+    recovery: dict[str, Any],
+) -> Decision:
+    try:
+        decision = Decision.model_validate(recovery["normalized_decision"])
+    except Exception as exc:
+        raise RuntimeError(
+            "Normalized post-worker recovery decision is invalid."
+        ) from exc
+    payload = decision.model_dump(mode="json")
+    payload["active_packet_id"] = recovery["replacement_packet_id"]
+    payload["plan_patch"] = None
+    return Decision.model_validate(payload)
+
+
+def _assert_no_existing_recovery_child(
+    project: Path, source_run_id: str
+) -> None:
+    runs_directory = project / ".forge" / "runs"
+    if not runs_directory.is_dir():
+        return
+    for candidate in runs_directory.iterdir():
+        if candidate.name == source_run_id:
+            continue
+        if candidate.is_symlink():
+            raise RuntimeError(
+                "Post-worker decision recovery found a symlinked run entry; "
+                "one-shot lineage cannot be proven."
+            )
+        if not candidate.is_dir():
+            continue
+        run_path = candidate / "run.json"
+        if not run_path.exists():
+            continue
+        if (
+            not run_path.is_file()
+            or run_path.is_symlink()
+            or run_path.resolve().parent != candidate.resolve()
+        ):
+            raise RuntimeError(
+                "Post-worker decision recovery found an unsafe child run "
+                "artifact."
+            )
+        try:
+            child = load_json_object(run_path, "Forge child run")
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "Post-worker decision recovery found an unreadable child run; "
+                "one-shot lineage cannot be proven."
+            ) from exc
+        if child.get("parent_run_id") == source_run_id:
+            raise RuntimeError(
+                "Post-worker decision recovery is one-shot: a child run already "
+                "references this failed source run."
+            )
+
+
+def _load_authentic_post_worker_decision(
+    source_directory: Path,
+    source_result: dict[str, Any],
+    *,
+    expected_raw_sha256: str,
+) -> tuple[Decision, dict[str, Any], str, str, int]:
+    """Validate the sole unmatched raw decision that caused source failure."""
+
+    logs = source_directory / "logs"
+    if (
+        not logs.is_dir()
+        or logs.is_symlink()
+        or logs.resolve().parent != source_directory.resolve()
+    ):
+        raise RuntimeError(
+            "Post-worker decision recovery requires a direct run-scoped logs "
+            "directory, not a symlink or external path."
+        )
+    unmatched: list[Path] = []
+    for raw_path in sorted(logs.iterdir(), key=lambda item: item.name):
+        match = re.fullmatch(r"(\d{2})-decision-raw\.json", raw_path.name)
+        if match is None:
+            continue
+        if (
+            not raw_path.is_file()
+            or raw_path.is_symlink()
+            or raw_path.resolve().parent != logs.resolve()
+        ):
+            raise RuntimeError(
+                "A matching post-worker raw decision artifact is not a direct "
+                "regular run-scoped file."
+            )
+        validated_path = logs / f"{match.group(1)}-decision.json"
+        if validated_path.exists():
+            if (
+                not validated_path.is_file()
+                or validated_path.is_symlink()
+                or validated_path.resolve().parent != logs.resolve()
+            ):
+                raise RuntimeError(
+                    "A paired validated decision artifact is not a direct regular "
+                    "run-scoped file."
+                )
+        else:
+            unmatched.append(raw_path)
+    if len(unmatched) != 1:
+        raise RuntimeError(
+            "Post-worker decision recovery requires exactly one direct, unmatched "
+            "run-scoped NN-decision-raw.json artifact."
+        )
+
+    raw_path = unmatched[0]
+    iteration_match = re.fullmatch(
+        r"(\d{2})-decision-raw\.json", raw_path.name
+    )
+    assert iteration_match is not None
+    iteration = int(iteration_match.group(1))
+    if iteration < 2:
+        raise RuntimeError(
+            "The unmatched decision is not a post-worker review iteration."
+        )
+    try:
+        raw_text = raw_path.read_text(encoding="utf-8")
+        raw_payload = json.loads(raw_text)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "The unmatched post-worker decision is not valid UTF-8 JSON."
+        ) from exc
+    if not isinstance(raw_payload, dict):
+        raise RuntimeError(
+            "The unmatched post-worker decision must contain a JSON object."
+        )
+
+    expected_error = (
+        "Codex vrátil neplatné rozhodnutie:\n"
+        + truncate(redact_text(raw_text), 5000)
+    )
+    if (
+        source_result.get("error") != expected_error
+        or source_result.get("final_message") != expected_error
+    ):
+        raise RuntimeError(
+            "The unmatched raw decision does not exactly reproduce the persisted "
+            "Codex decision-validation failure."
+        )
+    if (
+        raw_payload.get("approve_check_contract_drift") is not False
+        or not isinstance(
+            raw_payload.get("check_contract_approval_reason"), str
+        )
+        or not raw_payload["check_contract_approval_reason"].strip()
+    ):
+        raise RuntimeError(
+            "The failed decision is not the one permitted native-false approval "
+            "normalization case."
+        )
+    normalized = normalize_codex_decision_payload(raw_payload)
+    changed_fields = sorted(
+        key
+        for key in set(raw_payload) | set(normalized)
+        if raw_payload.get(key) != normalized.get(key)
+    )
+    if changed_fields != ["check_contract_approval_reason"]:
+        raise RuntimeError(
+            "The raw decision requires more than the single permitted "
+            "native-false reason normalization."
+        )
+    try:
+        decision = Decision.model_validate(normalized)
+    except Exception as exc:
+        raise RuntimeError(
+            "The raw decision remains invalid after the sole permitted "
+            "normalization."
+        ) from exc
+    if (
+        decision.status != "continue"
+        or decision.decision_kind
+        not in {"implement_packet", "repair_packet", "verify_packet"}
+        or not (decision.next_prompt or "").strip()
+        or decision.approve_check_contract_drift
+        or decision.check_contract_approval_reason
+    ):
+        raise RuntimeError(
+            "The normalized raw decision is not a non-approving bounded worker "
+            "continuation."
+        )
+
+    previous_stem = f"{iteration - 1:02d}"
+    required_previous = {
+        "decision": logs / f"{previous_stem}-decision.json",
+        "worker": logs / f"{previous_stem}-worker.json",
+        "checks": logs / f"{previous_stem}-checks.json",
+        "post_worker_evidence": (
+            logs / f"{previous_stem}-post-worker-evidence-index.json"
+        ),
+        "review_evidence": logs / f"{iteration:02d}-evidence-index.json",
+        "codex_usage": logs / f"{iteration:02d}-codex-usage.json",
+    }
+    for label, artifact in required_previous.items():
+        if (
+            not artifact.is_file()
+            or artifact.is_symlink()
+            or artifact.resolve().parent != logs.resolve()
+        ):
+            raise RuntimeError(
+                f"Post-worker decision recovery is missing direct artifact: {label}."
+            )
+    if (logs / f"{iteration:02d}-worker.json").exists():
+        raise RuntimeError(
+            "A worker artifact already exists for the unmatched decision "
+            "iteration; recovery provenance is ambiguous."
+        )
+
+    try:
+        previous_decision = load_json_object(
+            required_previous["decision"], "Previous validated decision"
+        )
+        if source_result.get("final_decision") != previous_decision:
+            raise RuntimeError(
+                "The failed result's final_decision does not exactly match the "
+                "latest direct validated decision artifact."
+            )
+        Decision.model_validate(previous_decision)
+        worker = WorkerResult.model_validate(
+            load_json_object(required_previous["worker"], "Source worker result")
+        )
+        previous_checks_payload = json.loads(
+            required_previous["checks"].read_text(encoding="utf-8")
+        )
+        source_checks_payload = source_result.get("checks")
+        if (
+            not isinstance(previous_checks_payload, list)
+            or previous_checks_payload != source_checks_payload
+        ):
+            raise RuntimeError(
+                "Source result checks differ from the direct post-worker checks "
+                "artifact."
+            )
+        source_checks = [
+            CheckResult.model_validate(item)
+            for item in previous_checks_payload
+        ]
+        post_worker_evidence = load_json_object(
+            required_previous["post_worker_evidence"],
+            "Post-worker evidence",
+        )
+        review_evidence = load_json_object(
+            required_previous["review_evidence"],
+            "Decision review evidence",
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "Post-worker recovery evidence is malformed."
+        ) from exc
+    if not worker.valid_worker_outcome:
+        raise RuntimeError(
+            "Post-worker decision recovery cannot follow an invalid worker outcome."
+        )
+    if not checks_passed(source_checks):
+        raise RuntimeError(
+            "Post-worker decision recovery requires fresh persisted green checks."
+        )
+    repository_fingerprint = source_result.get("repository_fingerprint")
+    if (
+        post_worker_evidence.get("repository_fingerprint")
+        != repository_fingerprint
+        or review_evidence.get("repository_fingerprint")
+        != repository_fingerprint
+    ):
+        raise RuntimeError(
+            "Post-worker evidence fingerprints do not match the failed result."
+        )
+    raw_sha256 = hashlib.sha256(raw_path.read_bytes()).hexdigest()
+    if raw_sha256 != _validated_decision_recovery_sha256(
+        expected_raw_sha256
+    ):
+        raise RuntimeError(
+            "The unmatched raw decision does not match the explicit audited "
+            "SHA-256 authorization."
+        )
+    return decision, normalized, raw_path.name, raw_sha256, iteration
+
+
+def _validate_post_worker_counter_lineage(
+    project: Path,
+    source_directory: Path,
+    source_run: dict[str, Any],
+    source_result: dict[str, Any],
+    continuation: ContinuationPayload,
+) -> None:
+    parent_id = source_result.get("parent_run_id")
+    if (
+        not isinstance(parent_id, str)
+        or not parent_id.strip()
+        or source_run.get("parent_run_id") != parent_id
+    ):
+        raise RuntimeError(
+            "Post-worker decision recovery requires an exact parent-run lineage."
+        )
+    parent_directory = (
+        project / ".forge" / "runs" / _safe_run_id(parent_id)
+    )
+    runs_directory = (project / ".forge" / "runs").resolve()
+    if (
+        not parent_directory.is_dir()
+        or parent_directory.is_symlink()
+        or parent_directory.resolve().parent != runs_directory
+        or (parent_directory / "run.json").is_symlink()
+        or (parent_directory / "result.json").is_symlink()
+    ):
+        raise RuntimeError(
+            "Post-worker decision recovery requires a direct parent run and "
+            "direct parent run/result artifacts."
+        )
+    parent_run = load_json_object(
+        parent_directory / "run.json", "Post-worker recovery parent run"
+    )
+    parent_result = read_result_compat(parent_directory / "result.json")
+    if (
+        parent_run.get("run_id") != parent_id
+        or parent_run.get("continuation_chain_id")
+        != continuation.continuation_chain_id
+        or parent_result.get("run_id") != parent_id
+        or parent_result.get("continuation_chain_id")
+        != continuation.continuation_chain_id
+        or parent_result.get("final_status") != "needs_continuation"
+    ):
+        raise RuntimeError(
+            "Post-worker decision recovery parent lineage is inconsistent."
+        )
+    raw_parent_continuation = parent_result.get("continuation")
+    try:
+        parent = ContinuationPayload.model_validate(raw_parent_continuation)
+    except Exception as exc:
+        raise RuntimeError(
+            "Post-worker decision recovery parent has no valid continuation "
+            "counters."
+        ) from exc
+    if continuation.chain_child_runs != parent.chain_child_runs + 1:
+        raise RuntimeError(
+            "Post-worker decision recovery child-run counter is inconsistent."
+        )
+    monotonic_pairs = (
+        (continuation.chain_codex_calls, parent.chain_codex_calls, "Codex"),
+        (continuation.chain_worker_calls, parent.chain_worker_calls, "worker"),
+        (
+            continuation.chain_elapsed_seconds,
+            parent.chain_elapsed_seconds,
+            "elapsed",
+        ),
+        (
+            continuation.chain_full_check_suites,
+            parent.chain_full_check_suites,
+            "full-check",
+        ),
+        (
+            continuation.chain_premium_escalations,
+            parent.chain_premium_escalations,
+            "premium",
+        ),
+        (
+            continuation.chain_no_progress_events,
+            parent.chain_no_progress_events,
+            "no-progress",
+        ),
+    )
+    for current, previous, label in monotonic_pairs:
+        if current < previous:
+            raise RuntimeError(
+                f"Post-worker decision recovery {label} counter decreased."
+            )
+    if (
+        continuation.chain_worker_calls <= parent.chain_worker_calls
+        or continuation.chain_codex_calls <= parent.chain_codex_calls
+    ):
+        raise RuntimeError(
+            "The failed child does not account for both a worker dispatch and a "
+            "post-worker Codex decision."
+        )
+
+    telemetry_path = source_directory / "telemetry.json"
+    if (
+        not telemetry_path.is_file()
+        or telemetry_path.is_symlink()
+        or telemetry_path.resolve().parent != source_directory.resolve()
+    ):
+        raise RuntimeError(
+            "Post-worker decision recovery requires direct source telemetry."
+        )
+    telemetry = load_json_object(telemetry_path, "Source run telemetry")
+    if (
+        telemetry.get("run_id") != source_result.get("run_id")
+        or telemetry.get("continuation_chain_id")
+        != continuation.continuation_chain_id
+        or telemetry.get("parent_run_id") != parent_id
+        or telemetry.get("final_status") != "failed"
+        or telemetry.get("child_run_index") != continuation.chain_child_runs
+        or telemetry.get("chain_elapsed_seconds")
+        != continuation.chain_elapsed_seconds
+        or telemetry.get("budget_extension_count")
+        != continuation.budget_extension_count
+        or telemetry.get("chain_model_fallbacks")
+        != source_result.get("chain_model_fallbacks")
+        or telemetry.get("unavailable_models")
+        != source_result.get("unavailable_models")
+        or telemetry.get("premium_escalations")
+        != source_result.get("run_premium_claude_escalations_used")
+        or source_result.get("premium_claude_escalations_used")
+        != continuation.chain_premium_escalations
+    ):
+        raise RuntimeError(
+            "Source telemetry does not preserve the failed run's chain counters."
+        )
+
+
+def _load_post_worker_decision_recovery_context(
+    project: Path,
+    source_directory: Path,
+    source_run: dict[str, Any],
+    source_result: dict[str, Any],
+    *,
+    source_run_id: str,
+    resume_kind: ResumeKind,
+    expected_decision_recovery_sha256: str | None,
+) -> dict[str, Any]:
+    """Build a read-only, one-shot explicit-human recovery context."""
+
+    if resume_kind != "explicit_human":
+        raise RuntimeError(
+            "Post-worker decision recovery is allowed only through an explicit "
+            "human run-chain resume; direct and automatic resume are forbidden."
+        )
+    if (
+        type(source_result.get("schema_version")) is not int
+        or source_result["schema_version"] != SCHEMA_VERSION
+        or source_result.get("final_status") != "failed"
+        or source_result.get("stop_reason_code") != "technical_failure"
+        or source_result.get("automatic_resume_allowed") is not False
+        or source_result.get("continuation") is not None
+        or source_result.get("checks_passed") is not True
+    ):
+        raise RuntimeError(
+            "The source is not the exact schema-4 post-worker Codex "
+            "decision-validation failure eligible for explicit recovery."
+        )
+    runs_directory = (project / ".forge" / "runs").resolve()
+    if (
+        source_directory.is_symlink()
+        or source_directory.resolve().parent != runs_directory
+        or (source_directory / "run.json").is_symlink()
+        or (source_directory / "result.json").is_symlink()
+    ):
+        raise RuntimeError(
+            "Post-worker decision recovery requires a direct immutable run "
+            "directory and direct run/result artifacts."
+        )
+    _assert_no_existing_recovery_child(project, source_run_id)
+
+    decision, normalized, raw_name, raw_sha256, raw_iteration = (
+        _load_authentic_post_worker_decision(
+            source_directory,
+            source_result,
+            expected_raw_sha256=_validated_decision_recovery_sha256(
+                expected_decision_recovery_sha256
+            ),
+        )
+    )
+    source_packet_id = source_result.get("active_packet_id")
+    if (
+        not isinstance(source_packet_id, str)
+        or not source_packet_id.strip()
+        or decision.active_packet_id != source_packet_id
+    ):
+        raise RuntimeError(
+            "The normalized decision does not target the failed run's exact "
+            "active packet."
+        )
+
+    counter_values = {
+        "chain_child_runs": _strict_nonnegative_counter(
+            source_result, "chain_child_runs"
+        ),
+        "chain_codex_calls": _strict_nonnegative_counter(
+            source_result, "chain_codex_calls"
+        ),
+        "chain_worker_calls": _strict_nonnegative_counter(
+            source_result, "chain_worker_calls"
+        ),
+        "chain_elapsed_seconds": _strict_nonnegative_counter(
+            source_result, "chain_elapsed_seconds", floating=True
+        ),
+        "chain_full_check_suites": _strict_nonnegative_counter(
+            source_result, "chain_full_check_suites"
+        ),
+        "chain_premium_escalations": _strict_nonnegative_counter(
+            source_result, "chain_premium_escalations"
+        ),
+        "chain_no_progress_events": _strict_nonnegative_counter(
+            source_result, "chain_no_progress_events"
+        ),
+    }
+    for field in (
+        "no_progress_count",
+        "failed_iterations",
+        "repeated_failure_count",
+        "chain_model_fallbacks",
+        "budget_extension_count",
+    ):
+        _strict_nonnegative_counter(source_result, field)
+    unavailable_models = source_result.get("unavailable_models")
+    if not isinstance(unavailable_models, dict):
+        raise RuntimeError(
+            "Post-worker decision recovery unavailable-model state is malformed."
+        )
+    goal = source_result.get("goal")
+    if not isinstance(goal, str) or not goal.strip():
+        raise RuntimeError(
+            "Post-worker decision recovery source has no exact non-empty goal."
+        )
+
+    repository_fingerprint = source_result.get("repository_fingerprint")
+    if (
+        not isinstance(repository_fingerprint, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", repository_fingerprint)
+        or repo_fingerprint(project) != repository_fingerprint
+    ):
+        raise RuntimeError(
+            "Repository fingerprint changed after the failed post-worker "
+            "decision; explicit recovery stopped before plan mutation."
+        )
+    repository_manifest = repo_manifest(project)
+    if any(
+        isinstance(digest, str) and digest.startswith("large:")
+        for digest in repository_manifest.values()
+    ):
+        raise RuntimeError(
+            "Post-worker decision recovery requires content hashes for every "
+            "repository file; large metadata-only manifest entries are forbidden."
+        )
+    source_checks_payload = source_result.get("checks")
+    if not isinstance(source_checks_payload, list):
+        raise RuntimeError(
+            "Post-worker decision recovery source has no structured checks."
+        )
+    source_checks = [
+        CheckResult.model_validate(item) for item in source_checks_payload
+    ]
+    if not checks_passed(source_checks):
+        raise RuntimeError(
+            "Post-worker decision recovery requires checks_passed=true with "
+            "valid green check artifacts."
+        )
+    if source_result.get("last_check_tier") != decision.check_tier:
+        raise RuntimeError(
+            "The normalized decision check tier differs from the persisted "
+            "post-worker check tier."
+        )
+
+    required_identity: dict[str, str] = {}
+    for field in (
+        "project_id",
+        "plan_id",
+        "plan_hash",
+        "check_contract_hash",
+        "config_hash",
+        "continuation_chain_id",
+    ):
+        value = source_result.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError(
+                f"Post-worker decision recovery source is missing {field}."
+            )
+        required_identity[field] = value
+    if (
+        source_run.get("run_id") != source_run_id
+        or source_result.get("run_id") != source_run_id
+        or source_run.get("continuation_chain_id")
+        != required_identity["continuation_chain_id"]
+        or source_run.get("project_id") != required_identity["project_id"]
+        or source_run.get("plan_id") != required_identity["plan_id"]
+        or source_run.get("config_hash") != required_identity["config_hash"]
+        or source_run.get("goal") != source_result.get("goal")
+    ):
+        raise RuntimeError(
+            "Run/result identity differs in the failed recovery source."
+        )
+
+    continuation = ContinuationPayload(
+        source_run_id=source_run_id,
+        continuation_chain_id=required_identity["continuation_chain_id"],
+        next_prompt=decision.next_prompt or "",
+        acceptance_criteria=decision.acceptance_criteria,
+        risks=decision.risks,
+        last_check_results=source_checks,
+        repository_fingerprint=repository_fingerprint,
+        repository_manifest=repository_manifest,
+        no_progress_count=int(source_result["no_progress_count"]),
+        failed_iterations=int(source_result["failed_iterations"]),
+        chain_worker_calls=int(counter_values["chain_worker_calls"]),
+        chain_elapsed_seconds=float(
+            counter_values["chain_elapsed_seconds"]
+        ),
+        chain_full_check_suites=int(
+            counter_values["chain_full_check_suites"]
+        ),
+        chain_premium_escalations=int(
+            counter_values["chain_premium_escalations"]
+        ),
+        last_failure_signature=source_result.get(
+            "last_failure_signature"
+        ),
+        repeated_failure_count=int(source_result["repeated_failure_count"]),
+        project_id=required_identity["project_id"],
+        plan_id=required_identity["plan_id"],
+        plan_hash=required_identity["plan_hash"],
+        active_packet_id=source_packet_id,
+        chain_child_runs=int(counter_values["chain_child_runs"]),
+        chain_codex_calls=int(counter_values["chain_codex_calls"]),
+        chain_no_progress_events=int(
+            counter_values["chain_no_progress_events"]
+        ),
+        last_release_check_run_id=source_result.get(
+            "last_release_check_run_id"
+        ),
+        unavailable_models=dict(
+            unavailable_models
+        ),
+        chain_model_fallbacks=int(source_result["chain_model_fallbacks"]),
+        check_contract_hash=required_identity["check_contract_hash"],
+        config_hash=required_identity["config_hash"],
+        base_chain_budgets=source_result.get("base_chain_budgets"),
+        effective_chain_budgets=source_result.get(
+            "effective_chain_budgets"
+        ),
+        budget_extension_count=int(source_result["budget_extension_count"]),
+        last_budget_extension_source_run_id=source_result.get(
+            "last_budget_extension_source_run_id"
+        ),
+    )
+    merged_config, source_config_hash, legacy_config_compatibility = (
+        _verified_resume_config(
+            source_directory,
+            source_run,
+            source_result,
+            continuation,
+            resume_kind=resume_kind,
+        )
+    )
+    if legacy_config_compatibility:
+        raise RuntimeError(
+            "Post-worker decision recovery requires a canonical source config "
+            "snapshot; legacy config compatibility is forbidden."
+        )
+    (
+        base_chain_budgets,
+        effective_chain_budgets,
+        budget_extension_count,
+        budget_extended,
+    ) = _resolve_resume_budgets(
+        source_run,
+        source_result,
+        continuation,
+        merged_config,
+        source_run_id=source_run_id,
+        source_stop_reason="technical_failure",
+        resume_kind=resume_kind,
+        legacy_config_compatibility=False,
+    )
+    if budget_extended:
+        raise RuntimeError(
+            "Post-worker decision recovery must not extend the chain budget."
+        )
+
+    result_plan_path = source_directory / "project-plan.result.json"
+    contract_snapshot_path = (
+        source_directory / "check-contract.snapshot.json"
+    )
+    current_plan_path = project / ".forge" / "project-plan.json"
+    current_contract_path = project / ".forge" / "check-contract.json"
+    if (
+        not result_plan_path.is_file()
+        or result_plan_path.is_symlink()
+        or not contract_snapshot_path.is_file()
+        or contract_snapshot_path.is_symlink()
+        or not current_plan_path.is_file()
+        or current_plan_path.is_symlink()
+        or not current_contract_path.is_file()
+        or current_contract_path.is_symlink()
+    ):
+        raise RuntimeError(
+            "Post-worker decision recovery requires direct source snapshots and "
+            "direct current plan/contract artifacts."
+        )
+    try:
+        result_plan = ProjectPlan.model_validate_json(
+            result_plan_path.read_text(encoding="utf-8")
+        )
+        contract_snapshot = CheckContract.model_validate_json(
+            contract_snapshot_path.read_text(encoding="utf-8")
+        )
+        current_plan = ProjectPlan.model_validate_json(
+            current_plan_path.read_text(encoding="utf-8")
+        )
+        current_contract = CheckContract.model_validate_json(
+            current_contract_path.read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Post-worker decision recovery plan/contract snapshot is invalid."
+        ) from exc
+    identity = stable_project_identity(project, create_if_missing=False)
+    if (
+        identity.get("project_id") != required_identity["project_id"]
+        or result_plan.plan_id != required_identity["plan_id"]
+        or result_plan.project_id != required_identity["project_id"]
+        or plan_hash(result_plan) != required_identity["plan_hash"]
+        or contract_snapshot.model_dump(mode="json")
+        != current_contract.model_dump(mode="json")
+        or current_contract.contract_hash
+        != required_identity["check_contract_hash"]
+        or check_contract_runtime_error(
+            project, current_contract, merged_config
+        )
+        is not None
+    ):
+        raise RuntimeError(
+            "Source plan, project identity, or check contract differs from the "
+            "failed run's exact validated state."
+        )
+    active_packet = active_plan_packet(result_plan)
+    maximum_attempts = int(merged_config.get("max_packet_attempts", 3))
+    if (
+        active_packet is None
+        or active_packet.packet_id != source_packet_id
+        or active_packet.status not in {"in_progress", "verification"}
+        or active_packet.attempts != maximum_attempts + 1
+        or not active_packet.final_review_recovery_used
+        or active_packet.final_review_recovery_authorized
+        or len(result_plan.work_packets) >= MAX_PROJECT_WORK_PACKETS
+    ):
+        raise RuntimeError(
+            "The failed active packet is not the exact exhausted, consumed "
+            "final-review recovery state required for a bounded replan."
+        )
+    completed_downstream = [
+        packet.packet_id
+        for packet in result_plan.work_packets
+        if source_packet_id in packet.dependencies
+        and packet.status in {"completed", "superseded"}
+    ]
+    if completed_downstream:
+        raise RuntimeError(
+            "Completed or superseded downstream packets depend on the failed "
+            "packet; dependency rewiring would be inconsistent."
+        )
+    contracted = {
+        item.check_id: item for item in current_contract.check_definitions
+    }
+    if (
+        not decision.check_ids
+        or any(check_id not in contracted for check_id in decision.check_ids)
+        or decision.recommended_worker_profile in {"frontier", "rescue"}
+    ):
+        raise RuntimeError(
+            "The normalized decision requests an uncontracted check or a "
+            "non-routine premium/recovery worker profile."
+        )
+    tier_order = {
+        "smoke": 0,
+        "targeted": 1,
+        "milestone": 2,
+        "release": 3,
+    }
+    if any(
+        tier_order[contracted[check_id].tier]
+        > tier_order[decision.check_tier]
+        for check_id in decision.check_ids
+    ):
+        raise RuntimeError(
+            "The normalized decision's check tier cannot execute all requested "
+            "contracted checks."
+        )
+    if decision.plan_patch is not None:
+        patch = decision.plan_patch
+        if (
+            patch.add_packets
+            or patch.active_packet_id not in {None, source_packet_id}
+            or any(
+                update.packet_id != source_packet_id
+                for update in patch.update_packets
+            )
+            or patch.append_milestones
+            or patch.append_release_gates
+            or patch.append_architectural_decisions
+            or patch.append_safe_assumptions
+            or patch.append_risks
+        ):
+            raise RuntimeError(
+                "The raw decision contains a broader model-authored replan; "
+                "bounded deterministic recovery refused it."
+            )
+
+    _validate_post_worker_counter_lineage(
+        project,
+        source_directory,
+        source_run,
+        source_result,
+        continuation,
+    )
+    replacement_packet_id = _decision_recovery_packet_id(
+        source_packet_id,
+        source_run_id,
+        raw_sha256,
+    )
+    if any(
+        packet.packet_id == replacement_packet_id
+        for packet in result_plan.work_packets
+    ):
+        raise RuntimeError(
+            "The deterministic post-worker decision recovery packet already "
+            "exists in the immutable source plan."
+        )
+    recovery = {
+        "action": POST_WORKER_DECISION_RECOVERY_ACTION,
+        "source_run_id": source_run_id,
+        "source_packet_id": source_packet_id,
+        "replacement_packet_id": replacement_packet_id,
+        "raw_decision_file": raw_name,
+        "raw_decision_sha256": raw_sha256,
+        "raw_decision_iteration": raw_iteration,
+        "source_plan_hash": required_identity["plan_hash"],
+        "source_contract_hash": required_identity[
+            "check_contract_hash"
+        ],
+        "source_repository_fingerprint": repository_fingerprint,
+        "normalized_decision": normalized,
+        "journal_state": "none",
+        "journal_target_plan_hash": None,
+    }
+    journal = _load_decision_recovery_journal(project, source_run_id)
+    source_plan_payload = result_plan.model_dump(mode="json")
+    if journal is None:
+        if current_plan.model_dump(mode="json") != source_plan_payload:
+            raise RuntimeError(
+                "Current plan is neither the exact failed source plan nor a "
+                "journal-authenticated recovery target."
+            )
+    else:
+        expected_journal_fields = {
+            "schema_version",
+            "action",
+            "source_run_id",
+            "source_packet_id",
+            "replacement_packet_id",
+            "raw_decision_sha256",
+            "source_plan_hash",
+            "source_contract_hash",
+            "source_repository_fingerprint",
+            "source_config_hash",
+            "prepared_by_run_id",
+            "created_at",
+            "phase",
+            "child_run_id",
+            "target_plan_hash",
+            "target_plan",
+        }
+        if set(journal) != expected_journal_fields:
+            raise RuntimeError(
+                "Decision-recovery journal fields are incomplete or unexpected."
+            )
+        exact_journal_values = {
+            "schema_version": SCHEMA_VERSION,
+            "action": POST_WORKER_DECISION_RECOVERY_ACTION,
+            "source_run_id": source_run_id,
+            "source_packet_id": source_packet_id,
+            "replacement_packet_id": replacement_packet_id,
+            "raw_decision_sha256": raw_sha256,
+            "source_plan_hash": required_identity["plan_hash"],
+            "source_contract_hash": required_identity[
+                "check_contract_hash"
+            ],
+            "source_repository_fingerprint": repository_fingerprint,
+            "source_config_hash": source_config_hash,
+        }
+        if any(
+            journal.get(field) != value
+            for field, value in exact_journal_values.items()
+        ):
+            raise RuntimeError(
+                "Decision-recovery journal provenance does not match the "
+                "validated failed source."
+            )
+        if (
+            journal.get("phase") != "prepared"
+            or journal.get("child_run_id") is not None
+        ):
+            raise RuntimeError(
+                "Decision-recovery journal shows that a child run already "
+                "started; recovery is one-shot."
+            )
+        try:
+            _safe_run_id(str(journal["prepared_by_run_id"]))
+            if (
+                not isinstance(journal["created_at"], str)
+                or not journal["created_at"].strip()
+            ):
+                raise ValueError("created_at")
+            target_plan = ProjectPlan.model_validate(journal["target_plan"])
+        except Exception as exc:
+            raise RuntimeError(
+                "Decision-recovery journal target metadata is invalid."
+            ) from exc
+        target_plan_hash = plan_hash(target_plan)
+        if (
+            journal.get("target_plan_hash") != target_plan_hash
+            or not re.fullmatch(r"[0-9a-f]{64}", target_plan_hash)
+        ):
+            raise RuntimeError(
+                "Decision-recovery journal target plan hash is invalid."
+            )
+        derived_plan, _ = apply_post_worker_decision_recovery_plan(
+            result_plan,
+            recovery,
+            merged_config,
+        )
+        derived_plan.updated_at = target_plan.updated_at
+        derived_plan.last_validated_at = target_plan.last_validated_at
+        derived_plan.last_validation_summary = (
+            target_plan.last_validation_summary
+        )
+        derived_plan = ProjectPlan.model_validate(
+            derived_plan.model_dump(mode="json")
+        )
+        if (
+            derived_plan.model_dump(mode="json")
+            != target_plan.model_dump(mode="json")
+        ):
+            raise RuntimeError(
+                "Decision-recovery journal target is not the deterministic "
+                "transform of the immutable source plan."
+            )
+        current_payload = current_plan.model_dump(mode="json")
+        target_payload = target_plan.model_dump(mode="json")
+        if current_payload == source_plan_payload:
+            recovery["journal_state"] = "intent_only"
+        elif current_payload == target_payload:
+            recovery["journal_state"] = "target_applied"
+            continuation_payload = continuation.model_dump(mode="json")
+            continuation_payload["plan_hash"] = target_plan_hash
+            continuation_payload["active_packet_id"] = replacement_packet_id
+            continuation = ContinuationPayload.model_validate(
+                continuation_payload
+            )
+        else:
+            raise RuntimeError(
+                "Current plan differs from both states authorized by the "
+                "decision-recovery journal."
+            )
+        recovery["journal_target_plan_hash"] = target_plan_hash
+    return {
+        "source_run_id": source_run_id,
+        "source_directory": str(source_directory),
+        "goal": source_result["goal"],
+        "config": merged_config,
+        "continuation": continuation.model_dump(mode="json"),
+        "source_result_schema_version": SCHEMA_VERSION,
+        "source_stop_reason_code": "technical_failure",
+        "source_automatic_resume_allowed": False,
+        "resume_kind": resume_kind,
+        "source_config_hash": source_config_hash,
+        "legacy_config_compatibility": False,
+        "base_chain_budgets": base_chain_budgets.model_dump(mode="json"),
+        "effective_chain_budgets": effective_chain_budgets.model_dump(
+            mode="json"
+        ),
+        "budget_extension_count": budget_extension_count,
+        "budget_extended": False,
+        "bounded_packet_recovery_eligible": False,
+        "recovery_authorized_from_run_id": None,
+        "post_worker_decision_recovery_eligible": True,
+        "post_worker_decision_recovery": recovery,
+    }
+
+
+def _direct_run_artifact(
+    run_directory: Path,
+    relative_name: str,
+    label: str,
+) -> Path:
+    path = run_directory / relative_name
+    if (
+        not path.is_file()
+        or path.is_symlink()
+        or path.resolve().parent != path.parent.resolve()
+        or not _path_inside(path, run_directory)
+    ):
+        raise RuntimeError(
+            f"{label} is not a direct immutable run-scoped regular file."
+        )
+    return path
+
+
+def _load_recovery_attempt_budget_normalization_context(
+    project: Path,
+    source_directory: Path,
+    source_run: dict[str, Any],
+    source_result: dict[str, Any],
+    continuation: ContinuationPayload,
+    *,
+    source_run_id: str,
+    goal: str,
+    merged_config: dict[str, Any],
+    source_config_hash: str | None,
+    resume_kind: ResumeKind,
+    requested_latest: bool,
+) -> dict[str, Any] | None:
+    """Validate the one historical one-shot replacement defect, if present."""
+
+    legacy_source_id = source_result.get("parent_run_id")
+    if (
+        not isinstance(legacy_source_id, str)
+        or not legacy_source_id.strip()
+    ):
+        return None
+    legacy_source_id = _safe_run_id(legacy_source_id)
+    legacy_journal = _load_decision_recovery_journal(
+        project, legacy_source_id
+    )
+    if legacy_journal is None:
+        return None
+
+    active_packet_id = continuation.active_packet_id
+    journal_child_id = legacy_journal.get("child_run_id")
+    journal_packet_id = legacy_journal.get("replacement_packet_id")
+    candidate = (
+        journal_child_id == source_run_id
+        or (
+            journal_packet_id == active_packet_id
+            and legacy_journal.get("phase") == "child_started"
+        )
+    )
+    if not candidate:
+        return None
+    if (
+        legacy_journal.get("schema_version") != SCHEMA_VERSION
+        or legacy_journal.get("action")
+        != POST_WORKER_DECISION_RECOVERY_ACTION
+        or legacy_journal.get("phase") != "child_started"
+        or journal_child_id != source_run_id
+    ):
+        raise RuntimeError(
+            "Decision-recovery journal cannot authenticate this exact source "
+            "child."
+        )
+    try:
+        candidate_target = ProjectPlan.model_validate(
+            legacy_journal["target_plan"]
+        )
+        candidate_packet = next(
+            packet
+            for packet in candidate_target.work_packets
+            if packet.packet_id == journal_packet_id
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Decision-recovery child journal has an invalid target packet."
+        ) from exc
+    candidate_maximum = int(
+        merged_config.get("max_packet_attempts", 3)
+    )
+    legacy_signature = (
+        candidate_packet.attempts == candidate_maximum
+        and candidate_packet.final_review_recovery_authorized
+        and not candidate_packet.final_review_recovery_used
+    )
+    current_signature = (
+        candidate_packet.attempts == 0
+        and not candidate_packet.final_review_recovery_authorized
+        and not candidate_packet.final_review_recovery_used
+    )
+    if current_signature:
+        # New decision-recovery packets already receive the normal bounded
+        # budget. They must use the ordinary packet recovery policy, never this
+        # compatibility migration.
+        return None
+    if not legacy_signature:
+        raise RuntimeError(
+            "Decision-recovery child journal matches neither the historical "
+            "one-shot target nor the current normal-budget target."
+        )
+    if requested_latest:
+        raise RuntimeError(
+            "Recovery-attempt budget normalization requires an exact source "
+            "run ID; 'latest' is forbidden."
+        )
+    if resume_kind != "explicit_human":
+        raise RuntimeError(
+            "Recovery-attempt budget normalization is allowed only through an "
+            "explicit human supervised resume."
+        )
+    if (
+        int(source_result.get("schema_version") or 0) != SCHEMA_VERSION
+        or continuation.schema_version != SCHEMA_VERSION
+        or source_result.get("final_status") != "needs_continuation"
+        or source_result.get("stop_reason_code")
+        != "packet_attempts_exhausted"
+        or source_result.get("automatic_resume_allowed") is not False
+    ):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization requires the exact schema-4 "
+            "packet_attempts_exhausted termination."
+        )
+    if (
+        source_run.get("run_id") != source_run_id
+        or source_run.get("parent_run_id") != legacy_source_id
+        or source_result.get("parent_run_id") != legacy_source_id
+        or source_run.get("continuation_chain_id")
+        != continuation.continuation_chain_id
+        or source_result.get("continuation_chain_id")
+        != continuation.continuation_chain_id
+    ):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization source lineage is "
+            "inconsistent."
+        )
+    if not bool(merged_config.get("adaptive_orchestration", False)):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization requires adaptive "
+            "orchestration."
+        )
+    if not isinstance(source_config_hash, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", source_config_hash
+    ):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization requires a canonical source "
+            "config snapshot."
+        )
+    maximum_attempts = int(merged_config.get("max_packet_attempts", 3))
+    if maximum_attempts < 2:
+        raise RuntimeError(
+            "Recovery-attempt budget normalization requires at least two normal "
+            "packet attempts."
+        )
+
+    expected_legacy_journal_fields = {
+        "schema_version",
+        "action",
+        "source_run_id",
+        "source_packet_id",
+        "replacement_packet_id",
+        "raw_decision_sha256",
+        "source_plan_hash",
+        "source_contract_hash",
+        "source_repository_fingerprint",
+        "source_config_hash",
+        "prepared_by_run_id",
+        "created_at",
+        "phase",
+        "child_run_id",
+        "target_plan_hash",
+        "target_plan",
+    }
+    if set(legacy_journal) != expected_legacy_journal_fields:
+        raise RuntimeError(
+            "Legacy decision-recovery journal fields are incomplete or "
+            "unexpected."
+        )
+    if (
+        legacy_journal.get("schema_version") != SCHEMA_VERSION
+        or legacy_journal.get("action")
+        != POST_WORKER_DECISION_RECOVERY_ACTION
+        or legacy_journal.get("source_run_id") != legacy_source_id
+        or legacy_journal.get("phase") != "child_started"
+        or legacy_journal.get("child_run_id") != source_run_id
+        or legacy_journal.get("prepared_by_run_id") != source_run_id
+        or not isinstance(legacy_journal.get("created_at"), str)
+        or not str(legacy_journal.get("created_at")).strip()
+        or legacy_journal.get("source_config_hash")
+        != source_config_hash
+    ):
+        raise RuntimeError(
+            "Legacy decision-recovery journal does not authorize this exact "
+            "source child."
+        )
+    replacement_packet_id = _safe_run_id(
+        str(legacy_journal.get("replacement_packet_id") or "")
+    )
+    if active_packet_id != replacement_packet_id:
+        raise RuntimeError(
+            "Recovery-attempt budget normalization active packet does not match "
+            "the legacy recovery journal."
+        )
+
+    try:
+        legacy_target = ProjectPlan.model_validate(
+            legacy_journal["target_plan"]
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Legacy decision-recovery target plan is invalid."
+        ) from exc
+    legacy_target_hash = plan_hash(legacy_target)
+    if (
+        legacy_journal.get("target_plan_hash") != legacy_target_hash
+        or not re.fullmatch(r"[0-9a-f]{64}", legacy_target_hash)
+        or legacy_target.active_packet_id != replacement_packet_id
+    ):
+        raise RuntimeError(
+            "Legacy decision-recovery target plan hash or packet identity is "
+            "invalid."
+        )
+    legacy_target_packet = active_plan_packet(legacy_target)
+    if (
+        legacy_target_packet is None
+        or legacy_target_packet.status not in {"in_progress", "verification"}
+        or legacy_target_packet.attempts != maximum_attempts
+        or not legacy_target_packet.final_review_recovery_authorized
+        or legacy_target_packet.final_review_recovery_used
+    ):
+        raise RuntimeError(
+            "Legacy decision-recovery target is not the exact max-attempt "
+            "one-shot packet."
+        )
+
+    runs_directory = (project / ".forge" / "runs").resolve()
+    if (
+        source_directory.is_symlink()
+        or source_directory.resolve().parent != runs_directory
+    ):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization source run is not a direct "
+            "run-scoped directory."
+        )
+    source_plan_path = _direct_run_artifact(
+        source_directory,
+        "project-plan.result.json",
+        "Source result plan snapshot",
+    )
+    initial_plan_path = _direct_run_artifact(
+        source_directory,
+        "project-plan.initial.json",
+        "Source initial plan snapshot",
+    )
+    pre_worker_plan_path = _direct_run_artifact(
+        source_directory,
+        "project-plan.pre-worker-01.json",
+        "Source pre-worker plan snapshot",
+    )
+    recovery_record_path = _direct_run_artifact(
+        source_directory,
+        "decision-recovery.json",
+        "Source decision-recovery record",
+    )
+    contract_snapshot_path = _direct_run_artifact(
+        source_directory,
+        "check-contract.snapshot.json",
+        "Source check-contract snapshot",
+    )
+    telemetry_path = _direct_run_artifact(
+        source_directory,
+        "telemetry.json",
+        "Source telemetry",
+    )
+    try:
+        source_plan = ProjectPlan.model_validate_json(
+            source_plan_path.read_text(encoding="utf-8")
+        )
+        initial_plan = ProjectPlan.model_validate_json(
+            initial_plan_path.read_text(encoding="utf-8")
+        )
+        pre_worker_plan = ProjectPlan.model_validate_json(
+            pre_worker_plan_path.read_text(encoding="utf-8")
+        )
+        recovery_record = load_json_object(
+            recovery_record_path, "Source decision-recovery record"
+        )
+        source_contract_snapshot = CheckContract.model_validate_json(
+            contract_snapshot_path.read_text(encoding="utf-8")
+        )
+        telemetry = load_json_object(telemetry_path, "Source telemetry")
+    except Exception as exc:
+        raise RuntimeError(
+            "Recovery-attempt budget normalization source artifacts are invalid."
+        ) from exc
+
+    source_plan_hash = plan_hash(source_plan)
+    required_identity = {
+        "project_id": continuation.project_id,
+        "plan_id": continuation.plan_id,
+        "plan_hash": continuation.plan_hash,
+        "check_contract_hash": continuation.check_contract_hash,
+    }
+    if any(
+        not isinstance(value, str) or not value
+        for value in required_identity.values()
+    ):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization continuation identity is "
+            "incomplete."
+        )
+    identity = stable_project_identity(project, create_if_missing=False)
+    expected_goal_hash = hashlib.sha256(goal.encode("utf-8")).hexdigest()
+    if (
+        continuation.project_id != identity["project_id"]
+        or source_plan.project_id != identity["project_id"]
+        or source_plan.plan_id != continuation.plan_id
+        or source_plan.goal_hash != expected_goal_hash
+        or source_plan_hash != continuation.plan_hash
+        or source_result.get("plan_hash") != source_plan_hash
+        or source_result.get("project_id") != continuation.project_id
+        or source_result.get("plan_id") != continuation.plan_id
+        or source_result.get("active_packet_id") != replacement_packet_id
+        or source_plan.active_packet_id != replacement_packet_id
+    ):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization source plan identity changed."
+        )
+    source_packet = active_plan_packet(source_plan)
+    if (
+        source_packet is None
+        or source_packet.status not in {"in_progress", "verification"}
+        or source_packet.attempts != maximum_attempts + 1
+        or source_packet.final_review_recovery_authorized
+        or not source_packet.final_review_recovery_used
+    ):
+        raise RuntimeError(
+            "Source result packet is not the exact consumed legacy one-shot "
+            "state."
+        )
+    if (
+        initial_plan.model_dump(mode="json")
+        != legacy_target.model_dump(mode="json")
+    ):
+        raise RuntimeError(
+            "Source child initial plan is not the exact legacy journal target."
+        )
+    expected_pre_worker = ProjectPlan.model_validate(
+        legacy_target.model_dump(mode="json")
+    )
+    expected_pre_worker.updated_at = pre_worker_plan.updated_at
+    expected_pre_worker.last_validated_at = pre_worker_plan.last_validated_at
+    pre_worker_packet = active_plan_packet(expected_pre_worker)
+    assert pre_worker_packet is not None
+    pre_worker_packet.attempts = maximum_attempts + 1
+    pre_worker_packet.final_review_recovery_authorized = False
+    pre_worker_packet.final_review_recovery_used = True
+    expected_pre_worker = ProjectPlan.model_validate(
+        expected_pre_worker.model_dump(mode="json")
+    )
+    if (
+        pre_worker_plan.model_dump(mode="json")
+        != expected_pre_worker.model_dump(mode="json")
+    ):
+        raise RuntimeError(
+            "Source child does not contain exactly one consumed legacy "
+            "pre-worker transition."
+        )
+
+    expected_recovery_record_fields = {
+        "action",
+        "source_run_id",
+        "source_packet_id",
+        "replacement_packet_id",
+        "raw_decision_file",
+        "raw_decision_sha256",
+        "raw_decision_iteration",
+        "source_plan_hash",
+        "source_contract_hash",
+        "source_repository_fingerprint",
+        "normalized_decision",
+        "journal_state",
+        "journal_target_plan_hash",
+        "recovered_plan_hash",
+        "source_packet_attempts_preserved",
+        "replacement_packet_attempts_at_replan",
+        "replacement_recovery_authorized_at_replan",
+        "replacement_recovery_used_at_replan",
+    }
+    if (
+        set(recovery_record) != expected_recovery_record_fields
+        or recovery_record.get("action")
+        != POST_WORKER_DECISION_RECOVERY_ACTION
+        or recovery_record.get("source_run_id") != legacy_source_id
+        or recovery_record.get("source_packet_id")
+        != legacy_journal.get("source_packet_id")
+        or recovery_record.get("replacement_packet_id")
+        != replacement_packet_id
+        or recovery_record.get("raw_decision_sha256")
+        != legacy_journal.get("raw_decision_sha256")
+        or recovery_record.get("source_plan_hash")
+        != legacy_journal.get("source_plan_hash")
+        or recovery_record.get("source_contract_hash")
+        != legacy_journal.get("source_contract_hash")
+        or recovery_record.get("source_repository_fingerprint")
+        != legacy_journal.get("source_repository_fingerprint")
+        or recovery_record.get("journal_state") != "target_applied"
+        or recovery_record.get("journal_target_plan_hash")
+        != legacy_target_hash
+        or recovery_record.get("recovered_plan_hash")
+        != legacy_target_hash
+        or recovery_record.get("source_packet_attempts_preserved") is not True
+        or recovery_record.get("replacement_packet_attempts_at_replan")
+        != maximum_attempts
+        or recovery_record.get(
+            "replacement_recovery_authorized_at_replan"
+        )
+        is not True
+        or recovery_record.get("replacement_recovery_used_at_replan")
+        is not False
+    ):
+        raise RuntimeError(
+            "Source child decision-recovery record is not the exact legacy "
+            "one-shot provenance."
+        )
+    run_resume = source_run.get("resume")
+    run_recovery = (
+        run_resume.get("post_worker_decision_recovery")
+        if isinstance(run_resume, dict)
+        else None
+    )
+    if (
+        not isinstance(run_recovery, dict)
+        or run_resume.get("source_run_id") != legacy_source_id
+        or run_resume.get("source_config_hash") != source_config_hash
+        or run_recovery
+        != {
+            "action": POST_WORKER_DECISION_RECOVERY_ACTION,
+            "source_packet_id": legacy_journal.get("source_packet_id"),
+            "replacement_packet_id": replacement_packet_id,
+            "raw_decision_sha256": legacy_journal.get(
+                "raw_decision_sha256"
+            ),
+        }
+    ):
+        raise RuntimeError(
+            "Source child run metadata does not match the legacy recovery "
+            "journal."
+        )
+
+    contract_path = project / ".forge" / "check-contract.json"
+    plan_path = project / ".forge" / "project-plan.json"
+    if (
+        not contract_path.is_file()
+        or contract_path.is_symlink()
+        or not plan_path.is_file()
+        or plan_path.is_symlink()
+    ):
+        raise RuntimeError(
+            "Persistent plan or Forge-owned check contract is unsafe."
+        )
+    try:
+        current_contract = CheckContract.model_validate_json(
+            contract_path.read_text(encoding="utf-8")
+        )
+        current_plan = ProjectPlan.model_validate_json(
+            plan_path.read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Persistent recovery-attempt normalization state is invalid."
+        ) from exc
+    if (
+        source_contract_snapshot.model_dump(mode="json")
+        != current_contract.model_dump(mode="json")
+        or current_contract.contract_hash
+        != continuation.check_contract_hash
+        or source_result.get("check_contract_hash")
+        != current_contract.contract_hash
+        or source_plan.check_contract_hash != current_contract.contract_hash
+        or legacy_target.check_contract_hash != current_contract.contract_hash
+        or legacy_journal.get("source_contract_hash")
+        != current_contract.contract_hash
+    ):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization check-contract identity "
+            "changed."
+        )
+
+    raw_checks = source_result.get("checks")
+    if (
+        source_result.get("checks_passed") is not True
+        or not isinstance(raw_checks, list)
+    ):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization requires persisted green "
+            "checks."
+        )
+    try:
+        source_checks = [
+            CheckResult.model_validate(item) for item in raw_checks
+        ]
+    except Exception as exc:
+        raise RuntimeError(
+            "Recovery-attempt budget normalization checks are invalid."
+        ) from exc
+    if (
+        not checks_passed(source_checks)
+        or [item.model_dump(mode="json") for item in source_checks]
+        != [
+            item.model_dump(mode="json")
+            for item in continuation.last_check_results
+        ]
+    ):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization check evidence is not exact."
+        )
+    logs = source_directory / "logs"
+    if (
+        not logs.is_dir()
+        or logs.is_symlink()
+        or logs.resolve().parent != source_directory.resolve()
+    ):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization logs directory is unsafe."
+        )
+    worker_paths = sorted(
+        path
+        for path in logs.iterdir()
+        if re.fullmatch(r"\d{2}-worker\.json", path.name)
+    )
+    if len(worker_paths) != 1:
+        raise RuntimeError(
+            "Recovery-attempt budget normalization requires exactly one direct "
+            "worker artifact."
+        )
+    worker_path = worker_paths[0]
+    if (
+        not worker_path.is_file()
+        or worker_path.is_symlink()
+        or worker_path.resolve().parent != logs.resolve()
+    ):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization worker artifact is unsafe."
+        )
+    stem = worker_path.name[:2]
+    checks_path = _direct_run_artifact(
+        source_directory,
+        f"logs/{stem}-checks.json",
+        "Source worker checks",
+    )
+    evidence_path = _direct_run_artifact(
+        source_directory,
+        f"logs/{stem}-post-worker-evidence-index.json",
+        "Source post-worker evidence",
+    )
+    try:
+        source_worker = WorkerResult.model_validate(
+            load_json_object(worker_path, "Source worker")
+        )
+        direct_checks = json.loads(checks_path.read_text(encoding="utf-8"))
+        direct_evidence = load_json_object(
+            evidence_path, "Source post-worker evidence"
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "Recovery-attempt budget normalization worker evidence is invalid."
+        ) from exc
+    if (
+        not source_worker.valid_worker_outcome
+        or direct_checks != raw_checks
+        or direct_evidence.get("repository_fingerprint")
+        != source_packet.last_fingerprint
+        or not isinstance(source_packet.last_fingerprint, str)
+        or not source_packet.last_fingerprint
+    ):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization lacks one valid green worker "
+            "transition."
+        )
+    try:
+        source_decision = Decision.model_validate(
+            source_result.get("final_decision")
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Recovery-attempt budget normalization final decision is invalid."
+        ) from exc
+    if (
+        source_decision.status != "continue"
+        or source_decision.decision_kind
+        not in {"implement_packet", "repair_packet", "verify_packet"}
+        or source_decision.active_packet_id != replacement_packet_id
+        or not (source_decision.next_prompt or "").strip()
+        or source_decision.next_prompt != continuation.next_prompt
+        or source_decision.acceptance_criteria
+        != continuation.acceptance_criteria
+        or source_decision.risks != continuation.risks
+    ):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization has no exact validated "
+            "next_prompt."
+        )
+    matching_decisions = 0
+    for candidate in logs.iterdir():
+        if not re.fullmatch(r"\d{2}-decision\.json", candidate.name):
+            continue
+        if (
+            not candidate.is_file()
+            or candidate.is_symlink()
+            or candidate.resolve().parent != logs.resolve()
+        ):
+            raise RuntimeError(
+                "Recovery-attempt budget normalization decision artifact is "
+                "unsafe."
+            )
+        if load_json_object(candidate, "Source decision") == source_result.get(
+            "final_decision"
+        ):
+            matching_decisions += 1
+    if matching_decisions != 1:
+        raise RuntimeError(
+            "Recovery-attempt budget normalization requires one exact persisted "
+            "final decision."
+        )
+
+    current_manifest = repo_manifest(project)
+    current_fingerprint = repo_fingerprint(project)
+    if (
+        current_manifest != continuation.repository_manifest
+        or current_fingerprint != continuation.repository_fingerprint
+        or source_result.get("repository_fingerprint")
+        != current_fingerprint
+    ):
+        raise RuntimeError(
+            "Repository changed after the legacy recovery child; "
+            "normalization stopped before worker execution."
+        )
+
+    legacy_directory = (
+        project / ".forge" / "runs" / legacy_source_id
+    )
+    if (
+        not legacy_directory.is_dir()
+        or legacy_directory.is_symlink()
+        or legacy_directory.resolve().parent != runs_directory
+    ):
+        raise RuntimeError(
+            "Legacy recovery source is not a direct immutable run directory."
+        )
+    legacy_run = load_json_object(
+        _direct_run_artifact(
+            legacy_directory, "run.json", "Legacy recovery source run"
+        ),
+        "Legacy recovery source run",
+    )
+    legacy_result = read_result_compat(
+        _direct_run_artifact(
+            legacy_directory,
+            "result.json",
+            "Legacy recovery source result",
+        )
+    )
+    if (
+        legacy_run.get("run_id") != legacy_source_id
+        or legacy_result.get("run_id") != legacy_source_id
+        or legacy_run.get("continuation_chain_id")
+        != continuation.continuation_chain_id
+        or legacy_result.get("continuation_chain_id")
+        != continuation.continuation_chain_id
+        or legacy_result.get("final_status") != "failed"
+        or legacy_result.get("stop_reason_code") != "technical_failure"
+        or legacy_result.get("automatic_resume_allowed") is not False
+    ):
+        raise RuntimeError(
+            "Legacy recovery parent is not the exact technical-failure source."
+        )
+    counter_fields = (
+        ("chain_child_runs", False),
+        ("chain_codex_calls", False),
+        ("chain_worker_calls", False),
+        ("chain_elapsed_seconds", True),
+        ("chain_full_check_suites", False),
+        ("chain_premium_escalations", False),
+        ("chain_no_progress_events", False),
+        ("chain_model_fallbacks", False),
+    )
+    source_counters: dict[str, int | float] = {}
+    legacy_counters: dict[str, int | float] = {}
+    for field, floating in counter_fields:
+        source_counters[field] = _strict_nonnegative_counter(
+            source_result, field, floating=floating
+        )
+        legacy_counters[field] = _strict_nonnegative_counter(
+            legacy_result, field, floating=floating
+        )
+    continuation_counter_values = {
+        "chain_child_runs": continuation.chain_child_runs,
+        "chain_codex_calls": continuation.chain_codex_calls,
+        "chain_worker_calls": continuation.chain_worker_calls,
+        "chain_elapsed_seconds": continuation.chain_elapsed_seconds,
+        "chain_full_check_suites": continuation.chain_full_check_suites,
+        "chain_premium_escalations": (
+            continuation.chain_premium_escalations
+        ),
+        "chain_no_progress_events": continuation.chain_no_progress_events,
+        "chain_model_fallbacks": continuation.chain_model_fallbacks,
+    }
+    if any(
+        source_counters[field] != value
+        for field, value in continuation_counter_values.items()
+    ):
+        raise RuntimeError(
+            "Source result and continuation chain counters differ."
+        )
+    worker_call_delta = int(source_counters["chain_worker_calls"]) - int(
+        legacy_counters["chain_worker_calls"]
+    )
+    if (
+        int(source_counters["chain_child_runs"])
+        != int(legacy_counters["chain_child_runs"]) + 1
+        or worker_call_delta != 1
+        or int(source_counters["chain_codex_calls"])
+        != int(legacy_counters["chain_codex_calls"]) + 1
+        or source_counters["chain_elapsed_seconds"]
+        < legacy_counters["chain_elapsed_seconds"]
+        or any(
+            source_counters[field] != legacy_counters[field]
+            for field in (
+                "chain_full_check_suites",
+                "chain_premium_escalations",
+                "chain_no_progress_events",
+                "chain_model_fallbacks",
+            )
+        )
+    ):
+        raise RuntimeError(
+            "Legacy recovery child counters do not represent exactly one worker "
+            "dispatch with monotonic chain lineage."
+        )
+    if (
+        telemetry.get("schema_version") != SCHEMA_VERSION
+        or telemetry.get("run_id") != source_run_id
+        or telemetry.get("parent_run_id") != legacy_source_id
+        or telemetry.get("continuation_chain_id")
+        != continuation.continuation_chain_id
+        or telemetry.get("child_run_index")
+        != continuation.chain_child_runs
+        or telemetry.get("chain_elapsed_seconds")
+        != continuation.chain_elapsed_seconds
+        or int(telemetry.get("chain_model_fallbacks") or 0)
+        != continuation.chain_model_fallbacks
+        or int(telemetry.get("premium_escalations") or 0)
+        != continuation.chain_premium_escalations
+    ):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization telemetry lineage is "
+            "inconsistent."
+        )
+
+    legacy_journal_path = _decision_recovery_journal_path(
+        project, legacy_source_id
+    )
+    legacy_journal_sha256 = hashlib.sha256(
+        legacy_journal_path.read_bytes()
+    ).hexdigest()
+    normalization = {
+        "action": RECOVERY_ATTEMPT_BUDGET_NORMALIZATION_ACTION,
+        "source_run_id": source_run_id,
+        "legacy_recovery_source_run_id": legacy_source_id,
+        "replacement_packet_id": replacement_packet_id,
+        "source_plan_hash": source_plan_hash,
+        "source_contract_hash": current_contract.contract_hash,
+        "source_repository_fingerprint": current_fingerprint,
+        "source_config_hash": source_config_hash,
+        "legacy_decision_recovery_journal_sha256": (
+            legacy_journal_sha256
+        ),
+        "legacy_target_plan_hash": legacy_target_hash,
+        "legacy_parent_chain_worker_calls": int(
+            legacy_counters["chain_worker_calls"]
+        ),
+        "source_chain_worker_calls": int(
+            source_counters["chain_worker_calls"]
+        ),
+        "worker_call_delta": worker_call_delta,
+        "journal_state": "none",
+        "journal_target_plan_hash": None,
+    }
+    normalization_journal = (
+        _load_recovery_attempt_budget_normalization_journal(
+            project, source_run_id
+        )
+    )
+    source_plan_payload = source_plan.model_dump(mode="json")
+    if normalization_journal is None:
+        if current_plan.model_dump(mode="json") != source_plan_payload:
+            raise RuntimeError(
+                "Current plan is neither the exact packet-exhausted source plan "
+                "nor a journal-authenticated normalization target."
+            )
+    else:
+        expected_fields = {
+            "schema_version",
+            "action",
+            "source_run_id",
+            "legacy_recovery_source_run_id",
+            "replacement_packet_id",
+            "source_plan_hash",
+            "source_contract_hash",
+            "source_repository_fingerprint",
+            "source_config_hash",
+            "legacy_decision_recovery_journal_sha256",
+            "legacy_target_plan_hash",
+            "legacy_parent_chain_worker_calls",
+            "source_chain_worker_calls",
+            "worker_call_delta",
+            "prepared_by_run_id",
+            "created_at",
+            "phase",
+            "child_run_id",
+            "target_plan_hash",
+            "target_plan",
+        }
+        if set(normalization_journal) != expected_fields:
+            raise RuntimeError(
+                "Recovery-attempt normalization journal fields are incomplete "
+                "or unexpected."
+            )
+        exact_values = {
+            key: value
+            for key, value in normalization.items()
+            if key not in {"journal_state", "journal_target_plan_hash"}
+        }
+        if any(
+            normalization_journal.get(field) != value
+            for field, value in exact_values.items()
+        ):
+            raise RuntimeError(
+                "Recovery-attempt normalization journal provenance changed."
+            )
+        if (
+            normalization_journal.get("phase") != "prepared"
+            or normalization_journal.get("child_run_id") is not None
+        ):
+            raise RuntimeError(
+                "Recovery-attempt normalization child already started; replay "
+                "is forbidden."
+            )
+        try:
+            _safe_run_id(
+                str(normalization_journal.get("prepared_by_run_id") or "")
+            )
+            if (
+                not isinstance(
+                    normalization_journal.get("created_at"), str
+                )
+                or not str(
+                    normalization_journal.get("created_at")
+                ).strip()
+            ):
+                raise ValueError("created_at")
+            target_plan = ProjectPlan.model_validate(
+                normalization_journal["target_plan"]
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Recovery-attempt normalization journal target is invalid."
+            ) from exc
+        target_hash = plan_hash(target_plan)
+        if normalization_journal.get("target_plan_hash") != target_hash:
+            raise RuntimeError(
+                "Recovery-attempt normalization journal target hash changed."
+            )
+        derived_target = apply_recovery_attempt_budget_normalization_plan(
+            source_plan,
+            normalization,
+            merged_config,
+        )
+        derived_target.updated_at = target_plan.updated_at
+        derived_target.last_validated_at = target_plan.last_validated_at
+        derived_target.last_validation_summary = (
+            target_plan.last_validation_summary
+        )
+        derived_target = ProjectPlan.model_validate(
+            derived_target.model_dump(mode="json")
+        )
+        if (
+            derived_target.model_dump(mode="json")
+            != target_plan.model_dump(mode="json")
+        ):
+            raise RuntimeError(
+                "Recovery-attempt normalization target is not the deterministic "
+                "source-plan transform."
+            )
+        current_payload = current_plan.model_dump(mode="json")
+        target_payload = target_plan.model_dump(mode="json")
+        if current_payload == source_plan_payload:
+            normalization["journal_state"] = "intent_only"
+        elif current_payload == target_payload:
+            normalization["journal_state"] = "target_applied"
+            continuation_payload = continuation.model_dump(mode="json")
+            continuation_payload["plan_hash"] = target_hash
+            continuation = ContinuationPayload.model_validate(
+                continuation_payload
+            )
+        else:
+            raise RuntimeError(
+                "Current plan differs from both states authorized by the "
+                "recovery-attempt normalization journal."
+            )
+        normalization["journal_target_plan_hash"] = target_hash
+
+    _assert_no_existing_recovery_child(project, source_run_id)
+    return {
+        "continuation": continuation,
+        "normalization": normalization,
+    }
+
+
+def load_resume_context(
+    project: Path,
+    requested_run_id: str,
+    *,
+    resume_kind: ResumeKind = "direct_manual",
+    authorize_packet_recovery: bool = True,
+    expected_decision_recovery_sha256: str | None = None,
+) -> dict[str, Any]:
+    resume_kind = _validate_resume_kind(resume_kind)
+    requested_latest = str(requested_run_id).strip().lower() == "latest"
+    if expected_decision_recovery_sha256 is not None:
+        _validated_decision_recovery_sha256(
+            expected_decision_recovery_sha256
+        )
+        if requested_latest:
+            raise RuntimeError(
+                "Post-worker decision recovery requires an exact source run ID; "
+                "'latest' is forbidden."
+            )
     project = validate_existing_project_path(project)
     source_directory = resolve_resume_run_directory(project, requested_run_id)
     source_run = load_json_object(source_directory / "run.json", "Zdrojový Forge run")
     source_result = read_result_compat(source_directory / "result.json")
+    source_stop_reason = str(source_result.get("stop_reason_code") or "")
     source_run_id = _safe_run_id(str(source_result.get("run_id") or source_directory.name))
     if source_directory.name != source_run_id:
         raise RuntimeError(
             "Zdrojový result.json nezodpovedá run adresáru; resume sa bezpečne zastavil."
+        )
+    if source_result.get("final_status") == "failed":
+        return _load_post_worker_decision_recovery_context(
+            project,
+            source_directory,
+            source_run,
+            source_result,
+            source_run_id=source_run_id,
+            resume_kind=resume_kind,
+            expected_decision_recovery_sha256=(
+                expected_decision_recovery_sha256
+            ),
+        )
+    if expected_decision_recovery_sha256 is not None:
+        raise RuntimeError(
+            "An expected decision-recovery SHA-256 may be supplied only for the "
+            "explicit failed-run recovery path."
         )
     if source_result.get("final_status") != "needs_continuation":
         raise RuntimeError(
@@ -1283,18 +4173,37 @@ def load_resume_context(project: Path, requested_run_id: str) -> dict[str, Any]:
     if not continuation.next_prompt.strip():
         raise RuntimeError("Continuation next_prompt je prázdny; resume sa nespustil.")
 
-    config = source_run.get("config")
-    if not isinstance(config, dict):
-        raise RuntimeError(
-            f"Run {source_run_id} nemá čitateľnú použitú konfiguráciu."
+    merged_config, source_config_hash, legacy_config_compatibility = (
+        _verified_resume_config(
+            source_directory,
+            source_run,
+            source_result,
+            continuation,
+            resume_kind=resume_kind,
         )
-    merged_config = DEFAULT_CONFIG.copy()
-    merged_config.update(config)
-    validate_config(merged_config)
+    )
     goal = source_run.get("goal") or source_result.get("goal")
     if not isinstance(goal, str) or not goal.strip():
         raise RuntimeError(f"Run {source_run_id} nemá pôvodný cieľ.")
+    (
+        base_chain_budgets,
+        effective_chain_budgets,
+        budget_extension_count,
+        budget_extended,
+    ) = _resolve_resume_budgets(
+        source_run,
+        source_result,
+        continuation,
+        merged_config,
+        source_run_id=source_run_id,
+        source_stop_reason=source_stop_reason,
+        resume_kind=resume_kind,
+        legacy_config_compatibility=legacy_config_compatibility,
+    )
     source_config_preview = source_run.get("config")
+    recovery_authorized_from_run_id: str | None = None
+    bounded_packet_recovery_eligible = False
+    recovery_attempt_budget_normalization: dict[str, Any] | None = None
     if (
         int(source_result.get("schema_version") or 1) >= ADAPTIVE_SCHEMA_VERSION
         and isinstance(source_config_preview, dict)
@@ -1319,39 +4228,168 @@ def load_resume_context(project: Path, requested_run_id: str) -> dict[str, Any]:
                 "Adaptive continuation payload is incomplete; missing: "
                 + ", ".join(adaptive_missing)
             )
-        identity = stable_project_identity(project)
-        if continuation.project_id != identity["project_id"]:
-            raise RuntimeError("Resume project identity does not match the source run.")
-        plan_path = project / ".forge" / "project-plan.json"
-        if not plan_path.is_file():
-            raise RuntimeError("Persistent project plan is missing; resume stopped safely.")
-        current_plan = ProjectPlan.model_validate_json(
-            plan_path.read_text(encoding="utf-8")
-        )
-        if current_plan.plan_id != continuation.plan_id:
-            raise RuntimeError("Persistent plan identity does not match the source run.")
-        if plan_hash(current_plan) != continuation.plan_hash:
-            raise RuntimeError(
-                "Persistent project plan changed outside the source run; resume stopped "
-                "instead of silently executing a stale packet."
+        if source_stop_reason == "packet_attempts_exhausted":
+            normalization_context = (
+                _load_recovery_attempt_budget_normalization_context(
+                    project,
+                    source_directory,
+                    source_run,
+                    source_result,
+                    continuation,
+                    source_run_id=source_run_id,
+                    goal=goal,
+                    merged_config=merged_config,
+                    source_config_hash=source_config_hash,
+                    resume_kind=resume_kind,
+                    requested_latest=requested_latest,
+                )
             )
-        contract_path = project / ".forge" / "check-contract.json"
-        if not contract_path.is_file():
-            raise RuntimeError(
-                "Forge-owned check contract is missing; resume stopped safely."
-            )
-        try:
-            current_contract = CheckContract.model_validate_json(
-                contract_path.read_text(encoding="utf-8")
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                "Forge-owned check contract is invalid; resume stopped safely."
-            ) from exc
-        if current_contract.contract_hash != continuation.check_contract_hash:
-            raise RuntimeError(
-                "Check contract hash changed since the source run; resume requires "
-                "a consistency review and stopped before worker execution."
+            if normalization_context is not None:
+                continuation = normalization_context["continuation"]
+                recovery_attempt_budget_normalization = (
+                    normalization_context["normalization"]
+                )
+            else:
+                _, current_plan, _ = load_verified_adaptive_resume_state(
+                    project,
+                    continuation,
+                    goal=goal,
+                )
+            if resume_kind == "internal_automatic":
+                raise RuntimeError(
+                    "Packet-attempt recovery requires an explicit human resume; "
+                    "automatic child resume is forbidden."
+                )
+            if recovery_attempt_budget_normalization is None:
+                candidate_results: list[dict[str, Any]] = [source_result]
+                parent_id = source_result.get("parent_run_id")
+                if isinstance(parent_id, str) and parent_id.strip():
+                    parent_directory = (
+                        project / ".forge" / "runs" / _safe_run_id(parent_id)
+                    )
+                    if parent_directory.is_dir():
+                        parent_result = read_result_compat(
+                            parent_directory / "result.json"
+                        )
+                        if (
+                            parent_result.get("continuation_chain_id")
+                            == source_result.get("continuation_chain_id")
+                        ):
+                            candidate_results.append(parent_result)
+
+                counters = ChainCounters(
+                    child_runs=continuation.chain_child_runs,
+                    codex_calls=continuation.chain_codex_calls,
+                    worker_calls=continuation.chain_worker_calls,
+                    elapsed_seconds=continuation.chain_elapsed_seconds,
+                    full_check_suites=continuation.chain_full_check_suites,
+                    premium_escalations=(
+                        continuation.chain_premium_escalations
+                    ),
+                    no_progress_events=(
+                        continuation.chain_no_progress_events
+                    ),
+                )
+                recovery_budgets = ChainBudgets.model_validate(
+                    merged_config.get("chain_budgets", {})
+                )
+                budget_reason = next(
+                    (
+                        f"Continuation chain budget exhausted: {label}={current}, "
+                        f"limit={maximum}."
+                        for label, current, maximum in (
+                            (
+                                "child runs",
+                                counters.child_runs,
+                                recovery_budgets.max_child_runs,
+                            ),
+                            (
+                                "Codex calls",
+                                counters.codex_calls,
+                                recovery_budgets.max_codex_calls,
+                            ),
+                            (
+                                "worker calls",
+                                counters.worker_calls,
+                                recovery_budgets.max_worker_calls,
+                            ),
+                            (
+                                "elapsed seconds",
+                                counters.elapsed_seconds,
+                                recovery_budgets.max_elapsed_seconds,
+                            ),
+                            (
+                                "full check suites",
+                                counters.full_check_suites,
+                                recovery_budgets.max_full_check_suites,
+                            ),
+                            (
+                                "no-progress events",
+                                counters.no_progress_events,
+                                recovery_budgets.max_no_progress_events,
+                            ),
+                        )
+                        if current >= maximum
+                    ),
+                    None,
+                )
+                for candidate in candidate_results:
+                    raw_decision = candidate.get("final_decision")
+                    raw_checks = candidate.get("checks")
+                    if not isinstance(raw_decision, dict) or not isinstance(
+                        raw_checks, list
+                    ):
+                        continue
+                    try:
+                        candidate_decision = Decision.model_validate(
+                            raw_decision
+                        )
+                        candidate_checks = [
+                            CheckResult.model_validate(item)
+                            for item in raw_checks
+                        ]
+                    except Exception:
+                        continue
+                    if (
+                        candidate_decision.next_prompt
+                        != continuation.next_prompt
+                    ):
+                        continue
+                    (
+                        current_plan,
+                        authorized,
+                    ) = maybe_authorize_final_review_recovery(
+                        current_plan,
+                        candidate_decision,
+                        candidate_checks,
+                        config=merged_config,
+                        last_check_tier=str(
+                            candidate.get("last_check_tier") or ""
+                        ),
+                        no_progress_count=continuation.no_progress_count,
+                        failed_iterations=continuation.failed_iterations,
+                        budget_reason=budget_reason,
+                    )
+                    if authorized:
+                        bounded_packet_recovery_eligible = True
+                        recovery_authorized_from_run_id = str(
+                            candidate.get("run_id") or source_run_id
+                        )
+                        if authorize_packet_recovery:
+                            save_plan(project, current_plan)
+                            continuation.plan_hash = plan_hash(current_plan)
+                        break
+                if recovery_authorized_from_run_id is None:
+                    raise RuntimeError(
+                        f"Run {source_run_id} exhausted packet attempts and has "
+                        "no eligible bounded final-review recovery. Manual resume "
+                        "would repeat the same stop; human replanning is required."
+                    )
+        else:
+            load_verified_adaptive_resume_state(
+                project,
+                continuation,
+                goal=goal,
             )
 
     return {
@@ -1361,6 +4399,25 @@ def load_resume_context(project: Path, requested_run_id: str) -> dict[str, Any]:
         "config": merged_config,
         "continuation": continuation.model_dump(mode="json"),
         "source_result_schema_version": int(source_result.get("schema_version") or 1),
+        "source_stop_reason_code": source_stop_reason,
+        "source_automatic_resume_allowed": bool(
+            source_result.get("automatic_resume_allowed", False)
+        ),
+        "resume_kind": resume_kind,
+        "source_config_hash": source_config_hash,
+        "legacy_config_compatibility": legacy_config_compatibility,
+        "base_chain_budgets": base_chain_budgets.model_dump(mode="json"),
+        "effective_chain_budgets": effective_chain_budgets.model_dump(mode="json"),
+        "budget_extension_count": budget_extension_count,
+        "budget_extended": budget_extended,
+        "bounded_packet_recovery_eligible": bounded_packet_recovery_eligible,
+        "recovery_authorized_from_run_id": recovery_authorized_from_run_id,
+        "recovery_attempt_budget_normalization_eligible": (
+            recovery_attempt_budget_normalization is not None
+        ),
+        "recovery_attempt_budget_normalization": (
+            recovery_attempt_budget_normalization
+        ),
     }
 
 
@@ -1381,9 +4438,686 @@ def ensure_git_repo(project: Path) -> None:
 
 def is_probably_text_file(path: Path) -> bool:
     name = path.name.lower()
-    if name == ".env.example":
+    if name == ".env.example" or name in BOOTSTRAP_TEXT_FILENAMES:
         return True
     return path.suffix.lower() in TEXT_EXTENSIONS
+
+
+def _git_bytes(
+    project: Path,
+    *args: str,
+    input_bytes: bytes | None = None,
+) -> tuple[int, bytes, str | None]:
+    """Run an internal Git read without a shell and retain exact binary output."""
+    disabled_hooks = project / ".forge" / "git-hooks-disabled"
+    disabled_hooks.mkdir(parents=True, exist_ok=True)
+    env = subscription_only_env()
+    env.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GCM_INTERACTIVE": "Never",
+        }
+    )
+    try:
+        cp = subprocess.run(
+            [
+                "git",
+                "-c",
+                f"core.hooksPath={disabled_hooks.resolve()}",
+                *args,
+            ],
+            cwd=str(project),
+            input=input_bytes,
+            capture_output=True,
+            timeout=120,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return 124, b"", "Git read timed out."
+    if cp.returncode != 0:
+        detail = (cp.stderr or b"").decode("utf-8", errors="replace").strip()
+        return (
+            cp.returncode,
+            b"",
+            redact_text(truncate(detail, 500)) or "Git read failed.",
+        )
+    return 0, cp.stdout or b"", None
+
+
+def _git_nul_paths(project: Path, *args: str) -> tuple[set[str], str | None]:
+    """Read Git path output without trimming or shell-interpreting unusual names."""
+    code, payload, error = _git_bytes(project, *args)
+    if code != 0:
+        return set(), error
+    paths: set[str] = set()
+    for item in payload.split(b"\0"):
+        if not item:
+            continue
+        try:
+            paths.add(item.decode("utf-8", errors="strict"))
+        except UnicodeDecodeError:
+            return (
+                set(),
+                "Git returned a non-UTF-8 path; bootstrap scanning stopped "
+                "instead of merging distinct byte paths.",
+            )
+    return paths, None
+
+
+def _git_staged_entries(
+    project: Path, staged_paths: set[str] | None = None
+) -> tuple[dict[str, tuple[str, str]], str | None]:
+    """Map stage-zero paths to (mode, object id) without reading working files."""
+    code, payload, error = _git_bytes(project, "ls-files", "--stage", "-z")
+    if code != 0:
+        return {}, error
+    entries: dict[str, tuple[str, str]] = {}
+    for record in payload.split(b"\0"):
+        if not record or b"\t" not in record:
+            continue
+        metadata, raw_path = record.split(b"\t", 1)
+        fields = metadata.split()
+        if len(fields) != 3 or fields[2] != b"0":
+            continue
+        try:
+            relative_path = raw_path.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return (
+                {},
+                "Git index contains a non-UTF-8 path; bootstrap scanning stopped "
+                "instead of merging distinct byte paths.",
+            )
+        if staged_paths is not None and relative_path not in staged_paths:
+            continue
+        mode = fields[0].decode("ascii", errors="replace")
+        object_id = fields[1].decode("ascii", errors="replace")
+        if re.fullmatch(r"[0-9a-fA-F]{40,64}", object_id):
+            entries[relative_path] = (mode, object_id)
+    return entries, None
+
+
+def _git_index_symlink_targets(
+    project: Path,
+    index_entries: dict[str, tuple[str, str]],
+) -> tuple[dict[str, str], str | None]:
+    """Read bounded stage-zero symlink targets for index-chain validation."""
+    symlink_entries = {
+        path: object_id
+        for path, (mode, object_id) in index_entries.items()
+        if mode == "120000"
+    }
+    if len(symlink_entries) > BOOTSTRAP_SCAN_MAX_FILES:
+        return (
+            {},
+            "Git index contains too many symlinks for bounded bootstrap scanning.",
+        )
+    object_ids = list(dict.fromkeys(symlink_entries.values()))
+    metadata, metadata_error = _git_blob_metadata(project, object_ids)
+    if metadata_error:
+        return {}, metadata_error
+    total_size = 0
+    for object_id in object_ids:
+        object_metadata = metadata.get(object_id)
+        if object_metadata is None or object_metadata[0] != "blob":
+            return {}, "Git index symlink points to an unreadable object."
+        object_size = object_metadata[1]
+        if object_size > BOOTSTRAP_SCAN_MAX_FILE_BYTES:
+            return {}, "Git index symlink target exceeds the per-file scan bound."
+        total_size += object_size
+        if total_size > BOOTSTRAP_SCAN_MAX_TOTAL_BYTES:
+            return {}, "Git index symlink targets exceed the total scan bound."
+    blobs, blob_error = _git_read_blobs(project, object_ids)
+    if blob_error:
+        return {}, blob_error
+    targets: dict[str, str] = {}
+    for path, object_id in symlink_entries.items():
+        raw_target = blobs.get(object_id)
+        if raw_target is None:
+            return {}, "Git index symlink target blob is missing."
+        try:
+            targets[path] = raw_target.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return {}, "Git index symlink target is not valid UTF-8."
+    return targets, None
+
+
+def _git_blob_metadata(
+    project: Path, object_ids: list[str]
+) -> tuple[dict[str, tuple[str, int]], str | None]:
+    if not object_ids:
+        return {}, None
+    request = ("\n".join(object_ids) + "\n").encode("ascii")
+    code, payload, error = _git_bytes(
+        project,
+        "cat-file",
+        "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+        input_bytes=request,
+    )
+    if code != 0:
+        return {}, error
+    metadata: dict[str, tuple[str, int]] = {}
+    for line in payload.splitlines():
+        fields = line.decode("ascii", errors="replace").split()
+        if len(fields) != 3:
+            continue
+        try:
+            size = int(fields[2])
+        except ValueError:
+            continue
+        metadata[fields[0]] = (fields[1], size)
+    return metadata, None
+
+
+def _git_read_blobs(
+    project: Path, object_ids: list[str]
+) -> tuple[dict[str, bytes], str | None]:
+    """Read only size-approved Git blobs and parse --batch framing exactly."""
+    if not object_ids:
+        return {}, None
+    request = ("\n".join(object_ids) + "\n").encode("ascii")
+    code, payload, error = _git_bytes(
+        project, "cat-file", "--batch", input_bytes=request
+    )
+    if code != 0:
+        return {}, error
+    blobs: dict[str, bytes] = {}
+    cursor = 0
+    for requested_id in object_ids:
+        header_end = payload.find(b"\n", cursor)
+        if header_end < 0:
+            return {}, "Git blob batch returned a truncated header."
+        fields = payload[cursor:header_end].decode(
+            "ascii", errors="replace"
+        ).split()
+        if len(fields) != 3 or fields[1] != "blob":
+            return {}, "Git blob batch returned an unexpected object."
+        try:
+            size = int(fields[2])
+        except ValueError:
+            return {}, "Git blob batch returned an invalid size."
+        content_start = header_end + 1
+        content_end = content_start + size
+        if content_end >= len(payload) or payload[content_end : content_end + 1] != b"\n":
+            return {}, "Git blob batch returned truncated content."
+        blobs[requested_id] = payload[content_start:content_end]
+        cursor = content_end + 1
+    return blobs, None
+
+
+def _bootstrap_fixture_path(relative_path: str) -> bool:
+    parts = {
+        part.casefold()
+        for part in relative_path.replace("\\", "/").split("/")
+        if part
+    }
+    return bool(parts & BOOTSTRAP_FIXTURE_PARTS)
+
+
+def _bootstrap_placeholder(value: str) -> bool:
+    upper = value.upper()
+    placeholder_markers = (
+        "CHANGEME",
+        "DUMMY",
+        "EXAMPLE",
+        "FAKE",
+        "PLACEHOLDER",
+        "REDACTED",
+        "SAMPLE",
+        "TEST",
+        "YOUR_",
+        "XXXX",
+    )
+    if any(marker in upper for marker in placeholder_markers):
+        return True
+    compact = re.sub(r"[^A-Za-z0-9]", "", value)
+    return len(set(compact.casefold())) < 6
+
+
+def _bootstrap_secret_like(value: str) -> bool:
+    if _bootstrap_placeholder(value) or len(value) < 20:
+        return False
+    categories = sum(
+        bool(pattern.search(value))
+        for pattern in (
+            re.compile(r"[a-z]"),
+            re.compile(r"[A-Z]"),
+            re.compile(r"[0-9]"),
+            re.compile(r"[^A-Za-z0-9]"),
+        )
+    )
+    return categories >= 2 and len(set(value)) >= 10
+
+
+def _bootstrap_line_number(text: str, offset: int) -> int:
+    return text.count("\n", 0, max(0, offset)) + 1
+
+
+def _bootstrap_conflict_lines(text: str) -> list[int]:
+    """Find conflict blocks without treating ordinary ======= rules as conflicts."""
+    opener: int | None = None
+    base: int | None = None
+    separator: int | None = None
+    findings: list[int] = []
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        if BOOTSTRAP_CONFLICT_OPEN_RE.fullmatch(line):
+            if opener is not None:
+                findings.append(opener)
+            opener = line_number
+            base = None
+            separator = None
+        elif opener is not None and BOOTSTRAP_CONFLICT_BASE_RE.fullmatch(line):
+            base = line_number
+        elif opener is not None and line == "=======":
+            separator = line_number
+        elif opener is not None and BOOTSTRAP_CONFLICT_CLOSE_RE.fullmatch(line):
+            findings.extend(
+                item
+                for item in (opener, base, separator, line_number)
+                if item is not None
+            )
+            opener = None
+            base = None
+            separator = None
+    if opener is not None:
+        findings.append(opener)
+    return findings
+
+
+def _bootstrap_symlink_finding(
+    project: Path,
+    link_path: Path,
+    target_text: str,
+    *,
+    index_entries: dict[str, tuple[str, str]],
+    index_symlink_targets: dict[str, str],
+    staged_paths: set[str] | None = None,
+) -> str | None:
+    """Validate a symlink and its full stage-zero index chain."""
+    if not target_text or "\x00" in target_text:
+        return "symlink-invalid-target"
+
+    def lexical_target(
+        current_link: Path,
+        current_target_text: str,
+    ) -> tuple[str | None, str | None]:
+        current_target = Path(current_target_text)
+        if current_target.is_absolute() or current_target.drive:
+            return None, "symlink-absolute-target"
+        try:
+            current_link.parent.resolve().relative_to(project)
+            absolute_target = Path(
+                os.path.abspath(str(current_link.parent / current_target))
+            )
+            relative_target = absolute_target.relative_to(project).as_posix()
+        except (OSError, RuntimeError, ValueError):
+            return None, "symlink-outside-project-target"
+        if (
+            not relative_target
+            or relative_target == "."
+            or relative_target.split("/", 1)[0].casefold()
+            in {".git", ".forge"}
+        ):
+            return None, "symlink-protected-control-target"
+        return relative_target, None
+
+    direct_target, direct_finding = lexical_target(link_path, target_text)
+    if direct_finding is not None:
+        return direct_finding
+    assert direct_target is not None
+
+    # Validate the stage-zero Git graph lexically instead of dereferencing the
+    # working tree.  GitHub Windows runners may expose the checkout through a
+    # path alias whose resolved spelling is not relative to the lexical
+    # workspace, and dereferencing here would also inspect data outside the
+    # approved index chain.  Every accepted hop below must still be present in
+    # the index and use an explicitly supported mode.
+    direct_candidate = project / Path(direct_target)
+    if direct_target not in index_entries:
+        if (
+            not direct_candidate.exists()
+            and direct_target not in (staged_paths or set())
+        ):
+            return "symlink-dangling-target"
+        return "symlink-untracked-target"
+
+    visited: set[str] = set()
+    current_link = link_path
+    current_target_text = target_text
+    while True:
+        relative_target, finding = lexical_target(
+            current_link, current_target_text
+        )
+        if finding is not None:
+            return finding
+        assert relative_target is not None
+        if relative_target in visited:
+            return "symlink-cycle"
+        visited.add(relative_target)
+        target_entry = index_entries.get(relative_target)
+        if target_entry is None:
+            return "symlink-untracked-target"
+        target_mode = target_entry[0]
+        if target_mode in {"100644", "100755"}:
+            return None
+        if target_mode != "120000":
+            return "symlink-index-target-unsupported-mode"
+        next_target = index_symlink_targets.get(relative_target)
+        if next_target is None or not next_target or "\x00" in next_target:
+            return "symlink-invalid-target"
+        current_link = project / relative_target
+        current_target_text = next_target
+
+
+def _bootstrap_display_path(relative_path: str) -> str:
+    """Render a path as data, never as a terminal control sequence."""
+    return json.dumps(relative_path, ensure_ascii=True)
+
+
+def run_bootstrap_integrity_check(project: Path) -> tuple[int, str]:
+    """Scan only pending project content and never echo a matched secret value."""
+    project = project.expanduser().resolve()
+    untracked, untracked_error = _git_nul_paths(
+        project, "ls-files", "-z", "--others", "--exclude-standard"
+    )
+    unstaged, unstaged_error = _git_nul_paths(
+        project, "diff", "--name-only", "-z", "--diff-filter=ACMRT", "--"
+    )
+    staged, staged_error = _git_nul_paths(
+        project, "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMRT", "--"
+    )
+    discovery_errors = [
+        item for item in (untracked_error, unstaged_error, staged_error) if item
+    ]
+    if discovery_errors:
+        return 1, (
+            "Bootstrap integrity scan could not enumerate pending files: "
+            + "; ".join(discovery_errors)
+        )
+
+    pending_paths = untracked | unstaged | staged
+    if len(pending_paths) > BOOTSTRAP_SCAN_MAX_FILES:
+        return 1, (
+            "Bootstrap integrity scan stopped safely: "
+            f"{len(pending_paths)} pending files exceed the "
+            f"{BOOTSTRAP_SCAN_MAX_FILES}-file bound."
+        )
+
+    issues: list[tuple[str, str, int | None]] = []
+    issue_keys: set[tuple[str, str, int | None]] = set()
+    total_bytes = 0
+    scanned_files = 0
+    skipped_binary = 0
+
+    def add_issue(category: str, relative_path: str, line: int | None = None) -> None:
+        key = (category, relative_path, line)
+        if key not in issue_keys and len(issues) < BOOTSTRAP_SCAN_MAX_ISSUES:
+            issue_keys.add(key)
+            issues.append(key)
+
+    index_entries, index_entry_error = _git_staged_entries(project)
+    if index_entry_error:
+        return 1, (
+            "Bootstrap integrity scan could not inspect the Git index: "
+            + index_entry_error
+        )
+    staged_entries = {
+        path: index_entries[path]
+        for path in staged
+        if path in index_entries
+    }
+    for missing_staged_path in sorted(
+        staged - set(staged_entries), key=str.casefold
+    ):
+        add_issue("staged-index-missing-entry", missing_staged_path)
+    index_symlink_targets, symlink_target_error = (
+        _git_index_symlink_targets(project, index_entries)
+    )
+    if symlink_target_error:
+        return 1, (
+            "Bootstrap integrity scan could not inspect index symlinks: "
+            + symlink_target_error
+        )
+
+    def scan_raw_text(
+        relative_path: str,
+        raw: bytes,
+        *,
+        check_untracked_whitespace: bool,
+        category_prefix: str = "",
+    ) -> None:
+        nonlocal total_bytes, scanned_files, skipped_binary
+        if total_bytes + len(raw) > BOOTSTRAP_SCAN_MAX_TOTAL_BYTES:
+            add_issue(
+                f"{category_prefix}total-text-scan-bound-exceeded",
+                relative_path,
+            )
+            return
+        if b"\x00" in raw:
+            skipped_binary += 1
+            return
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            skipped_binary += 1
+            return
+        total_bytes += len(raw)
+        scanned_files += 1
+        is_fixture = _bootstrap_fixture_path(relative_path)
+        suffix = Path(relative_path).suffix.casefold()
+
+        if check_untracked_whitespace:
+            for line_number, line in enumerate(
+                text.splitlines(keepends=True), start=1
+            ):
+                body = line.rstrip("\r\n")
+                trailing = body[len(body.rstrip(" \t")) :]
+                markdown_hard_break = (
+                    suffix in {".md", ".markdown"} and trailing == "  "
+                )
+                if trailing and not markdown_hard_break:
+                    add_issue(
+                        f"{category_prefix}trailing-whitespace",
+                        relative_path,
+                        line_number,
+                    )
+
+        if not is_fixture:
+            for line_number in _bootstrap_conflict_lines(text):
+                add_issue(
+                    f"{category_prefix}merge-conflict-marker",
+                    relative_path,
+                    line_number,
+                )
+
+        private_key = BOOTSTRAP_PRIVATE_KEY_RE.search(text)
+        if private_key is not None and not is_fixture:
+            add_issue(
+                f"{category_prefix}private-key-material",
+                relative_path,
+                _bootstrap_line_number(text, private_key.start()),
+            )
+        for category, pattern in BOOTSTRAP_KNOWN_SECRET_PATTERNS:
+            for match in pattern.finditer(text):
+                if not _bootstrap_placeholder(match.group(0)):
+                    add_issue(
+                        f"{category_prefix}{category}",
+                        relative_path,
+                        _bootstrap_line_number(text, match.start()),
+                    )
+        if not is_fixture:
+            for match in BOOTSTRAP_SECRET_ASSIGNMENT_RE.finditer(text):
+                if _bootstrap_secret_like(match.group(2)):
+                    add_issue(
+                        f"{category_prefix}credential-assignment",
+                        relative_path,
+                        _bootstrap_line_number(text, match.start()),
+                    )
+
+    for relative_path in sorted(untracked | unstaged, key=str.casefold):
+        candidate = project / relative_path
+        try:
+            if candidate.is_symlink():
+                try:
+                    target_text = os.readlink(candidate)
+                except OSError:
+                    add_issue("symlink-unreadable-target", relative_path)
+                    continue
+                finding = _bootstrap_symlink_finding(
+                    project,
+                    candidate,
+                    target_text,
+                    index_entries=index_entries,
+                    index_symlink_targets=index_symlink_targets,
+                    staged_paths=staged,
+                )
+                if finding is not None:
+                    add_issue(finding, relative_path)
+                scanned_files += 1
+                continue
+            resolved = candidate.resolve()
+            resolved.relative_to(project)
+            if not resolved.is_file():
+                continue
+            size = resolved.stat().st_size
+        except (OSError, ValueError):
+            add_issue("unreadable-or-outside-project", relative_path)
+            continue
+
+        probably_text = is_probably_text_file(resolved)
+        if size > BOOTSTRAP_SCAN_MAX_FILE_BYTES:
+            if probably_text:
+                add_issue("text-file-exceeds-scan-bound", relative_path)
+            else:
+                skipped_binary += 1
+            continue
+        if total_bytes + size > BOOTSTRAP_SCAN_MAX_TOTAL_BYTES:
+            add_issue("total-text-scan-bound-exceeded", relative_path)
+            break
+        try:
+            raw = resolved.read_bytes()
+        except OSError:
+            add_issue("unreadable-file", relative_path)
+            continue
+        scan_raw_text(
+            relative_path,
+            raw,
+            check_untracked_whitespace=relative_path in untracked,
+        )
+
+    blob_entries = {
+        path: (mode, object_id)
+        for path, (mode, object_id) in staged_entries.items()
+        if mode in {"100644", "100755", "120000"}
+    }
+    for path, (mode, _) in staged_entries.items():
+        if mode == "160000":
+            add_issue("staged-index-gitlink-not-allowed", path)
+        elif mode not in {"100644", "100755", "120000", "160000"}:
+            add_issue("staged-index-unsupported-mode", path)
+    object_ids = list(
+        dict.fromkeys(object_id for _, object_id in blob_entries.values())
+    )
+    object_metadata, metadata_error = _git_blob_metadata(project, object_ids)
+    if metadata_error:
+        return 1, (
+            "Bootstrap integrity scan could not inspect staged object sizes: "
+            + metadata_error
+        )
+
+    approved_object_ids: list[str] = []
+    approved_entries: list[tuple[str, str, str]] = []
+    planned_total = total_bytes
+    for relative_path, (mode, object_id) in sorted(
+        blob_entries.items(), key=lambda item: item[0].casefold()
+    ):
+        metadata = object_metadata.get(object_id)
+        if metadata is None or metadata[0] != "blob":
+            add_issue("staged-index-unreadable-object", relative_path)
+            continue
+        size = metadata[1]
+        probably_text = (
+            mode == "120000"
+            or is_probably_text_file(Path(relative_path))
+        )
+        if size > BOOTSTRAP_SCAN_MAX_FILE_BYTES:
+            if probably_text:
+                add_issue(
+                    "staged-text-file-exceeds-scan-bound", relative_path
+                )
+            else:
+                skipped_binary += 1
+            continue
+        if planned_total + size > BOOTSTRAP_SCAN_MAX_TOTAL_BYTES:
+            add_issue(
+                "staged-total-text-scan-bound-exceeded", relative_path
+            )
+            continue
+        planned_total += size
+        approved_entries.append((relative_path, object_id, mode))
+        if object_id not in approved_object_ids:
+            approved_object_ids.append(object_id)
+
+    staged_blobs, blob_error = _git_read_blobs(project, approved_object_ids)
+    if blob_error:
+        return 1, (
+            "Bootstrap integrity scan could not read approved staged blobs: "
+            + blob_error
+        )
+    for relative_path, object_id, mode in approved_entries:
+        raw = staged_blobs.get(object_id)
+        if raw is None:
+            add_issue("staged-index-missing-blob", relative_path)
+            continue
+        if mode == "120000":
+            try:
+                target_text = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                add_issue(
+                    "staged-index-symlink-invalid-target", relative_path
+                )
+                continue
+            finding = _bootstrap_symlink_finding(
+                project,
+                project / relative_path,
+                target_text,
+                index_entries=index_entries,
+                index_symlink_targets=index_symlink_targets,
+                staged_paths=set(staged_entries),
+            )
+            if finding is not None:
+                add_issue(f"staged-index-{finding}", relative_path)
+            scanned_files += 1
+            total_bytes += len(raw)
+            continue
+        scan_raw_text(
+            relative_path,
+            raw,
+            check_untracked_whitespace=False,
+            category_prefix="staged-index-",
+        )
+
+    if issues:
+        lines = [
+            "Bootstrap integrity scan failed. Matched content and secret values are "
+            "intentionally omitted."
+        ]
+        for category, relative_path, line_number in issues:
+            location = _bootstrap_display_path(relative_path)
+            if line_number is not None:
+                location += f":{line_number}"
+            lines.append(f"- {category}: {location}")
+        if len(issues) >= BOOTSTRAP_SCAN_MAX_ISSUES:
+            lines.append(
+                f"- additional findings omitted after {BOOTSTRAP_SCAN_MAX_ISSUES} issues"
+            )
+        return 1, "\n".join(lines)
+
+    return 0, (
+        "Bootstrap integrity scan passed: "
+        f"{scanned_files} pending text files inspected; "
+        f"{skipped_binary} binary/non-UTF-8 files skipped."
+    )
 
 
 def untracked_preview(
@@ -1457,6 +5191,36 @@ def changed_manifest_paths(
     )
     deleted = sorted(rel for rel in baseline if rel not in current)
     return changed, deleted
+
+
+def lean_docs_scope_violations(
+    packet: WorkPacket,
+    before_manifest: dict[str, str],
+    after_manifest: dict[str, str],
+) -> list[str]:
+    """Return changed paths that a lean documentation packet may not touch."""
+    changed, deleted = changed_manifest_paths(
+        before_manifest,
+        after_manifest,
+    )
+    expected = {
+        path.replace("\\", "/").lstrip("./").casefold()
+        for path in packet.expected_paths
+        if path.strip()
+    }
+
+    def allowed(raw_path: str) -> bool:
+        path = raw_path.replace("\\", "/").lstrip("./")
+        folded = path.casefold()
+        if folded == "readme.md" or folded.startswith("docs/"):
+            return True
+        return any(
+            folded == candidate
+            or folded.startswith(candidate.rstrip("/") + "/")
+            for candidate in expected
+        )
+
+    return sorted(path for path in [*changed, *deleted] if not allowed(path))
 
 
 def repo_fingerprint(project: Path) -> str:
@@ -1535,7 +5299,11 @@ def collect_repo_evidence(
 
 
 def discover_checks(project: Path, config: dict) -> list[str]:
-    checks: list[str] = ["git diff --check"]
+    checks: list[str] = [
+        FORGE_BOOTSTRAP_CHECK_COMMAND,
+        "git diff --check",
+        "git diff --cached --check",
+    ]
     if config.get("auto_detect_checks", True):
         package_json = project / "package.json"
         if package_json.exists():
@@ -1555,6 +5323,20 @@ def discover_checks(project: Path, config: dict) -> list[str]:
                         checks.append(f"{runner} run {name}")
             except (OSError, json.JSONDecodeError):
                 pass
+        gradle_project = any(
+            (project / marker).is_file()
+            for marker in (
+                "settings.gradle",
+                "settings.gradle.kts",
+                "build.gradle",
+                "build.gradle.kts",
+            )
+        )
+        if gradle_project:
+            if os.name == "nt" and (project / "gradlew.bat").is_file():
+                checks.append(r".\gradlew.bat --no-daemon test")
+            elif (project / "gradlew").is_file():
+                checks.append("./gradlew --no-daemon test")
         has_pytest = any(
             (project / marker).exists()
             for marker in ("pytest.ini", "tox.ini", "conftest.py", "tests")
@@ -1580,9 +5362,15 @@ def discover_check_definitions(
         return select_check_definitions(config, tier, requested_ids=requested_ids)
     commands = discover_checks(project, config)
     generated: list[CheckDefinition] = []
-    for index, command in enumerate(commands, start=1):
+    assigned_ids: dict[str, str] = {}
+    for command in commands:
         low = command.lower()
-        if "diff --check" in low or "compile" in low or "syntax" in low:
+        if (
+            command == FORGE_BOOTSTRAP_CHECK_COMMAND
+            or ("git diff" in low and "--check" in low)
+            or "compile" in low
+            or "syntax" in low
+        ):
             command_tier = "smoke"
         elif "e2e" in low or "build" in low:
             command_tier = "release"
@@ -1595,15 +5383,33 @@ def discover_check_definitions(
             test_pattern = r"(?P<count>\d+)\s+passed"
         elif "unittest" in low:
             test_pattern = r"Ran\s+(?P<count>\d+)\s+tests?"
+        is_gradle_test = bool(
+            re.search(r"\bgradlew(?:\.bat)?\b.*\btest\b", command, re.I)
+        )
+        check_id = collision_safe_auto_check_id(command, assigned_ids)
+        assigned_ids[check_id] = command.strip()
         generated.append(
             CheckDefinition(
-                check_id=f"auto-{index:02d}",
+                check_id=check_id,
                 command=command,
                 tier=command_tier,
                 timeout_seconds=int(config.get("check_timeout_seconds", 900)),
                 cacheable=False,
                 required_before_done=True,
                 test_count_pattern=test_pattern,
+                check_kind=(
+                    "security"
+                    if command == FORGE_BOOTSTRAP_CHECK_COMMAND
+                    else ("test" if is_gradle_test else "auto")
+                ),
+                report_path="." if is_gradle_test else None,
+                report_glob=(
+                    "**/build/test-results/**/*.xml"
+                    if is_gradle_test
+                    else None
+                ),
+                report_format="gradle-junit" if is_gradle_test else "auto",
+                require_test_execution=is_gradle_test,
             )
         )
     allowed_ids = {item.check_id for item in generated}
@@ -1621,14 +5427,13 @@ def discover_check_definitions(
     return selected
 
 
-def ensure_check_contract(
+def propose_check_contract(
     project: Path,
     config: dict,
     *,
-    approve_indirect_drift: bool = False,
     change_reason: str = "Forge validated the active verification configuration.",
 ) -> CheckContract:
-    """Create or validate the Forge-owned verification contract."""
+    """Build the current semantic proposal without mutating the stored contract."""
     definitions = discover_check_definitions(project, config, "release")
     if not definitions:
         raise RuntimeError("Adaptive Forge requires at least one check definition.")
@@ -1644,12 +5449,25 @@ def ensure_check_contract(
             for stack in definition.stacks
         }
     )
-    proposed = build_check_contract(
+    return build_check_contract(
         project,
         definitions,
         source=source,
         stacks=stacks,
         change_reason=change_reason,
+    )
+
+
+def ensure_check_contract(
+    project: Path,
+    config: dict,
+    *,
+    approve_indirect_drift: bool = False,
+    change_reason: str = "Forge validated the active verification configuration.",
+) -> CheckContract:
+    """Create or validate the Forge-owned verification contract."""
+    proposed = propose_check_contract(
+        project, config, change_reason=change_reason
     )
     path = project / ".forge" / "check-contract.json"
     if not path.is_file():
@@ -1668,13 +5486,15 @@ def ensure_check_contract(
         item.model_dump(mode="json") for item in proposed.check_definitions
     ]
     if current_definitions != proposed_definitions:
-        validate_contract_update(
-            current,
-            proposed,
-            justification=proposed.change_reason,
-        )
-        save_json(path, proposed)
-        return proposed
+        if approve_indirect_drift:
+            validate_contract_update(
+                current,
+                proposed,
+                justification=proposed.change_reason,
+            )
+            save_json(path, proposed)
+            return proposed
+        return current
     if (
         approve_indirect_drift
         and current.indirect_source_hashes != proposed.indirect_source_hashes
@@ -1689,8 +5509,149 @@ def ensure_check_contract(
     return current
 
 
+CHECK_CONTRACT_REVIEWABLE_DRIFT_PREFIXES = (
+    "Indirect check sources drifted",
+    "Auto-discovered check runners drifted",
+    "Configured check definitions drifted",
+)
+
+
+def _check_contract_semantic_hash(contract: CheckContract) -> str:
+    payload = contract.model_dump(mode="json")
+    for field in ("contract_hash", "created_at", "change_reason"):
+        payload.pop(field, None)
+    serialized = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def check_contract_drift_evidence(
+    project: Path,
+    expected: CheckContract,
+    config: dict,
+) -> dict[str, Any]:
+    """Return an exact redacted semantic diff suitable for Codex approval."""
+    proposed = propose_check_contract(
+        project,
+        config,
+        change_reason="Pending check-contract consistency review.",
+    )
+    old = {
+        item.check_id: item.model_dump(mode="json")
+        for item in expected.check_definitions
+    }
+    new = {
+        item.check_id: item.model_dump(mode="json")
+        for item in proposed.check_definitions
+    }
+    added = [
+        redact_data(new[check_id])
+        for check_id in sorted(set(new) - set(old))
+    ]
+    removed = [
+        redact_data(old[check_id])
+        for check_id in sorted(set(old) - set(new))
+    ]
+    modified: list[dict[str, Any]] = []
+    for check_id in sorted(set(old) & set(new)):
+        field_changes = {
+            field: {
+                "before": redact_data(old[check_id].get(field)),
+                "after": redact_data(new[check_id].get(field)),
+            }
+            for field in sorted(set(old[check_id]) | set(new[check_id]))
+            if old[check_id].get(field) != new[check_id].get(field)
+        }
+        if field_changes:
+            modified.append(
+                {"check_id": check_id, "fields": field_changes}
+            )
+    indirect_changes = []
+    old_indirect = expected.indirect_source_hashes
+    new_indirect = proposed.indirect_source_hashes
+    for source in sorted(set(old_indirect) | set(new_indirect)):
+        before = old_indirect.get(source)
+        after = new_indirect.get(source)
+        if before == after:
+            continue
+        indirect_changes.append(
+            {
+                "source": redact_text(source),
+                "change": (
+                    "added"
+                    if before is None
+                    else ("removed" if after is None else "modified")
+                ),
+                "before_sha256": before,
+                "after_sha256": after,
+            }
+        )
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "current_contract_hash": expected.contract_hash,
+        "current_semantic_hash": _check_contract_semantic_hash(expected),
+        "proposed_semantic_hash": _check_contract_semantic_hash(proposed),
+        "definition_changes": {
+            "added": added,
+            "removed": removed,
+            "modified": modified,
+        },
+        "indirect_source_changes": indirect_changes,
+        "approval_policy": (
+            "Set approve_check_contract_drift=true only after comparing every "
+            "old/new semantic field and indirect-source hash, finding no weakened "
+            "required/security/test/report gate, and provide a non-empty reason."
+        ),
+    }
+
+
+def apply_check_contract_approval(
+    project: Path,
+    config: dict,
+    current: CheckContract,
+    decision: Decision,
+    reviewed_evidence: dict[str, Any] | None,
+) -> tuple[CheckContract, bool]:
+    """Apply only an explicit, evidence-bound Codex contract approval."""
+    contract_error = check_contract_runtime_error(project, current, config)
+    if not contract_error or not contract_error.startswith(
+        CHECK_CONTRACT_REVIEWABLE_DRIFT_PREFIXES
+    ):
+        return current, False
+    if not decision.approve_check_contract_drift:
+        return current, False
+    if reviewed_evidence is None:
+        raise RuntimeError(
+            "Check-contract approval was requested without semantic drift evidence."
+        )
+    current_evidence = check_contract_drift_evidence(
+        project, current, config
+    )
+    if reviewed_evidence != current_evidence:
+        raise RuntimeError(
+            "Check-contract drift changed after Codex review; stale approval rejected."
+        )
+    updated = ensure_check_contract(
+        project,
+        config,
+        approve_indirect_drift=True,
+        change_reason=decision.check_contract_approval_reason,
+    )
+    if (
+        _check_contract_semantic_hash(updated)
+        != current_evidence["proposed_semantic_hash"]
+    ):
+        raise RuntimeError(
+            "Approved check contract does not match the reviewed semantic hash."
+        )
+    return updated, updated.contract_hash != current.contract_hash
+
+
 def check_contract_runtime_error(
-    project: Path, expected: CheckContract
+    project: Path,
+    expected: CheckContract,
+    config: dict | None = None,
 ) -> str | None:
     path = project / ".forge" / "check-contract.json"
     if not path.is_file():
@@ -1714,13 +5675,46 @@ def check_contract_runtime_error(
             "Indirect check sources drifted and require a Codex consistency review: "
             + ", ".join(changed)
         )
+    if config is not None:
+        discovered = discover_check_definitions(project, config, "release")
+        expected_by_id = {
+            item.check_id: item.model_dump(mode="json")
+            for item in expected.check_definitions
+        }
+        discovered_by_id = {
+            item.check_id: item.model_dump(mode="json")
+            for item in discovered
+        }
+        if discovered_by_id != expected_by_id:
+            added = sorted(set(discovered_by_id) - set(expected_by_id))
+            removed = sorted(set(expected_by_id) - set(discovered_by_id))
+            changed = sorted(
+                check_id
+                for check_id in set(expected_by_id) & set(discovered_by_id)
+                if expected_by_id[check_id] != discovered_by_id[check_id]
+            )
+            summary = []
+            if added:
+                summary.append("added=" + ",".join(added))
+            if removed:
+                summary.append("removed=" + ",".join(removed))
+            if changed:
+                summary.append("changed=" + ",".join(changed))
+            drift_kind = (
+                "Auto-discovered check runners"
+                if expected.source == "validated_auto_discovery"
+                else "Configured check definitions"
+            )
+            return (
+                f"{drift_kind} drifted and require a Codex consistency review: "
+                + "; ".join(summary)
+            )
     return None
 
 
 def build_srt_settings(project: Path, config: dict) -> Path:
     home = str(Path.home().resolve())
-    temp_dir = project / ".forge" / "check-tmp"
-    temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_dir = project_runtime_temp_dir(project, "checks")
     allowed_domains = [
         str(x).strip() for x in config.get("check_network_domains", []) if str(x).strip()
     ]
@@ -1786,7 +5780,7 @@ def build_check_environment(project: Path) -> dict[str, str]:
     """Build a secret-scrubbed, non-interactive environment for project checks."""
     env = subscription_only_env()
     check_home = project / ".forge" / "check-home"
-    check_tmp = project / ".forge" / "check-tmp"
+    check_tmp = project_runtime_temp_dir(project, "checks")
     disabled_hooks = project / ".forge" / "git-hooks-disabled"
     check_home.mkdir(parents=True, exist_ok=True)
     check_tmp.mkdir(parents=True, exist_ok=True)
@@ -1867,10 +5861,54 @@ def run_checks(
         else git_metadata_manifest(project)
     )
     warned_unsandboxed = False
+    contract_preflight_error = (
+        check_contract_runtime_error(project, check_contract, config)
+        if check_contract is not None
+        else None
+    )
     if config.get("adaptive_orchestration", False):
-        definitions = discover_check_definitions(
-            project, config, tier, requested_ids=requested_ids
-        )
+        if check_contract is not None:
+            contracted_ids = {
+                item.check_id for item in check_contract.check_definitions
+            }
+            unknown_requested = sorted(
+                set(requested_ids or []) - contracted_ids
+            )
+            if unknown_requested and contract_preflight_error is None:
+                raise RuntimeError(
+                    "Codex requested non-contracted check IDs: "
+                    + ", ".join(unknown_requested)
+                )
+            contracted_config = {
+                "check_definitions": [
+                    item.model_dump(mode="json")
+                    for item in check_contract.check_definitions
+                ]
+            }
+            definitions = select_check_definitions(
+                contracted_config,
+                tier,
+                requested_ids=[
+                    item
+                    for item in (requested_ids or [])
+                    if item in contracted_ids
+                ]
+                or None,
+            )
+            if contract_preflight_error is not None:
+                definitions = [
+                    item
+                    for item in definitions
+                    if item.command == FORGE_BOOTSTRAP_CHECK_COMMAND
+                    or (
+                        item.command.lower().startswith("git diff")
+                        and "--check" in item.command.lower()
+                    )
+                ]
+        else:
+            definitions = discover_check_definitions(
+                project, config, tier, requested_ids=requested_ids
+            )
     else:
         definitions = [
             CheckDefinition(
@@ -1881,6 +5919,24 @@ def run_checks(
                 required_before_done=True,
             )
             for index, command in enumerate(discover_checks(project, config), start=1)
+        ]
+    if contract_preflight_error is not None and not definitions:
+        return [
+            CheckResult(
+                command="forge check-contract preflight",
+                exit_code=1,
+                output=redact_text(contract_preflight_error),
+                check_id="forge-contract-preflight",
+                tier="smoke",
+                report_failure_reason=contract_preflight_error,
+                report_valid=False,
+                check_contract_hash=(
+                    check_contract.contract_hash
+                    if check_contract is not None
+                    else None
+                ),
+                check_contract_valid=False,
+            )
         ]
     for definition in definitions:
         command = definition.command
@@ -1896,25 +5952,42 @@ def run_checks(
         started = time.monotonic()
         started_wall_time = time.time()
         try:
-            invocation, use_shell = check_command_args(command, project, config)
-            if use_shell and str(config.get("sandbox_checks", "auto")).lower() == "auto" and not warned_unsandboxed:
-                print(
-                    "  BEZPEČNOSTNÉ VAROVANIE: srt nie je nainštalovaný; "
-                    "projektové kontroly bežia so scrubnutým prostredím, "
-                    "ale bez OS sandboxu. Tento režim je určený iba pre "
-                    "manuálny beh s človekom pri počítači."
+            if command == FORGE_BOOTSTRAP_CHECK_COMMAND:
+                internal_exit, internal_output = run_bootstrap_integrity_check(
+                    project
                 )
-                warned_unsandboxed = True
-            cp = subprocess.run(
-                invocation,
-                cwd=str(project),
-                shell=use_shell,
-                text=True,
-                capture_output=True,
-                timeout=int(definition.timeout_seconds),
-                env=env,
-                errors="replace",
-            )
+                cp = subprocess.CompletedProcess(
+                    args=[FORGE_BOOTSTRAP_CHECK_COMMAND],
+                    returncode=internal_exit,
+                    stdout=internal_output,
+                    stderr="",
+                )
+            else:
+                invocation, use_shell = check_command_args(
+                    command, project, config
+                )
+                if (
+                    use_shell
+                    and str(config.get("sandbox_checks", "auto")).lower() == "auto"
+                    and not warned_unsandboxed
+                ):
+                    print(
+                        "  BEZPEČNOSTNÉ VAROVANIE: srt nie je nainštalovaný; "
+                        "projektové kontroly bežia so scrubnutým prostredím, "
+                        "ale bez OS sandboxu. Tento režim je určený iba pre "
+                        "manuálny beh s človekom pri počítači."
+                    )
+                    warned_unsandboxed = True
+                cp = subprocess.run(
+                    invocation,
+                    cwd=str(project),
+                    shell=use_shell,
+                    text=True,
+                    capture_output=True,
+                    timeout=int(definition.timeout_seconds),
+                    env=env,
+                    errors="replace",
+                )
             raw_check_output = (cp.stdout or "") + (
                 "\n" + cp.stderr if cp.stderr else ""
             )
@@ -1973,7 +6046,7 @@ def run_checks(
                     + ", ".join(metadata_drift)
                 )
             contract_error = (
-                check_contract_runtime_error(project, check_contract)
+                check_contract_runtime_error(project, check_contract, config)
                 if check_contract is not None
                 else None
             )
@@ -2124,6 +6197,7 @@ def build_review_prompt(
     active_packet: WorkPacket | None = None,
     allowed_check_ids: list[str] | None = None,
     evidence_index: dict[str, Any] | None = None,
+    check_contract_evidence: dict[str, Any] | None = None,
 ) -> str:
     config = config or DEFAULT_CONFIG
     goal_text = compact_goal(goal, iteration, config)
@@ -2150,10 +6224,36 @@ def build_review_prompt(
         if evidence_index is not None
         else "(not available)"
     )
+    check_contract_evidence_text = (
+        json.dumps(
+            check_contract_evidence,
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+        )
+        if check_contract_evidence is not None
+        else "(no check-contract drift detected; approval must remain false)"
+    )
     adaptive_instruction = (
         (
             "This is the first planning pass. Create a coherent 4-12 packet plan_patch "
-            "and activate the first dependency-ready packet."
+            "and activate the first dependency-ready packet. "
+            + (
+                "This run uses lean orchestration: every added packet MUST contain "
+                "packet_type and a complete, self-contained worker_prompt. Each "
+                "worker_prompt must state the bounded goal, relevant context, all "
+                "acceptance criteria, expected_paths, forbidden_scope, and the "
+                "allowlisted checks/check tier that must pass. Forge will dispatch "
+                "these prompts without another routine Codex planning call. No "
+                "later than packet 3, produce a runnable application walking "
+                "skeleton with synthetic data and code expected_paths outside "
+                "docs/. Plan external Google, database, and third-party API work "
+                "mock-first: access gates may block only the real-data connection "
+                "packet, never safe local UI or logic. At most two of the first "
+                "five packets may be documentation or process work."
+                if config.get("orchestration_style", "classic") == "lean"
+                else ""
+            )
             if phase == "architecture"
             else "Update only the active packet through a minimal validated plan_patch."
         )
@@ -2190,10 +6290,37 @@ def build_review_prompt(
         STRUCTURED EVIDENCE INDEX:
         {evidence_index_text}
 
+        CHECK-CONTRACT SEMANTIC DIFF:
+        {check_contract_evidence_text}
+
         REPOSITORY EVIDENCE:
         {evidence}
 
         Return the strict versioned decision schema. {adaptive_instruction}
+        approve_check_contract_drift defaults to false. Set it true only after
+        comparing every old/new check field and indirect-source hash in the
+        semantic diff above, verifying that no required security/test/report
+        gate is weakened, and provide a concrete non-empty approval reason.
+        Review the complete current evidence before deciding. Report every
+        actionable defect that the evidence substantiates in this one decision;
+        do not drip-feed one small finding per review. If a repair is needed,
+        make next_prompt a single bounded repair packet that enumerates all such
+        defects visible now, and put every actionable objection in review_issues
+        with its repository-relative file_path whenever one exists.
+        Treat the user's goal and SPEC as authoritative. Do not invent stricter
+        product, compliance, or workflow requirements that they do not contain.
+        A schema-validation error, broken pipe, sandbox denial, timeout, or other
+        model transport failure is technical evidence, not a content failure of
+        the work packet, and must never be reported as an implementation defect.
+        Keep observed UI capability, local runtime behavior, remote transport,
+        account permission, and OAuth/API scope as separate facts; evidence for
+        one is not proof of another.
+        A restriction on deploy, production, remote systems, secrets, or external
+        accounts blocks only that restricted action. It must not block independent
+        safe local implementation or verification. If one packet is externally
+        blocked but another dependency-ready packet is independent and within
+        scope, select the independent packet and record the blocker instead of
+        stopping the whole project.
         Do not ask the human questions unless the task is genuinely blocked by a
         missing secret, account permission, legal/business choice, or unavailable external system.
         """
@@ -2205,7 +6332,18 @@ def build_consistency_review_prompt(
     evidence: str,
     current_fingerprint: str,
     config: dict,
+    check_contract_evidence: dict[str, Any] | None = None,
 ) -> str:
+    contract_evidence_text = (
+        json.dumps(
+            check_contract_evidence,
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+        )
+        if check_contract_evidence is not None
+        else "(no check-contract drift detected; approval must remain false)"
+    )
     return textwrap.dedent(
         f"""
         RESUME CONSISTENCY REVIEW ONLY
@@ -2236,15 +6374,48 @@ def build_consistency_review_prompt(
         EXTERNAL CHANGES AND CURRENT EVIDENCE:
         {evidence}
 
+        CHECK-CONTRACT SEMANTIC DIFF:
+        {contract_evidence_text}
+
         Return status=continue with either the exact original next_prompt or the
         smallest necessary adaptation. Preserve the acceptance criteria unless an
         external change makes one invalid. Return blocked only when proceeding is
         unsafe without human input. Do not return done in a consistency review.
+        approve_check_contract_drift must remain false unless the semantic diff is
+        present, every old/new field and indirect-source hash was compared, and no
+        required security/test/report gate is weakened. Approval requires a
+        concrete non-empty check_contract_approval_reason.
         """
     ).strip()
 
 
-DECISION_SCHEMA = Decision.model_json_schema()
+def normalize_codex_output_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Return a Codex-compatible strict JSON schema.
+
+    Codex structured outputs require every declared object property to appear
+    in that object's ``required`` array. Pydantic omits fields with defaults
+    from ``required`` even when their value schema already permits ``null``.
+    Requiring every declared property preserves the Pydantic value contract
+    while satisfying the stricter transport-level schema validator.
+    """
+    normalized = json.loads(json.dumps(schema))
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            properties = value.get("properties")
+            if isinstance(properties, dict):
+                value["required"] = list(properties)
+            for item in value.values():
+                visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    visit(normalized)
+    return normalized
+
+
+DECISION_SCHEMA = normalize_codex_output_schema(Decision.model_json_schema())
 
 
 def subscription_only_env() -> dict[str, str]:
@@ -2270,6 +6441,67 @@ def subscription_only_env() -> dict[str, str]:
             env.pop(key, None)
     env.update({"CI": "1", "NO_COLOR": "1", "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1"})
     return env
+
+
+def running_in_wsl() -> bool:
+    """Return whether Forge is executing inside WSL rather than native Linux."""
+    if os.name != "posix":
+        return False
+    if os.getenv("WSL_DISTRO_NAME"):
+        return True
+    try:
+        return "microsoft" in platform.release().lower()
+    except OSError:
+        return False
+
+
+def project_runtime_temp_dir(project: Path, purpose: str) -> Path:
+    """Return a private runtime directory on a socket-capable filesystem.
+
+    DrvFS paths below /mnt/* do not support the Unix sockets used by Sandbox
+    Runtime and Claude Code. Keep durable run state in the project while placing
+    only disposable transport files on native WSL storage.
+    """
+    safe_purpose = re.sub(r"[^A-Za-z0-9_.-]+", "-", purpose).strip("-") or "runtime"
+    project_key = hashlib.sha256(str(project.resolve()).encode("utf-8")).hexdigest()[:16]
+    if running_in_wsl():
+        root = Path("/tmp") / "gpt-claude-forge"
+    elif os.name == "nt":
+        root = project / ".forge" / "runtime-tmp"
+    else:
+        root = Path(tempfile.gettempdir()) / "gpt-claude-forge"
+    path = root / project_key / safe_purpose
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name == "posix":
+        path.chmod(0o700)
+    return path
+
+
+def claude_subprocess_env(project: Path) -> dict[str, str]:
+    """Build the scrubbed Claude environment with WSL-safe runtime paths."""
+    env = subscription_only_env()
+    if not running_in_wsl():
+        return env
+
+    runtime_dir = project_runtime_temp_dir(project, "claude")
+    env.update(
+        {
+            "TMPDIR": str(runtime_dir),
+            "TEMP": str(runtime_dir),
+            "TMP": str(runtime_dir),
+        }
+    )
+    return env
+
+
+def use_outer_claude_srt(config: dict) -> bool:
+    """Use one OS sandbox around Claude on WSL to avoid nested-bwrap defects."""
+    return (
+        running_in_wsl()
+        and bool(config.get("claude_outer_srt_on_wsl", True))
+        and str(config.get("security_profile", "")).lower() == "strict"
+        and shutil.which("srt") is not None
+    )
 
 
 def codex_auth_status() -> tuple[bool, str]:
@@ -2526,8 +6758,41 @@ def ask_orchestrator(
 
     try:
         payload = json.loads(output_path.read_text(encoding="utf-8"))
-        decision = Decision.model_validate(payload)
+        cosmetic_reason_normalized = bool(
+            isinstance(payload, dict)
+            and payload.get("approve_check_contract_drift") is False
+            and isinstance(
+                payload.get("check_contract_approval_reason"),
+                str,
+            )
+            and payload["check_contract_approval_reason"].strip()
+        )
+        normalized_payload = normalize_codex_decision_payload(payload)
+        decision = Decision.model_validate(normalized_payload)
+        if cosmetic_reason_normalized:
+            warning = (
+                "Dropped check_contract_approval_reason because "
+                "approve_check_contract_drift=false."
+            )
+            if warning not in decision.normalization_warnings:
+                decision.normalization_warnings.append(warning)
+        # Keep the run-scoped raw artifact faithful to the Codex response.  It
+        # is redacted and atomically rewritten for storage safety, but the
+        # ineffective reason is removed only from the validated Decision and
+        # the later *-decision.json artifact.
         atomic_save_json(output_path, payload)
+        if metadata_path is not None and decision.normalization_warnings:
+            telemetry_payload: dict[str, Any] = {}
+            if metadata_path.is_file():
+                candidate = json.loads(
+                    metadata_path.read_text(encoding="utf-8")
+                )
+                if isinstance(candidate, dict):
+                    telemetry_payload = candidate
+            telemetry_payload["normalization_warnings"] = list(
+                decision.normalization_warnings
+            )
+            save_json(metadata_path, telemetry_payload)
     except Exception as exc:
         raise RuntimeError(
             "Codex vrátil neplatné rozhodnutie:\n"
@@ -2541,42 +6806,145 @@ def ask_orchestrator(
     return decision
 
 
-def build_claude_settings(project: Path, config: dict) -> Path:
+def build_claude_settings(
+    project: Path,
+    config: dict,
+    *,
+    read_only: bool = False,
+) -> Path:
     deny = [
         "Bash(git push)", "Bash(git push *)", "Bash(git remote set-url *)",
         "Bash(gh pr create *)", "Bash(gh pr merge *)", "Bash(gh release create *)",
         "Bash(npm publish *)", "Bash(pnpm publish *)", "Bash(yarn npm publish *)",
         "Bash(docker push *)", "Bash(kubectl *)", "Bash(terraform apply *)",
         "Bash(terraform destroy *)", "Bash(aws *)", "Bash(az *)", "Bash(gcloud *)",
+        "Read(~/.claude/.credentials.json)", "Edit(~/.claude/.credentials.json)",
+        "Write(~/.claude/.credentials.json)",
     ]
+    if use_outer_claude_srt(config):
+        deny.extend(
+            [
+                "Read(~/.claude/**)",
+                "Edit(~/.claude/**)",
+                "Write(~/.claude/**)",
+            ]
+        )
+    if read_only:
+        deny.extend(
+            [
+                "Bash",
+                "Bash(*)",
+                "Edit",
+                "Edit(*)",
+                "Write",
+                "Write(*)",
+            ]
+        )
     payload: dict = {"permissions": {"deny": deny}}
     is_native_windows = os.name == "nt" and not os.getenv("WSL_DISTRO_NAME")
     if not is_native_windows:
-        payload["sandbox"] = {
-            "enabled": True,
-            "failIfUnavailable": config.get("security_profile") == "strict",
-            "allowUnsandboxedCommands": False,
-            "credentials": {
-                "files": [
-                    {"path": "~/.ssh", "mode": "deny"},
-                    {"path": "~/.aws", "mode": "deny"},
-                    {"path": "~/.kube", "mode": "deny"},
-                ],
-                "envVars": [
-                    {"name": name, "mode": "deny"}
-                    for name in ["GITHUB_TOKEN", "GH_TOKEN", "NPM_TOKEN", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"]
-                ],
-            },
-            "network": {
-                "allowedDomains": [
-                    "api.anthropic.com", "claude.ai", "*.claude.ai",
-                    "github.com", "*.github.com", "registry.npmjs.org", "*.npmjs.org",
-                    "pypi.org", "files.pythonhosted.org", "crates.io", "index.crates.io",
-                    "proxy.golang.org", "sum.golang.org",
-                ]
-            },
-        }
-    path = project / ".forge" / "claude-settings.json"
+        if use_outer_claude_srt(config):
+            payload["sandbox"] = {"enabled": False}
+        else:
+            payload["sandbox"] = {
+                "enabled": True,
+                "failIfUnavailable": config.get("security_profile") == "strict",
+                "allowUnsandboxedCommands": False,
+                "credentials": {
+                    "files": [
+                        {"path": "~/.ssh", "mode": "deny"},
+                        {"path": "~/.aws", "mode": "deny"},
+                        {"path": "~/.kube", "mode": "deny"},
+                    ],
+                    "envVars": [
+                        {"name": name, "mode": "deny"}
+                        for name in ["GITHUB_TOKEN", "GH_TOKEN", "NPM_TOKEN", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"]
+                    ],
+                },
+                "network": {
+                    "allowedDomains": [
+                        "api.anthropic.com", "claude.ai", "*.claude.ai",
+                        "github.com", "*.github.com", "registry.npmjs.org", "*.npmjs.org",
+                        "pypi.org", "files.pythonhosted.org", "crates.io", "index.crates.io",
+                        "proxy.golang.org", "sum.golang.org",
+                    ]
+                },
+            }
+    path = project / ".forge" / (
+        "claude-reviewer-settings.json"
+        if read_only
+        else "claude-settings.json"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def build_claude_srt_settings(project: Path, config: dict) -> Path:
+    """Create the WSL outer-sandbox policy for the whole Claude worker."""
+    home = Path.home().resolve()
+    runtime_dir = project_runtime_temp_dir(project, "claude")
+    runtime_credential = home / ".claude" / ".credentials.json"
+    claude_state_writes = [
+        home / ".claude" / "session-env",
+        home / ".claude" / "backups",
+        home / ".claude" / "sessions",
+        home / ".claude" / "shell-snapshots",
+        home / ".claude" / ".last-cleanup",
+    ]
+    claude_temp_dirs = [Path("/tmp/claude"), Path(f"/tmp/claude-{getattr(os, 'getuid', lambda: 1000)()}")]
+    if os.name == "posix":
+        for temp_dir in claude_temp_dirs:
+            temp_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            temp_dir.chmod(0o700)
+    payload = {
+        "network": {
+            "allowedDomains": [
+                "api.anthropic.com", "claude.ai", "*.claude.ai",
+                "github.com", "*.github.com", "registry.npmjs.org", "*.npmjs.org",
+                "pypi.org", "files.pythonhosted.org", "crates.io", "index.crates.io",
+                "proxy.golang.org", "sum.golang.org",
+            ],
+            "deniedDomains": [],
+            "strictAllowlist": True,
+            "allowLocalBinding": True,
+            "tlsTerminate": {},
+        },
+        "filesystem": {
+            "denyRead": [
+                str(home / ".ssh"),
+                str(home / ".aws"),
+                str(home / ".kube"),
+                str(home / ".config" / "gcloud"),
+                str(home / ".claude"),
+                str(home / ".codex"),
+                "/mnt/c/Users",
+            ],
+            "allowRead": [".", str(runtime_credential)],
+            "allowWrite": [
+                ".", str(runtime_dir),
+                *(str(path) for path in claude_temp_dirs),
+                *(str(path) for path in claude_state_writes),
+            ],
+            "denyWrite": [
+                ".env", ".git/config", ".git/hooks", str(runtime_credential),
+            ],
+        },
+        "credentials": {
+            "files": [
+                {
+                    "path": str(runtime_credential),
+                    "mode": "mask",
+                    "extract": r'"(?:accessToken|refreshToken)"\s*:\s*"([^"]+)"',
+                    "onExtractNoMatch": "error",
+                    "injectHosts": [
+                        "api.anthropic.com", "claude.ai", "*.claude.ai",
+                    ],
+                }
+            ]
+        },
+    }
+    path = project / ".forge" / "claude-srt-settings.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
@@ -2666,16 +7034,32 @@ def run_claude(
     effective_timeout_override: int | None = None,
     escalated: bool = False,
     log_stem: str | None = None,
+    prompt_override: str | None = None,
+    tools_override: str | None = None,
+    system_prompt_override: str | None = None,
+    read_only: bool = False,
 ) -> WorkerResult:
     claude = find_cli("claude")
     if not claude:
         raise RuntimeError("Príkaz 'claude' sa nenašiel. Nainštaluj Claude Code a spusti claude.")
-    prompt = redact_text(build_worker_prompt(goal, decision))
+    prompt = redact_text(
+        prompt_override
+        if prompt_override is not None
+        else build_worker_prompt(goal, decision)
+    )
     stem = log_stem or f"{iteration:02d}"
     write_prompt_log(logs, stem, prompt)
     raw_path = logs / f"{stem}-claude-stream.jsonl"
     live_path = logs / f"{stem}-claude-live.log"
-    settings_path = build_claude_settings(project, config)
+    settings_path = build_claude_settings(project, config, read_only=read_only)
+    selected_tools = str(
+        tools_override
+        or config.get("claude_tools")
+        or "Bash,Read,Edit,Write,Glob,Grep"
+    )
+    selected_system_prompt = (
+        system_prompt_override or WORKER_BOUNDARIES
+    )
     selected_model = str(model_override or config.get("claude_model") or "sonnet")
     selected_effort = str(effort_override or config.get("claude_effort") or "").strip()
     selected_max_turns = int(max_turns_override or config.get("claude_max_turns", 45))
@@ -2693,9 +7077,10 @@ def run_claude(
         cmd.append("--strict-mcp-config")
     cmd.extend([
         "--disable-slash-commands",
-        "--append-system-prompt", WORKER_BOUNDARIES,
+        "--append-system-prompt", selected_system_prompt,
         "--settings", str(settings_path),
-        "--tools", str(config.get("claude_tools") or "Bash,Read,Edit,Write,Glob,Grep"),
+        "--tools", selected_tools,
+        "--allowedTools", selected_tools,
         "--output-format", "stream-json",
         "--verbose",
         "--include-partial-messages",
@@ -2709,6 +7094,15 @@ def run_claude(
         cmd.extend(["--model", selected_model])
     if config.get("claude_supports_effort", True) and selected_effort:
         cmd.extend(["--effort", selected_effort])
+    if use_outer_claude_srt(config):
+        srt = shutil.which("srt")
+        if not srt:
+            raise RuntimeError("Strict WSL Claude sandbox vyžaduje dostupný príkaz srt.")
+        srt_settings = build_claude_srt_settings(project, config)
+        cmd = [
+            srt, "--settings", str(srt_settings), "--",
+            "/usr/bin/env", "-u", "SANDBOX_RUNTIME", *cmd,
+        ]
     started = time.monotonic()
     timeout_seconds = int(
         effective_timeout_override or config["claude_timeout_seconds"]
@@ -2724,6 +7118,13 @@ def run_claude(
         processor = ClaudeStreamProcessor(raw_handle, live_handle, status)
         # The prompt remains on stdin because --tools accepts a variable number
         # of values and could consume a trailing positional prompt.
+        outer_srt = use_outer_claude_srt(config)
+        worker_env = claude_subprocess_env(project)
+        if outer_srt:
+            # Forge already scrubbed provider/API secrets and SRT masks the
+            # OAuth file. Disable Claude's subprocess-host heuristic so the
+            # deliberately disabled nested sandbox is not forced back on.
+            worker_env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] = "0"
         process = subprocess.Popen(
             cmd,
             cwd=str(project),
@@ -2734,7 +7135,7 @@ def run_claude(
             encoding="utf-8",
             errors="replace",
             bufsize=1,
-            env=subscription_only_env(),
+            env=worker_env,
             creationflags=(
                 subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
             ),
@@ -2797,7 +7198,6 @@ def run_claude(
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 _terminate_process(process)
-
         duration = time.monotonic() - started
         raw_output = truncate(
             processor.combined_output(), int(config.get("max_worker_raw_chars", 60000))
@@ -2817,6 +7217,7 @@ def run_claude(
                 effort=selected_effort,
                 escalated=escalated,
                 termination_reason="timeout",
+                valid_worker_outcome=False,
                 requested_turn_budget=selected_max_turns,
                 cli_turn_limit_enforced=cli_turn_limit_enforced,
                 effective_timeout=timeout_seconds,
@@ -2865,6 +7266,7 @@ def run_claude(
                     effort=selected_effort,
                     escalated=escalated,
                     termination_reason="subscription_limit",
+                    valid_worker_outcome=False,
                     requested_turn_budget=selected_max_turns,
                     cli_turn_limit_enforced=cli_turn_limit_enforced,
                     effective_timeout=timeout_seconds,
@@ -2891,6 +7293,7 @@ def run_claude(
                     if termination_reason != "success"
                     else "missing_final_event"
                 ),
+                valid_worker_outcome=False,
                 requested_turn_budget=selected_max_turns,
                 cli_turn_limit_enforced=cli_turn_limit_enforced,
                 effective_timeout=timeout_seconds,
@@ -2913,6 +7316,13 @@ def run_claude(
             effort=selected_effort,
             escalated=escalated,
             termination_reason=termination_reason,
+            valid_worker_outcome=termination_reason not in {
+                *MODEL_FALLBACK_REASONS,
+                "auth_failure",
+                "rate_limit",
+                "subscription_limit",
+                "sandbox_denial",
+            },
             requested_turn_budget=selected_max_turns,
             cli_turn_limit_enforced=cli_turn_limit_enforced,
             effective_timeout=timeout_seconds,
@@ -2934,6 +7344,10 @@ def run_claude_routed(
     max_worker_calls_remaining: int,
     max_premium_calls_remaining: int,
     log_stem: str | None = None,
+    prompt_override: str | None = None,
+    tools_override: str | None = None,
+    system_prompt_override: str | None = None,
+    read_only: bool = False,
 ) -> RoutedWorkerOutcome:
     """Execute one logical packet through the common subscription-safe router."""
     unavailable = {
@@ -2972,6 +7386,7 @@ def run_claude_routed(
                 effort=last_worker.effort if last_worker is not None else "",
                 escalated=profile == "rescue",
                 termination_reason="model_unavailable_without_credits",
+                valid_worker_outcome=False,
                 requested_turn_budget=(
                     last_worker.requested_turn_budget
                     if last_worker is not None
@@ -3024,21 +7439,49 @@ def run_claude_routed(
         worker_calls += 1
         if model_key in premium_aliases:
             premium_calls += 1
-        worker = run_claude(
-            project,
-            goal,
-            decision,
-            config,
-            iteration=iteration,
-            logs=logs,
-            status=status,
-            model_override=routing.selected_model,
-            effort_override=routing.selected_effort,
-            max_turns_override=routing.requested_turn_budget,
-            effective_timeout_override=routing.effective_timeout,
-            escalated=profile == "rescue",
-            log_stem=attempt_stem,
-        )
+        try:
+            worker = run_claude(
+                project,
+                goal,
+                decision,
+                config,
+                iteration=iteration,
+                logs=logs,
+                status=status,
+                model_override=routing.selected_model,
+                effort_override=routing.selected_effort,
+                max_turns_override=routing.requested_turn_budget,
+                effective_timeout_override=routing.effective_timeout,
+                escalated=profile == "rescue",
+                log_stem=attempt_stem,
+                prompt_override=prompt_override,
+                tools_override=tools_override,
+                system_prompt_override=system_prompt_override,
+                read_only=read_only,
+            )
+        except SubscriptionLimitError as exc:
+            setattr(exc, "worker_calls", worker_calls)
+            setattr(exc, "premium_calls", premium_calls)
+            setattr(exc, "routing_records", list(routing_records))
+            raise
+        except Exception as exc:
+            worker = WorkerResult(
+                exit_code=74,
+                summary=(
+                    "Claude worker transport failed before a valid outcome: "
+                    + truncate(redact_text(str(exc)), 2000)
+                ),
+                raw_output="",
+                duration_seconds=0.0,
+                model=routing.selected_model,
+                effort=routing.selected_effort,
+                escalated=profile == "rescue",
+                termination_reason="transport_failure",
+                valid_worker_outcome=False,
+                requested_turn_budget=routing.requested_turn_budget,
+                cli_turn_limit_enforced=routing.cli_turn_limit_enforced,
+                effective_timeout=routing.effective_timeout,
+            )
         last_worker = worker
         save_json(logs / f"{attempt_stem}-worker.json", worker)
         if worker.termination_reason not in MODEL_FALLBACK_REASONS:
@@ -3069,6 +7512,7 @@ def run_claude_routed(
         raw_output="",
         duration_seconds=0.0,
         termination_reason="chain_worker_budget_exhausted",
+        valid_worker_outcome=False,
     )
     if terminal.termination_reason in MODEL_FALLBACK_REASONS:
         terminal = terminal.model_copy(
@@ -3079,6 +7523,7 @@ def run_claude_routed(
                     "budget; usage credits and API billing remain disabled."
                 ),
                 "termination_reason": "model_unavailable_without_credits",
+                "valid_worker_outcome": False,
             }
         )
     return RoutedWorkerOutcome(
@@ -3089,6 +7534,99 @@ def run_claude_routed(
         model_fallbacks=fallbacks,
         unavailable_models=unavailable,
     )
+
+
+def run_read_only_claude_review(
+    project: Path,
+    goal: str,
+    packet: WorkPacket,
+    checks: list[CheckResult],
+    config: dict,
+    *,
+    iteration: int,
+    logs: Path,
+    status: StatusTracker | None,
+    unavailable_models: dict[str, str],
+    max_worker_calls_remaining: int,
+    max_premium_calls_remaining: int,
+) -> tuple[ClaudeReviewVerdict, RoutedWorkerOutcome]:
+    """Run the optional milestone reviewer through the shared safe router."""
+    review_prompt = textwrap.dedent(
+        f"""
+        READ-ONLY CLAUDE ROUTINE REVIEW
+
+        You are not an implementation worker. Do not modify files and do not
+        run shell commands. Use only Read, Glob, and Grep to inspect the packet
+        and the green deterministic evidence.
+
+        OVERALL GOAL:
+        {goal}
+
+        PACKET:
+        {json.dumps(packet.model_dump(mode="json"), ensure_ascii=False, indent=2)}
+
+        GREEN CHECK EVIDENCE:
+        {checks_as_text(checks, config)}
+
+        Return only one compact JSON object with this exact shape:
+        {{"approve": true|false, "issues": [
+          {{"file_path": "relative/path", "description": "grounded issue"}}
+        ]}}
+        List every grounded issue at once. An approval closes only this packet;
+        it can never approve project status done.
+        """
+    ).strip()
+    review_decision = Decision(
+        status="continue",
+        decision_kind="verify_packet",
+        assessment="Read-only Claude packet review.",
+        active_packet_id=packet.packet_id,
+        next_prompt=review_prompt,
+        acceptance_criteria=packet.acceptance_criteria,
+        risks=[],
+        recommended_worker_profile="standard",
+        recommended_worker_max_turns=10,
+        recommended_review_profile="routine_review",
+        check_tier=packet.check_tier,
+        routing_reason="Optional read-only Claude milestone reviewer.",
+    )
+    routed = run_claude_routed(
+        project,
+        goal,
+        review_decision,
+        config,
+        profile="claude_reviewer",
+        routing_reason="Read-only structured milestone review.",
+        iteration=iteration,
+        logs=logs,
+        status=status,
+        unavailable_models=unavailable_models,
+        max_worker_calls_remaining=max_worker_calls_remaining,
+        max_premium_calls_remaining=max_premium_calls_remaining,
+        log_stem=f"{iteration:02d}R",
+        prompt_override=review_prompt,
+        tools_override="Read,Glob,Grep",
+        system_prompt_override=(
+            "You are a read-only packet reviewer. Never implement, write, edit, "
+            "or run Bash. Return only the requested JSON verdict."
+        ),
+        read_only=True,
+    )
+    worker = routed.worker
+    if not worker.valid_worker_outcome or worker.exit_code != 0:
+        raise RuntimeError(
+            "Read-only Claude reviewer did not produce a valid outcome: "
+            + worker.summary
+        )
+    try:
+        payload = json.loads(worker.summary)
+        verdict = ClaudeReviewVerdict.model_validate(payload)
+    except Exception as exc:
+        raise RuntimeError(
+            "Read-only Claude reviewer returned an invalid structured verdict."
+        ) from exc
+    save_json(logs / f"{iteration:02d}-claude-review-verdict.json", verdict)
+    return verdict, routed
 
 
 def save_json(path: Path, data: object) -> None:
@@ -3110,6 +7648,18 @@ def load_config(path: Path) -> dict:
 
 
 def validate_config(config: dict) -> None:
+    if config.get("orchestration_style", "classic") not in {"lean", "classic"}:
+        raise RuntimeError(
+            "orchestration_style must be either 'lean' or 'classic'."
+        )
+    if config.get("routine_reviewer", "codex") not in {
+        "none",
+        "claude",
+        "codex",
+    }:
+        raise RuntimeError(
+            "routine_reviewer must be 'none', 'claude', or 'codex'."
+        )
     if not 1 <= int(config.get("max_iterations", 0)) <= 10:
         raise RuntimeError("max_iterations musí byť v rozsahu 1 až 10.")
     if int(config.get("max_diff_chars", 0)) < 2000:
@@ -3169,13 +7719,20 @@ def validate_config(config: dict) -> None:
         if not isinstance(profiles, dict):
             raise RuntimeError("adaptive_profiles musí byť JSON objekt.")
         claude_profiles = profiles.get("claude", {})
-        required_profiles = {"economy", "standard", "complex", "frontier", "rescue"}
+        required_profiles = {
+            "economy",
+            "standard",
+            "complex",
+            "frontier",
+            "rescue",
+            "claude_reviewer",
+        }
         if not isinstance(claude_profiles, dict) or not required_profiles.issubset(
             claude_profiles
         ):
             raise RuntimeError(
                 "Adaptive Claude policy musí definovať economy, standard, complex, "
-                "frontier a rescue profily."
+                "frontier, rescue a claude_reviewer profily."
             )
         for profile_name in sorted(required_profiles):
             resolve_worker_runtime(profile_name, config)
@@ -3281,6 +7838,8 @@ def claude_escalation_reasons(
     escalations_used: int,
     config: dict,
 ) -> list[str]:
+    if not worker.valid_worker_outcome:
+        return []
     if not config.get("claude_escalation_enabled", True):
         return []
     if escalations_used >= int(config.get("claude_escalation_max_per_run", 1)):
@@ -3356,6 +7915,252 @@ def active_plan_packet(plan: ProjectPlan | None) -> WorkPacket | None:
     )
 
 
+def apply_recovery_attempt_budget_normalization_plan(
+    plan: ProjectPlan,
+    normalization: dict[str, Any],
+    config: dict[str, Any],
+) -> ProjectPlan:
+    """Reinterpret the sole legacy recovery dispatch as one normal attempt."""
+
+    if not isinstance(normalization, dict):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization provenance is missing."
+        )
+    required_strings = (
+        "source_run_id",
+        "legacy_recovery_source_run_id",
+        "replacement_packet_id",
+        "source_plan_hash",
+        "source_contract_hash",
+        "source_repository_fingerprint",
+        "source_config_hash",
+        "legacy_decision_recovery_journal_sha256",
+        "legacy_target_plan_hash",
+    )
+    for field in required_strings:
+        if not isinstance(normalization.get(field), str) or not normalization[
+            field
+        ]:
+            raise RuntimeError(
+                "Recovery-attempt budget normalization provenance is missing "
+                f"{field}."
+            )
+    if (
+        normalization.get("action")
+        != RECOVERY_ATTEMPT_BUDGET_NORMALIZATION_ACTION
+    ):
+        raise RuntimeError(
+            "Recovery-attempt budget normalization action is invalid."
+        )
+    worker_call_delta = normalization.get("worker_call_delta")
+    if type(worker_call_delta) is not int or worker_call_delta != 1:
+        raise RuntimeError(
+            "Recovery-attempt budget normalization requires exactly one "
+            "historical worker dispatch."
+        )
+    maximum_attempts = int(config.get("max_packet_attempts", 3))
+    if maximum_attempts < 2:
+        raise RuntimeError(
+            "Recovery-attempt budget normalization requires a bounded normal "
+            "packet budget greater than the historical worker-call delta."
+        )
+    if plan_hash(plan) != normalization["source_plan_hash"]:
+        raise RuntimeError(
+            "Persistent plan changed before recovery-attempt budget "
+            "normalization."
+        )
+    if plan.check_contract_hash != normalization["source_contract_hash"]:
+        raise RuntimeError(
+            "Recovery-attempt budget normalization plan/contract identity "
+            "changed."
+        )
+
+    updated = ProjectPlan.model_validate(plan.model_dump(mode="json"))
+    if updated.active_packet_id != normalization["replacement_packet_id"]:
+        raise RuntimeError(
+            "Recovery-attempt budget normalization active packet changed."
+        )
+    packet = active_plan_packet(updated)
+    if (
+        packet is None
+        or packet.status not in {"in_progress", "verification"}
+        or packet.attempts != maximum_attempts + worker_call_delta
+        or packet.final_review_recovery_authorized
+        or not packet.final_review_recovery_used
+    ):
+        raise RuntimeError(
+            "Current packet is not the exact consumed legacy one-shot "
+            "replacement."
+        )
+
+    packet.attempts = worker_call_delta
+    packet.final_review_recovery_authorized = False
+    packet.final_review_recovery_used = False
+    updated.updated_at = utc_now()
+    return ProjectPlan.model_validate(updated.model_dump(mode="json"))
+
+
+def apply_post_worker_decision_recovery_plan(
+    plan: ProjectPlan,
+    recovery: dict[str, Any],
+    config: dict[str, Any],
+) -> tuple[ProjectPlan, Decision]:
+    """Deterministically supersede one exhausted packet without refunding it."""
+
+    if not isinstance(recovery, dict):
+        raise RuntimeError("Post-worker decision recovery provenance is missing.")
+    required_strings = (
+        "source_run_id",
+        "source_packet_id",
+        "replacement_packet_id",
+        "raw_decision_sha256",
+        "source_plan_hash",
+        "source_repository_fingerprint",
+    )
+    for field in required_strings:
+        if not isinstance(recovery.get(field), str) or not recovery[field]:
+            raise RuntimeError(
+                f"Post-worker decision recovery provenance is missing {field}."
+            )
+    if recovery.get("action") != POST_WORKER_DECISION_RECOVERY_ACTION:
+        raise RuntimeError("Post-worker decision recovery action is invalid.")
+    maximum_attempts = int(config.get("max_packet_attempts", 3))
+    if maximum_attempts < 1:
+        raise RuntimeError(
+            "Post-worker decision recovery requires a positive packet-attempt "
+            "budget."
+        )
+    if plan_hash(plan) != recovery["source_plan_hash"]:
+        raise RuntimeError(
+            "Persistent plan changed before post-worker recovery replan."
+        )
+    try:
+        decision = Decision.model_validate(recovery["normalized_decision"])
+    except Exception as exc:
+        raise RuntimeError(
+            "Normalized post-worker recovery decision is invalid."
+        ) from exc
+    source_packet_id = recovery["source_packet_id"]
+    replacement_packet_id = recovery["replacement_packet_id"]
+    if (
+        decision.status != "continue"
+        or decision.decision_kind
+        not in {"implement_packet", "repair_packet", "verify_packet"}
+        or decision.active_packet_id != source_packet_id
+        or not (decision.next_prompt or "").strip()
+        or not decision.acceptance_criteria
+    ):
+        raise RuntimeError(
+            "Normalized post-worker recovery decision is not a bounded packet "
+            "replacement instruction."
+        )
+
+    updated = ProjectPlan.model_validate(plan.model_dump(mode="json"))
+    if len(updated.work_packets) >= MAX_PROJECT_WORK_PACKETS:
+        raise RuntimeError(
+            "Post-worker decision recovery would exceed the project packet limit."
+        )
+    by_id = {packet.packet_id: packet for packet in updated.work_packets}
+    source = by_id.get(source_packet_id)
+    if source is None or replacement_packet_id in by_id:
+        raise RuntimeError(
+            "Post-worker decision recovery packet identity is inconsistent."
+        )
+    if (
+        source.status not in {"in_progress", "verification"}
+        or not source.final_review_recovery_used
+        or source.final_review_recovery_authorized
+    ):
+        raise RuntimeError(
+            "Post-worker decision recovery source is not the consumed exhausted "
+            "packet."
+        )
+
+    downstream = [
+        packet
+        for packet in updated.work_packets
+        if source_packet_id in packet.dependencies
+    ]
+    inconsistent = [
+        packet.packet_id
+        for packet in downstream
+        if packet.status in {"completed", "superseded"}
+    ]
+    if inconsistent:
+        raise RuntimeError(
+            "Completed or superseded downstream dependencies cannot be rewired."
+        )
+
+    context_parts = [
+        decision.assessment.strip(),
+        decision.packet_assessment.strip(),
+        decision.routing_reason.strip(),
+    ]
+    replacement = WorkPacket(
+        packet_id=replacement_packet_id,
+        title=(source.title + " — decision recovery")[:160],
+        objective=(decision.next_prompt or "").strip(),
+        context="\n\n".join(part for part in context_parts if part),
+        dependencies=list(source.dependencies),
+        acceptance_criteria=list(decision.acceptance_criteria),
+        status="in_progress",
+        difficulty=source.difficulty,
+        risk=source.risk,
+        recommended_worker_profile=decision.recommended_worker_profile,
+        recommended_review_profile=decision.recommended_review_profile,
+        check_tier=decision.check_tier,
+        max_worker_turns=decision.recommended_worker_max_turns,
+        expected_paths=list(source.expected_paths),
+        forbidden_scope=list(source.forbidden_scope),
+        # The replacement is a new bounded packet. The exhausted source keeps
+        # its historical attempts, while this packet receives the normal
+        # configured attempt budget from zero.
+        attempts=0,
+        final_review_recovery_authorized=False,
+        final_review_recovery_used=False,
+        last_fingerprint=None,
+        last_failure_signature=None,
+        closes_milestone=decision.closes_milestone,
+        requires_fresh_release_check=decision.requires_release_check,
+    )
+
+    source.status = "superseded"
+    source_index = next(
+        index
+        for index, packet in enumerate(updated.work_packets)
+        if packet.packet_id == source_packet_id
+    )
+    updated.work_packets.insert(source_index + 1, replacement)
+    for packet in downstream:
+        rewritten_dependencies: list[str] = []
+        seen_dependencies: set[str] = set()
+        for dependency in packet.dependencies:
+            rewritten = (
+                replacement_packet_id
+                if dependency == source_packet_id
+                else dependency
+            )
+            if rewritten not in seen_dependencies:
+                rewritten_dependencies.append(rewritten)
+                seen_dependencies.add(rewritten)
+        packet.dependencies = rewritten_dependencies
+    updated.active_packet_id = replacement_packet_id
+    updated.status = "active"
+    updated.completed_packet_ids = [
+        packet.packet_id
+        for packet in updated.work_packets
+        if packet.status == "completed"
+    ]
+    updated.updated_at = utc_now()
+    updated = ProjectPlan.model_validate(updated.model_dump(mode="json"))
+
+    # The raw plan patch described the exhausted source packet and includes an
+    # attempts increment. Recovery owns the deterministic replan and never
+    # carries that model-authored counter mutation into the new packet.
+    runtime_decision = _runtime_decision_for_recovery(recovery)
+    return updated, runtime_decision
+
+
 def update_plan_from_decision(
     project: Path,
     plan: ProjectPlan,
@@ -3366,8 +8171,22 @@ def update_plan_from_decision(
     goal: str,
 ) -> ProjectPlan:
     if decision.plan_patch is not None:
+        # Packet attempts are an execution counter owned by Forge. Codex may
+        # update packet status and evidence, but it must not increment the
+        # counter in a review/final-review plan patch and thereby double-count
+        # a worker attempt that Forge records immediately before routing it.
+        patch_payload = decision.plan_patch.model_dump(mode="json")
+        for added in patch_payload.get("add_packets", []):
+            added["attempts"] = 0
+            added["final_review_recovery_authorized"] = False
+            added["final_review_recovery_used"] = False
+        for update in patch_payload.get("update_packets", []):
+            update["attempts_increment"] = 0
+            update["final_review_recovery_authorized"] = None
+            update["final_review_recovery_used"] = None
+        codex_plan_patch = PlanPatch.model_validate(patch_payload)
         plan = apply_plan_patch(
-            plan, decision.plan_patch, checks_passed=checks_are_green
+            plan, codex_plan_patch, checks_passed=checks_are_green
         )
     if not plan.work_packets and decision.status == "continue":
         packet = bootstrap_packet(decision, goal)
@@ -3409,6 +8228,7 @@ def update_plan_from_decision(
                     PacketUpdate(
                         packet_id=active.packet_id,
                         status="completed",
+                        completed_by="codex_review",
                         justification=(
                             "Codex requested packet completion and deterministic checks passed."
                         ),
@@ -3418,13 +8238,297 @@ def update_plan_from_decision(
             ),
             checks_passed=checks_are_green,
         )
+    if decision.status == "blocked" and plan.status != "blocked":
+        # A blocked decision without a plan patch is still a real persistent
+        # project state.  Keeping the plan "active" would make a later run look
+        # dependency-ready even though the terminal result requires a human or
+        # external-state change.
+        blocked_payload = plan.model_dump(mode="json")
+        blocked_payload["status"] = "blocked"
+        blocked_payload["updated_at"] = utc_now()
+        plan = ProjectPlan.model_validate(blocked_payload)
     if plan.safe_assumptions:
         write_assumptions(project, plan.safe_assumptions)
     save_plan(project, plan, snapshot_path=snapshot_path)
     return plan
 
 
+def lean_packet_decision(
+    packet: WorkPacket,
+    plan: ProjectPlan,
+    *,
+    assessment: str,
+    decision_kind: Literal["implement_packet", "repair_packet"] = "implement_packet",
+) -> Decision:
+    """Build the deterministic runtime decision from the persisted lean plan."""
+    prompt = (packet.worker_prompt or "").strip()
+    if not prompt:
+        raise RuntimeError(
+            f"Lean packet {packet.packet_id} has no persisted worker_prompt."
+        )
+    return Decision(
+        status="continue",
+        decision_kind=decision_kind,
+        assessment=assessment,
+        active_packet_id=packet.packet_id,
+        packet_assessment="Dependency-ready packet selected from the persistent plan.",
+        next_prompt=prompt,
+        acceptance_criteria=packet.acceptance_criteria,
+        risks=plan.overall_risks,
+        recommended_worker_profile=packet.recommended_worker_profile,
+        recommended_worker_max_turns=packet.max_worker_turns,
+        recommended_review_profile=packet.recommended_review_profile,
+        check_tier=packet.check_tier,
+        routing_reason=(
+            "Deterministic lean dispatch from the persisted dependency-ordered plan."
+        ),
+        closes_milestone=packet.closes_milestone,
+        requires_release_check=packet.requires_fresh_release_check,
+    )
+
+
+def complete_lean_packet_by_checks(
+    plan: ProjectPlan,
+    packet_id: str,
+    *,
+    completed_by: Literal["forge_checks", "claude_review"] = "forge_checks",
+) -> ProjectPlan:
+    """Close one green lean packet and activate the next ready packet."""
+    completed = apply_plan_patch(
+        plan,
+        PlanPatch(
+            update_packets=[
+                PacketUpdate(
+                    packet_id=packet_id,
+                    status="completed",
+                    completed_by=completed_by,
+                    justification=(
+                        "Lean packet closed by deterministic green checks."
+                        if completed_by == "forge_checks"
+                        else "Lean packet closed after green checks and read-only Claude review."
+                    ),
+                )
+            ],
+            explanation="Deterministic lean packet completion.",
+        ),
+        checks_passed=True,
+    )
+    ready = dependency_ready_packet(completed)
+    if ready is None:
+        return completed
+    return apply_plan_patch(
+        completed,
+        PlanPatch(
+            active_packet_id=ready.packet_id,
+            explanation=(
+                "Select the first dependency-ready pending packet in persistent "
+                "plan order."
+            ),
+        ),
+        checks_passed=True,
+    )
+
+
+def record_lean_check_evidence(
+    plan: ProjectPlan,
+    packet_id: str,
+    checks: list[CheckResult],
+) -> ProjectPlan:
+    """Persist the last two consecutive failures for one lean packet."""
+    updated = plan.model_copy(deep=True)
+    packet = next(
+        (
+            item
+            for item in updated.work_packets
+            if item.packet_id == packet_id
+        ),
+        None,
+    )
+    if packet is None:
+        raise ValueError(f"Unknown lean packet {packet_id}.")
+    if checks_passed(checks):
+        packet.consecutive_check_failures = []
+    else:
+        packet.consecutive_check_failures = (
+            packet.consecutive_check_failures
+            + [
+                {
+                    "recorded_at": utc_now(),
+                    "signature": check_failure_signature(checks),
+                    "checks": [
+                        {
+                            "check_id": item.check_id or item.command,
+                            "exit_code": item.exit_code,
+                            "report_valid": item.report_valid,
+                            "output": truncate(item.output, 1800),
+                        }
+                        for item in checks
+                        if item.exit_code != 0 or not item.report_valid
+                    ],
+                }
+            ]
+        )[-2:]
+    updated.updated_at = utc_now()
+    return ProjectPlan.model_validate(updated.model_dump(mode="json"))
+
+
+def record_review_snapshot(
+    plan: ProjectPlan,
+    packet_id: str,
+    *,
+    manifest: dict[str, str],
+    reviewed_paths: list[str],
+    issues: list[ReviewIssue],
+) -> tuple[ProjectPlan, list[dict[str, str]]]:
+    """Persist review file hashes and identify objections delayed on unchanged files."""
+    updated = plan.model_copy(deep=True)
+    packet = next(
+        (
+            item
+            for item in updated.work_packets
+            if item.packet_id == packet_id
+        ),
+        None,
+    )
+    if packet is None:
+        raise ValueError(f"Unknown reviewed packet {packet_id}.")
+    late: list[dict[str, str]] = []
+    normalized_issue_paths: list[str] = []
+    for issue in issues:
+        path = issue.file_path.replace("\\", "/").strip()
+        if not path:
+            continue
+        normalized_issue_paths.append(path)
+        current_hash = manifest.get(path, "<deleted>")
+        if packet.reviewed_file_hashes.get(path) == current_hash:
+            finding = {
+                "file_path": path,
+                "description": issue.description,
+                "file_hash": current_hash,
+                "detected_at": utc_now(),
+            }
+            late.append(finding)
+            packet.late_findings.append(finding)
+    for raw_path in [*reviewed_paths, *normalized_issue_paths]:
+        path = raw_path.replace("\\", "/").strip()
+        if path:
+            packet.reviewed_file_hashes[path] = manifest.get(path, "<deleted>")
+    updated.updated_at = utc_now()
+    return (
+        ProjectPlan.model_validate(updated.model_dump(mode="json")),
+        late,
+    )
+
+
+def prepare_claude_review_repair(
+    plan: ProjectPlan,
+    packet_id: str,
+    verdict: ClaudeReviewVerdict,
+) -> tuple[ProjectPlan, Decision | None]:
+    """Authorize exactly one packet repair after a read-only Claude rejection."""
+    updated = plan.model_copy(deep=True)
+    packet = next(
+        (
+            item
+            for item in updated.work_packets
+            if item.packet_id == packet_id
+        ),
+        None,
+    )
+    if packet is None:
+        raise ValueError(f"Unknown reviewed packet {packet_id}.")
+    if packet.claude_review_repair_used:
+        return plan, None
+    packet.claude_review_repair_used = True
+    updated.updated_at = utc_now()
+    updated = ProjectPlan.model_validate(updated.model_dump(mode="json"))
+    repair = lean_packet_decision(
+        packet,
+        updated,
+        assessment=(
+            "Read-only Claude review rejected the milestone; one bounded "
+            "repair is allowed before Codex review."
+        ),
+        decision_kind="repair_packet",
+    )
+    issue_text = "\n".join(
+        (
+            f"- {issue.file_path}: {issue.description}"
+            if issue.file_path
+            else f"- {issue.description}"
+        )
+        for issue in verdict.issues
+    )
+    repair.next_prompt = (
+        f"{repair.next_prompt}\n\nREAD-ONLY REVIEW ISSUES "
+        f"(repair all together):\n{issue_text}"
+    )
+    return updated, repair
+
+
+def maybe_authorize_final_review_recovery(
+    plan: ProjectPlan,
+    decision: Decision,
+    checks: list[CheckResult],
+    *,
+    config: dict[str, Any],
+    last_check_tier: str,
+    no_progress_count: int,
+    failed_iterations: int,
+    budget_reason: str | None,
+) -> tuple[ProjectPlan, bool]:
+    """Authorize one bounded repair after fresh green evidence at the packet tier."""
+    active = active_plan_packet(plan)
+    prompt = (decision.next_prompt or "").strip()
+    tier_order = {"smoke": 0, "targeted": 1, "milestone": 2, "release": 3}
+    if not (
+        active is not None
+        and active.status not in {"completed", "blocked", "superseded"}
+        and decision.status == "continue"
+        and decision.decision_kind == "repair_packet"
+        and decision.active_packet_id == active.packet_id
+        and prompt
+        and len(prompt) <= 4000
+        and checks_passed(checks)
+        and tier_order.get(last_check_tier, -1)
+        >= tier_order.get(active.check_tier, 99)
+        and no_progress_count == 0
+        and failed_iterations == 0
+        and budget_reason is None
+    ):
+        return plan, False
+    return authorize_final_review_recovery(
+        plan,
+        active.packet_id,
+        config,
+    )
+
+
 def run_forge(
+    project: Path,
+    goal: str,
+    config_path: Path,
+    *,
+    resume_context: dict[str, Any] | None = None,
+) -> int:
+    resolved_project = (
+        validate_existing_project_path(project)
+        if resume_context is not None
+        else validate_project_path(project)
+    )
+    with project_run_lock(
+        resolved_project,
+        create_forge_directory=True,
+    ):
+        return _run_forge_locked(
+            resolved_project,
+            goal,
+            config_path,
+            resume_context=resume_context,
+        )
+
+
+def _run_forge_locked(
     project: Path,
     goal: str,
     config_path: Path,
@@ -3446,6 +8550,28 @@ def run_forge(
     else:
         config = load_config(config_path)
     validate_config(config)
+    chain_budgets = ChainBudgets.model_validate(config.get("chain_budgets", {}))
+    if resume_context is not None:
+        base_chain_budgets = ChainBudgets.model_validate(
+            resume_context.get("base_chain_budgets")
+        )
+        effective_chain_budgets = ChainBudgets.model_validate(
+            resume_context.get("effective_chain_budgets")
+        )
+        budget_extension_count = int(
+            resume_context.get("budget_extension_count") or 0
+        )
+        if effective_chain_budgets != chain_budgets:
+            raise RuntimeError(
+                "Resume context effective chain budgets do not match the config "
+                "that would execute the child run."
+            )
+    else:
+        base_chain_budgets = chain_budgets
+        effective_chain_budgets = chain_budgets
+        budget_extension_count = 0
+    canonical_run_config = _canonical_config_snapshot(config)
+    run_config_hash = config_hash(canonical_run_config)
     forge_dir = project / ".forge"
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     parent_run_id = (
@@ -3457,6 +8583,16 @@ def run_forge(
         ContinuationPayload.model_validate(resume_context["continuation"])
         if resume_context is not None
         else None
+    )
+    last_budget_extension_source_run_id = (
+        str(resume_context["source_run_id"])
+        if resume_context is not None
+        and resume_context.get("budget_extended", False)
+        else (
+            inherited_continuation.last_budget_extension_source_run_id
+            if inherited_continuation is not None
+            else None
+        )
     )
     continuation_chain_id = (
         inherited_continuation.continuation_chain_id
@@ -3470,42 +8606,502 @@ def run_forge(
     )
     logs = run_directory / "logs"
     logs.mkdir(parents=True, exist_ok=True)
+    save_json(run_directory / "config.snapshot.json", canonical_run_config)
     trusted_git_metadata = git_metadata_manifest(project)
     save_json(run_directory / "git-metadata-baseline.json", trusted_git_metadata)
     adaptive_enabled = bool(config.get("adaptive_orchestration", False))
+    lean_mode = (
+        adaptive_enabled
+        and config.get("orchestration_style", "classic") == "lean"
+    )
     project_identity: dict[str, str] | None = None
     project_plan: ProjectPlan | None = None
     check_contract: CheckContract | None = None
     baseline_snapshot: dict[str, Any] | None = None
+    post_worker_recovery: dict[str, Any] | None = None
+    post_worker_recovery_decision: Decision | None = None
+    attempt_budget_normalization: dict[str, Any] | None = None
+    if resume_context is not None:
+        candidate_recovery = resume_context.get(
+            "post_worker_decision_recovery"
+        )
+        if candidate_recovery is not None:
+            if not isinstance(candidate_recovery, dict):
+                raise RuntimeError(
+                    "Post-worker decision recovery provenance is malformed."
+                )
+            post_worker_recovery = candidate_recovery
+        candidate_normalization = resume_context.get(
+            "recovery_attempt_budget_normalization"
+        )
+        if candidate_normalization is not None:
+            if not isinstance(candidate_normalization, dict):
+                raise RuntimeError(
+                    "Recovery-attempt budget normalization provenance is "
+                    "malformed."
+                )
+            attempt_budget_normalization = candidate_normalization
+    if (
+        post_worker_recovery is not None
+        and attempt_budget_normalization is not None
+    ):
+        raise RuntimeError(
+            "A resume cannot combine post-worker decision recovery with "
+            "recovery-attempt budget normalization."
+        )
+    if (
+        post_worker_recovery is not None
+        or attempt_budget_normalization is not None
+    ) and not adaptive_enabled:
+        raise RuntimeError(
+            "Special recovery migration requires adaptive orchestration."
+        )
     if adaptive_enabled:
-        project_identity = stable_project_identity(project)
-        project_plan = load_or_create_plan(project, goal)
-        check_contract = ensure_check_contract(project, config)
-        project_plan.check_contract_hash = check_contract.contract_hash
+        inherited_adaptive_values = (
+            {
+                "project_id": inherited_continuation.project_id,
+                "plan_id": inherited_continuation.plan_id,
+                "plan_hash": inherited_continuation.plan_hash,
+                "check_contract_hash": inherited_continuation.check_contract_hash,
+            }
+            if inherited_continuation is not None
+            else {}
+        )
+        inherited_has_adaptive_state = bool(
+            inherited_adaptive_values
+            and any(value is not None for value in inherited_adaptive_values.values())
+        )
+        if inherited_has_adaptive_state:
+            missing = sorted(
+                name
+                for name, value in inherited_adaptive_values.items()
+                if not isinstance(value, str) or not value.strip()
+            )
+            if missing:
+                raise RuntimeError(
+                    "Resume adaptive identity is incomplete before child run "
+                    "initialization; missing: "
+                    + ", ".join(missing)
+                )
+            (
+                project_identity,
+                project_plan,
+                check_contract,
+            ) = load_verified_adaptive_resume_state(
+                project,
+                inherited_continuation,
+                goal=goal,
+            )
+        else:
+            project_identity = stable_project_identity(project)
+            project_plan = load_or_create_plan(project, goal)
+            check_contract = ensure_check_contract(project, config)
+            project_plan.check_contract_hash = check_contract.contract_hash
         save_json(run_directory / "check-contract.snapshot.json", check_contract)
         export_schemas(forge_dir / "schemas")
         baseline_snapshot = git_baseline(project)
         save_json(run_directory / "git-baseline.json", baseline_snapshot)
-        save_plan(
+        if inherited_has_adaptive_state:
+            # The baseline scan can be expensive. Re-read the persistent state
+            # after it so even a non-cooperating external writer cannot have its
+            # plan silently replaced by the initial snapshot. The project lock
+            # excludes every cooperating Forge writer through the subsequent
+            # atomic save.
+            (
+                project_identity,
+                project_plan,
+                check_contract,
+            ) = load_verified_adaptive_resume_state(
+                project,
+                inherited_continuation,
+                goal=goal,
+            )
+            if post_worker_recovery is not None:
+                # Eligibility is deliberately read-only. Re-run its complete
+                # provenance validation under the project lock, immediately
+                # before the only persistent plan mutation.
+                fresh_context = load_resume_context(
+                    project,
+                    str(resume_context["source_run_id"]),
+                    resume_kind="explicit_human",
+                    authorize_packet_recovery=False,
+                    expected_decision_recovery_sha256=str(
+                        post_worker_recovery.get("raw_decision_sha256") or ""
+                    ),
+                )
+                fresh_recovery = fresh_context.get(
+                    "post_worker_decision_recovery"
+                )
+                if (
+                    fresh_recovery != post_worker_recovery
+                    or fresh_context.get("continuation")
+                    != resume_context.get("continuation")
+                    or fresh_context.get("source_config_hash")
+                    != resume_context.get("source_config_hash")
+                    or fresh_context.get("base_chain_budgets")
+                    != resume_context.get("base_chain_budgets")
+                    or fresh_context.get("effective_chain_budgets")
+                    != resume_context.get("effective_chain_budgets")
+                    or fresh_context.get("budget_extension_count")
+                    != resume_context.get("budget_extension_count")
+                ):
+                    raise RuntimeError(
+                        "Post-worker decision recovery provenance changed between "
+                        "eligibility and the locked replan."
+                    )
+                post_worker_recovery = fresh_recovery
+                journal_state = str(
+                    post_worker_recovery.get("journal_state") or ""
+                )
+                if journal_state == "none":
+                    transformed_plan, post_worker_recovery_decision = (
+                        apply_post_worker_decision_recovery_plan(
+                            project_plan,
+                            post_worker_recovery,
+                            config,
+                        )
+                    )
+                    target_plan = _prepare_recovery_plan_for_persistence(
+                        transformed_plan
+                    )
+                    target_plan_hash = plan_hash(target_plan)
+                    journal_payload = {
+                        "schema_version": SCHEMA_VERSION,
+                        "action": POST_WORKER_DECISION_RECOVERY_ACTION,
+                        "source_run_id": post_worker_recovery[
+                            "source_run_id"
+                        ],
+                        "source_packet_id": post_worker_recovery[
+                            "source_packet_id"
+                        ],
+                        "replacement_packet_id": post_worker_recovery[
+                            "replacement_packet_id"
+                        ],
+                        "raw_decision_sha256": post_worker_recovery[
+                            "raw_decision_sha256"
+                        ],
+                        "source_plan_hash": post_worker_recovery[
+                            "source_plan_hash"
+                        ],
+                        "source_contract_hash": post_worker_recovery[
+                            "source_contract_hash"
+                        ],
+                        "source_repository_fingerprint": (
+                            post_worker_recovery[
+                                "source_repository_fingerprint"
+                            ]
+                        ),
+                        "source_config_hash": fresh_context[
+                            "source_config_hash"
+                        ],
+                        "prepared_by_run_id": run_id,
+                        "created_at": utc_now(),
+                        "phase": "prepared",
+                        "child_run_id": None,
+                        "target_plan_hash": target_plan_hash,
+                        "target_plan": target_plan.model_dump(mode="json"),
+                    }
+                    # The journal is the write-ahead record. It must become
+                    # durable before the persistent plan can leave source state.
+                    atomic_json(
+                        _decision_recovery_journal_path(
+                            project,
+                            str(resume_context["source_run_id"]),
+                        ),
+                        journal_payload,
+                    )
+                    post_worker_recovery["journal_state"] = "intent_only"
+                    post_worker_recovery[
+                        "journal_target_plan_hash"
+                    ] = target_plan_hash
+                    project_plan = target_plan
+                elif journal_state in {"intent_only", "target_applied"}:
+                    journal_payload = _load_decision_recovery_journal(
+                        project,
+                        str(resume_context["source_run_id"]),
+                    )
+                    if journal_payload is None:
+                        raise RuntimeError(
+                            "Validated recovery journal disappeared before plan "
+                            "persistence."
+                        )
+                    target_plan = ProjectPlan.model_validate(
+                        journal_payload["target_plan"]
+                    )
+                    if (
+                        plan_hash(target_plan)
+                        != post_worker_recovery[
+                            "journal_target_plan_hash"
+                        ]
+                    ):
+                        raise RuntimeError(
+                            "Recovery journal target changed before persistence."
+                        )
+                    project_plan = target_plan
+                    post_worker_recovery_decision = (
+                        _runtime_decision_for_recovery(
+                            post_worker_recovery
+                        )
+                    )
+                else:
+                    raise RuntimeError(
+                        "Decision-recovery journal state is invalid."
+                    )
+            elif attempt_budget_normalization is not None:
+                # Eligibility is read-only. Revalidate every immutable source,
+                # lineage, counter, repository, config, contract, and journal
+                # invariant while the project writer lock is still held.
+                fresh_context = load_resume_context(
+                    project,
+                    str(resume_context["source_run_id"]),
+                    resume_kind="explicit_human",
+                    authorize_packet_recovery=False,
+                )
+                fresh_normalization = fresh_context.get(
+                    "recovery_attempt_budget_normalization"
+                )
+                if (
+                    fresh_normalization != attempt_budget_normalization
+                    or fresh_context.get("continuation")
+                    != resume_context.get("continuation")
+                    or fresh_context.get("source_config_hash")
+                    != resume_context.get("source_config_hash")
+                    or fresh_context.get("base_chain_budgets")
+                    != resume_context.get("base_chain_budgets")
+                    or fresh_context.get("effective_chain_budgets")
+                    != resume_context.get("effective_chain_budgets")
+                    or fresh_context.get("budget_extension_count")
+                    != resume_context.get("budget_extension_count")
+                ):
+                    raise RuntimeError(
+                        "Recovery-attempt budget normalization provenance "
+                        "changed between eligibility and the locked transform."
+                    )
+                if not isinstance(fresh_normalization, dict):
+                    raise RuntimeError(
+                        "Recovery-attempt budget normalization disappeared "
+                        "before the locked transform."
+                    )
+                attempt_budget_normalization = fresh_normalization
+                journal_state = str(
+                    attempt_budget_normalization.get("journal_state") or ""
+                )
+                if journal_state == "none":
+                    transformed_plan = (
+                        apply_recovery_attempt_budget_normalization_plan(
+                            project_plan,
+                            attempt_budget_normalization,
+                            config,
+                        )
+                    )
+                    target_plan = _prepare_recovery_plan_for_persistence(
+                        transformed_plan
+                    )
+                    target_plan_hash = plan_hash(target_plan)
+                    journal_payload = {
+                        "schema_version": SCHEMA_VERSION,
+                        "action": (
+                            RECOVERY_ATTEMPT_BUDGET_NORMALIZATION_ACTION
+                        ),
+                        "source_run_id": attempt_budget_normalization[
+                            "source_run_id"
+                        ],
+                        "legacy_recovery_source_run_id": (
+                            attempt_budget_normalization[
+                                "legacy_recovery_source_run_id"
+                            ]
+                        ),
+                        "replacement_packet_id": (
+                            attempt_budget_normalization[
+                                "replacement_packet_id"
+                            ]
+                        ),
+                        "source_plan_hash": attempt_budget_normalization[
+                            "source_plan_hash"
+                        ],
+                        "source_contract_hash": (
+                            attempt_budget_normalization[
+                                "source_contract_hash"
+                            ]
+                        ),
+                        "source_repository_fingerprint": (
+                            attempt_budget_normalization[
+                                "source_repository_fingerprint"
+                            ]
+                        ),
+                        "source_config_hash": attempt_budget_normalization[
+                            "source_config_hash"
+                        ],
+                        "legacy_decision_recovery_journal_sha256": (
+                            attempt_budget_normalization[
+                                "legacy_decision_recovery_journal_sha256"
+                            ]
+                        ),
+                        "legacy_target_plan_hash": (
+                            attempt_budget_normalization[
+                                "legacy_target_plan_hash"
+                            ]
+                        ),
+                        "legacy_parent_chain_worker_calls": (
+                            attempt_budget_normalization[
+                                "legacy_parent_chain_worker_calls"
+                            ]
+                        ),
+                        "source_chain_worker_calls": (
+                            attempt_budget_normalization[
+                                "source_chain_worker_calls"
+                            ]
+                        ),
+                        "worker_call_delta": attempt_budget_normalization[
+                            "worker_call_delta"
+                        ],
+                        "prepared_by_run_id": run_id,
+                        "created_at": utc_now(),
+                        "phase": "prepared",
+                        "child_run_id": None,
+                        "target_plan_hash": target_plan_hash,
+                        "target_plan": target_plan.model_dump(mode="json"),
+                    }
+                    # This WAL is durable before the persistent plan can move
+                    # from the exact source state to the exact normalized target.
+                    atomic_json(
+                        _recovery_attempt_budget_normalization_journal_path(
+                            project,
+                            str(resume_context["source_run_id"]),
+                        ),
+                        journal_payload,
+                    )
+                    attempt_budget_normalization[
+                        "journal_state"
+                    ] = "intent_only"
+                    attempt_budget_normalization[
+                        "journal_target_plan_hash"
+                    ] = target_plan_hash
+                    project_plan = target_plan
+                elif journal_state in {"intent_only", "target_applied"}:
+                    journal_payload = (
+                        _load_recovery_attempt_budget_normalization_journal(
+                            project,
+                            str(resume_context["source_run_id"]),
+                        )
+                    )
+                    if journal_payload is None:
+                        raise RuntimeError(
+                            "Validated recovery-attempt normalization journal "
+                            "disappeared before plan persistence."
+                        )
+                    target_plan = ProjectPlan.model_validate(
+                        journal_payload["target_plan"]
+                    )
+                    if (
+                        plan_hash(target_plan)
+                        != attempt_budget_normalization[
+                            "journal_target_plan_hash"
+                        ]
+                    ):
+                        raise RuntimeError(
+                            "Recovery-attempt normalization journal target "
+                            "changed before persistence."
+                        )
+                    project_plan = target_plan
+                else:
+                    raise RuntimeError(
+                        "Recovery-attempt normalization journal state is "
+                        "invalid."
+                    )
+                assert inherited_continuation is not None
+                inherited_continuation.plan_hash = plan_hash(project_plan)
+                inherited_continuation.active_packet_id = (
+                    attempt_budget_normalization["replacement_packet_id"]
+                )
+        if (
+            post_worker_recovery is None
+            and attempt_budget_normalization is None
+        ):
+            save_plan(
+                project,
+                project_plan,
+                snapshot_path=run_directory / "project-plan.initial.json",
+            )
+        elif post_worker_recovery is not None:
+            # Exact target bytes are already authenticated by the write-ahead
+            # journal. Persist them atomically without a second timestamp change.
+            atomic_json(
+                forge_dir / "project-plan.json",
+                project_plan.model_dump(mode="json"),
+            )
+            atomic_json(
+                run_directory / "project-plan.initial.json",
+                project_plan.model_dump(mode="json"),
+            )
+            post_worker_recovery["journal_state"] = "target_applied"
+            recovery_record = dict(post_worker_recovery)
+            recovery_record["recovered_plan_hash"] = plan_hash(project_plan)
+            recovery_record["source_packet_attempts_preserved"] = True
+            recovery_record["replacement_packet_attempts_at_replan"] = 0
+            recovery_record[
+                "replacement_recovery_authorized_at_replan"
+            ] = False
+            recovery_record["replacement_recovery_used_at_replan"] = False
+            save_json(
+                run_directory / "decision-recovery.json",
+                recovery_record,
+            )
+            atomic_json(
+                run_directory / "project-plan.decision-recovery.json",
+                project_plan.model_dump(mode="json"),
+            )
+        else:
+            # The exact target is authenticated by the dedicated write-ahead
+            # journal. Persist only that target and a run-scoped audit record.
+            atomic_json(
+                forge_dir / "project-plan.json",
+                project_plan.model_dump(mode="json"),
+            )
+            atomic_json(
+                run_directory / "project-plan.initial.json",
+                project_plan.model_dump(mode="json"),
+            )
+            attempt_budget_normalization[
+                "journal_state"
+            ] = "target_applied"
+            normalization_record = dict(attempt_budget_normalization)
+            normalization_record["normalized_plan_hash"] = plan_hash(
+                project_plan
+            )
+            normalization_record["normalized_packet_attempts"] = int(
+                attempt_budget_normalization["worker_call_delta"]
+            )
+            normalization_record[
+                "normalized_recovery_authorized"
+            ] = False
+            normalization_record["normalized_recovery_used"] = False
+            save_json(
+                run_directory
+                / "recovery-attempt-budget-normalization.json",
+                normalization_record,
+            )
+            atomic_json(
+                run_directory
+                / "project-plan.recovery-attempt-budget-normalization.json",
+                project_plan.model_dump(mode="json"),
+            )
+    if post_worker_recovery is not None:
+        # Consume the one-shot authorization before the child becomes visible
+        # or any model can be dispatched. A crash after this point fails closed.
+        _mark_decision_recovery_child_started(
             project,
-            project_plan,
-            snapshot_path=run_directory / "project-plan.initial.json",
+            str(resume_context["source_run_id"]),
+            run_id,
         )
-        if inherited_continuation is not None:
-            if (
-                inherited_continuation.project_id
-                and inherited_continuation.project_id != project_identity["project_id"]
-            ):
-                raise RuntimeError(
-                    "Resume project_id does not match the source continuation chain."
-                )
-            if (
-                inherited_continuation.plan_id
-                and inherited_continuation.plan_id != project_plan.plan_id
-            ):
-                raise RuntimeError(
-                    "Resume plan_id does not match the persistent project plan."
-                )
+    if attempt_budget_normalization is not None:
+        # The compatibility migration is also one-shot. Mark its exact child
+        # durably before status/run visibility or any model dispatch.
+        _mark_recovery_attempt_budget_normalization_child_started(
+            project,
+            str(resume_context["source_run_id"]),
+            run_id,
+        )
     status = StatusTracker(
         project,
         goal,
@@ -3528,6 +9124,15 @@ def run_forge(
         "run_directory": str(run_directory),
         "logs_path": str(logs),
         "config": config,
+        "config_integrity_version": CONFIG_INTEGRITY_VERSION,
+        "config_hash": run_config_hash,
+        "config_snapshot_file": "config.snapshot.json",
+        "base_chain_budgets": base_chain_budgets.model_dump(mode="json"),
+        "effective_chain_budgets": effective_chain_budgets.model_dump(mode="json"),
+        "budget_extension_count": budget_extension_count,
+        "last_budget_extension_source_run_id": (
+            last_budget_extension_source_run_id
+        ),
         "project_id": (
             project_identity["project_id"] if project_identity is not None else None
         ),
@@ -3542,6 +9147,55 @@ def run_forge(
                 "inherited_acceptance_criteria": inherited_continuation.acceptance_criteria,
                 "source_repository_fingerprint": (
                     inherited_continuation.repository_fingerprint
+                ),
+                "resume_kind": resume_context.get("resume_kind"),
+                "legacy_config_compatibility": bool(
+                    resume_context.get("legacy_config_compatibility", False)
+                ),
+                "source_config_hash": resume_context.get("source_config_hash"),
+                "budget_extended": bool(
+                    resume_context.get("budget_extended", False)
+                ),
+                "safety_overrides": list(
+                    resume_context.get("safety_overrides", [])
+                ),
+                "post_worker_decision_recovery": (
+                    {
+                        "action": post_worker_recovery["action"],
+                        "source_packet_id": post_worker_recovery[
+                            "source_packet_id"
+                        ],
+                        "replacement_packet_id": post_worker_recovery[
+                            "replacement_packet_id"
+                        ],
+                        "raw_decision_sha256": post_worker_recovery[
+                            "raw_decision_sha256"
+                        ],
+                    }
+                    if post_worker_recovery is not None
+                    else None
+                ),
+                "recovery_attempt_budget_normalization": (
+                    {
+                        "action": attempt_budget_normalization["action"],
+                        "legacy_recovery_source_run_id": (
+                            attempt_budget_normalization[
+                                "legacy_recovery_source_run_id"
+                            ]
+                        ),
+                        "replacement_packet_id": (
+                            attempt_budget_normalization[
+                                "replacement_packet_id"
+                            ]
+                        ),
+                        "worker_call_delta": (
+                            attempt_budget_normalization[
+                                "worker_call_delta"
+                            ]
+                        ),
+                    }
+                    if attempt_budget_normalization is not None
+                    else None
                 ),
             }
             if inherited_continuation is not None
@@ -3632,8 +9286,6 @@ def run_forge(
         else 0
     )
     last_check_tier = "targeted"
-    chain_budgets = ChainBudgets.model_validate(config.get("chain_budgets", {}))
-
     def current_chain_counters() -> ChainCounters:
         return ChainCounters(
             child_runs=chain_child_runs,
@@ -3722,7 +9374,38 @@ def run_forge(
         values.update(overrides)
         status.update_monitor_context(**values)
 
+    def persist_attempt_refund(
+        plan: ProjectPlan,
+        packet_id: str,
+        *,
+        recovery_attempt: bool,
+        iteration: int,
+        reason: str,
+    ) -> ProjectPlan:
+        refunded = refund_packet_attempt(
+            plan,
+            packet_id,
+            recovery_attempt=recovery_attempt,
+        )
+        save_plan(
+            project,
+            refunded,
+            snapshot_path=(
+                run_directory
+                / f"project-plan.refunded-worker-{iteration:02d}.json"
+            ),
+        )
+        status.update_event(
+            current_agent="Forge",
+            message=(
+                "Worker invocation produced no valid outcome; the logical packet "
+                f"attempt was refunded ({reason}). Chain call/time budgets remain consumed."
+            ),
+        )
+        return refunded
+
     escalation_records: list[dict[str, Any]] = []
+    run_rescue_attempts = 0
     codex_profile_counts: dict[str, int] = {}
     worker_profile_counts: dict[str, int] = {}
     check_suite_counts: dict[str, int] = {
@@ -3747,6 +9430,12 @@ def run_forge(
     error_text: str | None = None
     continuation_payload: ContinuationPayload | None = None
     packet_transition_ready = False
+    lean_pending_decision: Decision | None = None
+    pending_check_contract_review = False
+    logical_attempt_pending = False
+    logical_attempt_packet_id: str | None = None
+    logical_attempt_was_recovery = False
+    logical_attempt_iteration = 0
     refresh_monitor_context(
         next_action="Codex pripraví alebo skontroluje aktívny pracovný balík.",
         activity_state="active",
@@ -3791,6 +9480,19 @@ def run_forge(
                 config["claude_supports_max_turns"] = bool(
                     claude_capabilities.get("max_turns")
                 )
+                # Capability discovery is model-free but changes the exact
+                # execution config. Seal that final config before the first
+                # orchestrator or worker model call.
+                canonical_run_config = _canonical_config_snapshot(config)
+                run_config_hash = config_hash(canonical_run_config)
+                run_state["config"] = config
+                run_state["config_hash"] = run_config_hash
+                save_json(
+                    run_directory / "config.snapshot.json",
+                    canonical_run_config,
+                )
+                save_json(run_directory / "run.json", run_state)
+                save_json(forge_dir / "run.json", run_state)
             save_json(run_directory / "preflight.json", preflight)
 
         print(f"Projekt: {project}")
@@ -3817,6 +9519,7 @@ def run_forge(
             )
 
         for iteration in range(1, int(config["max_iterations"]) + 1):
+            lean_all_packets_complete = False
             budget_reason = current_budget_reason() if adaptive_enabled else None
             if budget_reason:
                 final_status = "needs_continuation"
@@ -3835,6 +9538,10 @@ def run_forge(
             current_manifest = repo_manifest(project)
             current_fingerprint = repo_fingerprint(project)
             active_packet = active_plan_packet(project_plan)
+            codex_model_reviewed = False
+            reviewed_paths_for_snapshot: list[str] = []
+            late_finding_only_repair = False
+            reviewed_check_contract_evidence: dict[str, Any] | None = None
             allowed_check_ids = (
                 [
                     item.check_id
@@ -3847,7 +9554,91 @@ def run_forge(
             )
             if iteration == 1 and inherited_continuation is not None:
                 source_manifest = inherited_continuation.repository_manifest
-                if current_fingerprint == inherited_continuation.repository_fingerprint:
+                resume_contract_error = (
+                    check_contract_runtime_error(
+                        project, check_contract, config
+                    )
+                    if check_contract is not None
+                    else None
+                )
+                if (
+                    resume_contract_error is not None
+                    and resume_contract_error.startswith(
+                        CHECK_CONTRACT_REVIEWABLE_DRIFT_PREFIXES
+                    )
+                    and check_contract is not None
+                ):
+                    reviewed_check_contract_evidence = (
+                        check_contract_drift_evidence(
+                            project, check_contract, config
+                        )
+                    )
+                    save_json(
+                        logs / f"{iteration:02d}-check-contract-drift.json",
+                        reviewed_check_contract_evidence,
+                    )
+                if post_worker_recovery_decision is not None:
+                    persistent_plan_path = forge_dir / "project-plan.json"
+                    try:
+                        persistent_plan = ProjectPlan.model_validate_json(
+                            persistent_plan_path.read_text(encoding="utf-8")
+                        )
+                    except Exception as exc:
+                        raise RuntimeError(
+                            "Recovered persistent plan became unreadable before "
+                            "worker dispatch."
+                        ) from exc
+                    if (
+                        persistent_plan_path.is_symlink()
+                        or current_fingerprint
+                        != inherited_continuation.repository_fingerprint
+                        or current_manifest
+                        != inherited_continuation.repository_manifest
+                        or resume_contract_error is not None
+                        or project_plan is None
+                        or persistent_plan.model_dump(mode="json")
+                        != project_plan.model_dump(mode="json")
+                    ):
+                        raise RuntimeError(
+                            "Post-worker recovery state changed after the locked "
+                            "replan; Forge stopped before any model call."
+                        )
+                    decision = Decision.model_validate(
+                        post_worker_recovery_decision.model_dump(mode="json")
+                    )
+                    status.set_phase(
+                        "codex_review",
+                        iteration=iteration,
+                        current_agent="Forge",
+                        message=(
+                            "Explicit recovery uses the audited normalized raw "
+                            "decision without a new model review."
+                        ),
+                    )
+                    review_prompt = textwrap.dedent(
+                        f"""
+                        EXPLICIT POST-WORKER DECISION RECOVERY
+                        SOURCE RUN: {parent_run_id}
+                        RAW DECISION SHA-256: {post_worker_recovery['raw_decision_sha256']}
+                        REPLACEMENT PACKET: {post_worker_recovery['replacement_packet_id']}
+                        EXACT NORMALIZED NEXT PROMPT:
+                        {decision.next_prompt}
+
+                        ACCEPTANCE CRITERIA:
+                        {chr(10).join('- ' + item for item in decision.acceptance_criteria)}
+                        """
+                    ).strip()
+                    print(
+                        "[Forge][Resume] Používam auditované normalizované "
+                        "post-worker rozhodnutie a nový packet; vyčerpaný packet "
+                        "ani jeho pokusy sa neresetujú.",
+                        flush=True,
+                    )
+                elif (
+                    current_fingerprint
+                    == inherited_continuation.repository_fingerprint
+                    and resume_contract_error is None
+                ):
                     status.set_phase(
                         "codex_review",
                         iteration=iteration,
@@ -3925,7 +9716,7 @@ def run_forge(
                         iteration=iteration,
                         current_agent="Codex",
                         message=(
-                            "Repository sa mimo Forge zmenil; Codex vykonáva krátky "
+                            "Repository alebo check contract sa zmenil; Codex vykonáva krátky "
                             f"consistency review: {selected_model or 'CLI default'} / "
                             f"{selected_effort or 'CLI default'}."
                         ),
@@ -3937,12 +9728,18 @@ def run_forge(
                         baseline=source_manifest,
                         current_manifest=current_manifest,
                     )
+                    if resume_contract_error is not None:
+                        evidence += (
+                            "\n\nFORGE CHECK-CONTRACT DRIFT:\n"
+                            + redact_text(resume_contract_error)
+                        )
                     review_prompt = redact_text(
                         build_consistency_review_prompt(
                             inherited_continuation,
                             evidence,
                             current_fingerprint,
                             config,
+                            reviewed_check_contract_evidence,
                         )
                     )
                     if adaptive_enabled:
@@ -3958,6 +9755,7 @@ def run_forge(
                             codex_profile_counts,
                             "important_review" if important_goal else "routine_review",
                         )
+                    codex_model_reviewed = True
                     decision = ask_orchestrator(
                         project,
                         review_prompt,
@@ -3978,6 +9776,27 @@ def run_forge(
                         flush=True,
                     )
                 evidence_baseline = current_manifest
+            elif lean_mode and lean_pending_decision is not None:
+                decision = lean_pending_decision
+                lean_pending_decision = None
+                packet_transition_ready = False
+                review_prompt = textwrap.dedent(
+                    f"""
+                    LEAN DETERMINISTIC PACKET DISPATCH
+                    PACKET: {decision.active_packet_id}
+                    SOURCE: persisted ProjectPlan.worker_prompt
+                    CODEX MODEL CALL: skipped
+                    """
+                ).strip()
+                status.set_phase(
+                    "codex_review",
+                    iteration=iteration,
+                    current_agent="Forge",
+                    message=(
+                        "Lean režim vybral ďalší dependency-ready packet bez "
+                        "rutinného Codex volania."
+                    ),
+                )
             else:
                 codex_phase = (
                     "architecture"
@@ -4053,6 +9872,36 @@ def run_forge(
                     logs / f"{iteration:02d}-evidence-index.json",
                     structured_evidence,
                 )
+                reviewed_paths_for_snapshot = sorted(
+                    set(
+                        structured_evidence.changed_files
+                        + structured_evidence.new_files
+                        + structured_evidence.deleted_files
+                    )
+                )
+                current_contract_error = (
+                    check_contract_runtime_error(
+                        project, check_contract, config
+                    )
+                    if check_contract is not None
+                    else None
+                )
+                if (
+                    current_contract_error is not None
+                    and current_contract_error.startswith(
+                        CHECK_CONTRACT_REVIEWABLE_DRIFT_PREFIXES
+                    )
+                    and check_contract is not None
+                ):
+                    reviewed_check_contract_evidence = (
+                        check_contract_drift_evidence(
+                            project, check_contract, config
+                        )
+                    )
+                    save_json(
+                        logs / f"{iteration:02d}-check-contract-drift.json",
+                        reviewed_check_contract_evidence,
+                    )
                 evidence_baseline = current_manifest
                 review_prompt = redact_text(
                     build_review_prompt(
@@ -4068,6 +9917,9 @@ def run_forge(
                         active_packet=active_packet,
                         allowed_check_ids=allowed_check_ids,
                         evidence_index=structured_evidence.model_dump(mode="json"),
+                        check_contract_evidence=(
+                            reviewed_check_contract_evidence
+                        ),
                     )
                 )
                 if adaptive_enabled:
@@ -4079,6 +9931,7 @@ def run_forge(
                         exit_code = EXIT_NEEDS_CONTINUATION
                         break
                     chain_codex_calls += 1
+                codex_model_reviewed = True
                 decision = ask_orchestrator(
                     project,
                     review_prompt,
@@ -4088,11 +9941,245 @@ def run_forge(
                     important=important_goal or adaptive_important,
                     metadata_path=logs / f"{iteration:02d}-codex-usage.json",
                 )
+                if lean_mode and codex_phase == "architecture":
+                    try:
+                        validate_lean_initial_plan(
+                            decision.plan_patch.add_packets
+                            if decision.plan_patch is not None
+                            else []
+                        )
+                    except ValueError as first_error:
+                        budget_reason = current_budget_reason()
+                        if budget_reason:
+                            final_status = "needs_continuation"
+                            final_message = budget_reason
+                            stop_reason_code = "chain_budget_exhausted"
+                            exit_code = EXIT_NEEDS_CONTINUATION
+                            break
+                        retry_prompt = redact_text(
+                            review_prompt
+                            + "\n\nLEAN ARCHITECTURE VALIDATION FAILED:\n"
+                            + str(first_error)
+                            + "\nReturn one corrected full architecture decision. "
+                            "This is the only architecture retry."
+                        )
+                        chain_codex_calls += 1
+                        increment_count(codex_profile_counts, "architecture")
+                        save_json(
+                            logs / f"{iteration:02d}-architecture-retry.json",
+                            {
+                                "schema_version": SCHEMA_VERSION,
+                                "first_error": str(first_error),
+                                "retry_count": 1,
+                            },
+                        )
+                        decision = ask_orchestrator(
+                            project,
+                            retry_prompt,
+                            config,
+                            logs / f"{iteration:02d}-decision-retry-raw.json",
+                            phase="architecture",
+                            important=important_goal,
+                            metadata_path=(
+                                logs / f"{iteration:02d}-codex-usage-retry.json"
+                            ),
+                        )
+                        try:
+                            validate_lean_initial_plan(
+                                decision.plan_patch.add_packets
+                                if decision.plan_patch is not None
+                                else []
+                            )
+                        except ValueError as second_error:
+                            raise RuntimeError(
+                                "Lean architecture remained invalid after its "
+                                f"single retry: {second_error}"
+                            ) from second_error
                 print(
                     f"[Forge][Phase] codex_review completed in "
                     f"{time.monotonic() - phase_started:.1f}s",
                     flush=True,
                 )
+            if (
+                adaptive_enabled
+                and codex_model_reviewed
+                and project_plan is not None
+                and active_packet is not None
+            ):
+                project_plan, late_findings = record_review_snapshot(
+                    project_plan,
+                    active_packet.packet_id,
+                    manifest=current_manifest,
+                    reviewed_paths=reviewed_paths_for_snapshot,
+                    issues=decision.review_issues,
+                )
+                issue_paths = [
+                    issue.file_path.replace("\\", "/").strip()
+                    for issue in decision.review_issues
+                    if issue.file_path.strip()
+                ]
+                late_finding_only_repair = bool(
+                    decision.status == "continue"
+                    and decision.decision_kind == "repair_packet"
+                    and issue_paths
+                    and len(late_findings) == len(decision.review_issues)
+                )
+                reviewed_plan_packet = next(
+                    packet
+                    for packet in project_plan.work_packets
+                    if packet.packet_id == active_packet.packet_id
+                )
+                reviewed_plan_packet.late_finding_repair_pending = (
+                    late_finding_only_repair
+                )
+                project_plan = ProjectPlan.model_validate(
+                    project_plan.model_dump(mode="json")
+                )
+                save_plan(
+                    project,
+                    project_plan,
+                    snapshot_path=(
+                        run_directory
+                        / f"project-plan.review-snapshot-{iteration:02d}.json"
+                    ),
+                )
+                save_json(
+                    logs / f"{iteration:02d}-review-snapshot.json",
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "packet_id": active_packet.packet_id,
+                        "reviewed_files": {
+                            path: current_manifest.get(path, "<deleted>")
+                            for path in reviewed_paths_for_snapshot
+                        },
+                        "issues": [
+                            issue.model_dump(mode="json")
+                            for issue in decision.review_issues
+                        ],
+                        "late_findings": late_findings,
+                        "packet_attempt_refund": late_finding_only_repair,
+                    },
+                )
+            if adaptive_enabled and check_contract is not None:
+                contract_error = check_contract_runtime_error(
+                    project, check_contract, config
+                )
+                reviewable_drift = bool(
+                    contract_error
+                    and contract_error.startswith(
+                        CHECK_CONTRACT_REVIEWABLE_DRIFT_PREFIXES
+                    )
+                )
+                if decision.approve_check_contract_drift and not reviewable_drift:
+                    raise RuntimeError(
+                        "Codex approved check-contract drift without a current "
+                        "reviewable drift."
+                    )
+                if reviewable_drift:
+                    updated_contract, approved = apply_check_contract_approval(
+                        project,
+                        config,
+                        check_contract,
+                        decision,
+                        reviewed_check_contract_evidence,
+                    )
+                    if approved:
+                        check_contract = updated_contract
+                        if project_plan is not None:
+                            project_plan.check_contract_hash = (
+                                check_contract.contract_hash
+                            )
+                            save_plan(
+                                project,
+                                project_plan,
+                                snapshot_path=(
+                                    run_directory
+                                    / (
+                                        "project-plan.contract-approved-"
+                                        f"{iteration:02d}.json"
+                                    )
+                                ),
+                            )
+                        save_json(
+                            run_directory / "check-contract.snapshot.json",
+                            check_contract,
+                        )
+                    else:
+                        pending_check_contract_review = True
+                        if decision.status == "continue":
+                            final_decision = decision
+                        else:
+                            fallback_prompt = (
+                                active_packet.objective
+                                if active_packet is not None
+                                else (
+                                    "Perform no implementation until the pending "
+                                    "check-contract semantic drift is explicitly "
+                                    "reviewed and approved."
+                                )
+                            )
+                            final_decision = Decision(
+                                status="continue",
+                                decision_kind="verify_packet",
+                                assessment=(
+                                    "Check-contract semantic drift requires an "
+                                    "explicit evidence-bound approval before any "
+                                    "plan transition or worker execution."
+                                ),
+                                active_packet_id=(
+                                    active_packet.packet_id
+                                    if active_packet is not None
+                                    else None
+                                ),
+                                next_prompt=fallback_prompt,
+                                acceptance_criteria=decision.acceptance_criteria,
+                                risks=decision.risks,
+                                recommended_worker_profile=(
+                                    decision.recommended_worker_profile
+                                ),
+                                recommended_worker_effort=(
+                                    decision.recommended_worker_effort
+                                ),
+                                recommended_worker_max_turns=(
+                                    decision.recommended_worker_max_turns
+                                ),
+                                recommended_review_profile=(
+                                    decision.recommended_review_profile
+                                ),
+                                check_tier=decision.check_tier,
+                                check_ids=decision.check_ids,
+                                routing_reason=(
+                                    "Fail-closed check-contract approval gate."
+                                ),
+                            )
+                        save_json(
+                            logs / f"{iteration:02d}-decision.json",
+                            final_decision,
+                        )
+                        (logs / f"{iteration:02d}-evidence.txt").write_text(
+                            redact_text(review_prompt), encoding="utf-8"
+                        )
+                        final_status = "needs_continuation"
+                        stop_reason_code = "external_change_review_required"
+                        final_message = (
+                            "Check-contract drift was not explicitly approved "
+                            "after semantic review; Forge stopped before plan "
+                            "mutation or Claude worker execution."
+                        )
+                        exit_code = EXIT_NEEDS_CONTINUATION
+                        status.set_phase(
+                            "needs_continuation",
+                            iteration=iteration,
+                            current_agent="Forge",
+                            message=final_message,
+                            final_status="needs_continuation",
+                        )
+                        break
+                elif contract_error is not None:
+                    raise RuntimeError(
+                        "Non-reviewable check-contract integrity failure: "
+                        + contract_error
+                    )
             if adaptive_enabled and project_plan is not None:
                 if (
                     iteration == 1
@@ -4121,6 +10208,24 @@ def run_forge(
                     goal=goal,
                 )
                 active_packet = active_plan_packet(project_plan)
+                if (
+                    lean_mode
+                    and decision.status == "continue"
+                    and active_packet is not None
+                ):
+                    decision = lean_packet_decision(
+                        active_packet,
+                        project_plan,
+                        assessment=(
+                            "Lean architecture accepted; dispatch the persisted "
+                            "worker prompt for the active packet."
+                        ),
+                        decision_kind=(
+                            "repair_packet"
+                            if decision.decision_kind == "repair_packet"
+                            else "implement_packet"
+                        ),
+                    )
                 refresh_monitor_context(
                     codex_assignment=decision.next_prompt,
                     check_tier=decision.check_tier,
@@ -4152,18 +10257,16 @@ def run_forge(
                     for packet in project_plan.work_packets
                 )
             ):
-                ready_packet = next(
-                    (
-                        packet
-                        for packet in project_plan.work_packets
-                        if packet.status == "pending"
-                        and all(
-                            dependency in project_plan.completed_packet_ids
-                            for dependency in packet.dependencies
-                        )
-                    ),
-                    None,
-                )
+                ready_packet = dependency_ready_packet(project_plan)
+                if ready_packet is None and lean_mode:
+                    already_activated = active_plan_packet(project_plan)
+                    if (
+                        already_activated is not None
+                        and already_activated.status == "in_progress"
+                        and already_activated.packet_id
+                        != decision.active_packet_id
+                    ):
+                        ready_packet = already_activated
                 if ready_packet is not None:
                     project_plan = apply_plan_patch(
                         project_plan,
@@ -4188,34 +10291,50 @@ def run_forge(
                             f"Codex skontroluje ďalší packet: {ready_packet.title}."
                         )
                     )
-                    final_decision = Decision(
-                        status="continue",
-                        decision_kind="implement_packet",
-                        assessment=(
-                            "Verified packet completed; continue with the next "
-                            "dependency-ready packet."
-                        ),
-                        active_packet_id=ready_packet.packet_id,
-                        packet_assessment="Next packet is ready.",
-                        next_prompt=ready_packet.objective,
-                        acceptance_criteria=ready_packet.acceptance_criteria,
-                        risks=project_plan.overall_risks,
-                        recommended_worker_profile=(
-                            ready_packet.recommended_worker_profile
-                        ),
-                        recommended_review_profile=(
-                            ready_packet.recommended_review_profile
-                        ),
-                        check_tier=ready_packet.check_tier,
-                        routing_reason="Deterministic dependency-ready packet transition.",
+                    final_decision = (
+                        lean_packet_decision(
+                            ready_packet,
+                            project_plan,
+                            assessment=(
+                                "Verified packet completed; continue with the next "
+                                "dependency-ready packet."
+                            ),
+                        )
+                        if lean_mode
+                        else Decision(
+                            status="continue",
+                            decision_kind="implement_packet",
+                            assessment=(
+                                "Verified packet completed; continue with the next "
+                                "dependency-ready packet."
+                            ),
+                            active_packet_id=ready_packet.packet_id,
+                            packet_assessment="Next packet is ready.",
+                            next_prompt=ready_packet.objective,
+                            acceptance_criteria=ready_packet.acceptance_criteria,
+                            risks=project_plan.overall_risks,
+                            recommended_worker_profile=(
+                                ready_packet.recommended_worker_profile
+                            ),
+                            recommended_review_profile=(
+                                ready_packet.recommended_review_profile
+                            ),
+                            check_tier=ready_packet.check_tier,
+                            routing_reason=(
+                                "Deterministic dependency-ready packet transition."
+                            ),
+                        )
                     )
                     packet_transition_ready = True
+                    if lean_mode:
+                        decision = final_decision
                 print(
                     "[Forge][Plan] Aktívny packet je overený; ďalší packet vyberie "
                     "nasledujúci Codex review.",
                     flush=True,
                 )
-                continue
+                if not lean_mode or ready_packet is None:
+                    continue
 
             if decision.status == "done":
                 if adaptive_enabled and project_plan is not None:
@@ -4345,46 +10464,14 @@ def run_forge(
                 print(f"[Codex][Decision] blocked - {redact_text(final_message)}")
                 break
 
-            if (
-                adaptive_enabled
-                and check_contract is not None
-                and decision.status == "continue"
-            ):
-                contract_error = check_contract_runtime_error(
-                    project, check_contract
-                )
-                if contract_error and contract_error.startswith(
-                    "Indirect check sources drifted"
-                ):
-                    check_contract = ensure_check_contract(
-                        project,
-                        config,
-                        approve_indirect_drift=True,
-                        change_reason=(
-                            "Codex reviewed the reported indirect check-source drift: "
-                            + (decision.routing_reason or decision.assessment)
-                        ),
-                    )
-                    if project_plan is not None:
-                        project_plan.check_contract_hash = (
-                            check_contract.contract_hash
-                        )
-                        save_plan(
-                            project,
-                            project_plan,
-                            snapshot_path=(
-                                run_directory
-                                / f"project-plan.contract-approved-{iteration:02d}.json"
-                            ),
-                        )
-                    save_json(
-                        run_directory / "check-contract.snapshot.json",
-                        check_contract,
-                    )
             final_decision = decision
             logical_worker_profile = "standard"
             worker_routing_reason = "Legacy-compatible standard worker profile."
             packet_for_worker: WorkPacket | None = None
+            logical_attempt_pending = False
+            logical_attempt_packet_id = None
+            logical_attempt_was_recovery = False
+            logical_attempt_iteration = iteration
             if adaptive_enabled:
                 budget_reason = current_budget_reason()
                 if budget_reason:
@@ -4419,22 +10506,30 @@ def run_forge(
                     project_plan is not None
                     and active_plan_packet(project_plan) is not None
                 ):
-                    project_plan = apply_plan_patch(
-                        project_plan,
-                        PlanPatch(
-                            update_packets=[
-                                PacketUpdate(
-                                    packet_id=packet_for_worker.packet_id,
-                                    attempts_increment=1,
-                                    justification=(
-                                        "A routed Claude worker attempt is starting."
-                                    ),
-                                )
-                            ],
-                            explanation="Record the bounded logical packet attempt.",
-                        ),
-                        checks_passed=checks_passed(checks),
-                    )
+                    if (
+                        late_finding_only_repair
+                        or packet_for_worker.late_finding_repair_pending
+                    ):
+                        logical_attempt_pending = False
+                        status.update_event(
+                            current_agent="Forge",
+                            message=(
+                                "Late finding on unchanged reviewed files is "
+                                "batched into one repair without consuming a "
+                                "packet attempt."
+                            ),
+                        )
+                    else:
+                        (
+                            project_plan,
+                            logical_attempt_was_recovery,
+                        ) = begin_packet_attempt(
+                            project_plan,
+                            packet_for_worker.packet_id,
+                            config,
+                        )
+                        logical_attempt_pending = True
+                        logical_attempt_packet_id = packet_for_worker.packet_id
                     save_plan(
                         project,
                         project_plan,
@@ -4462,25 +10557,64 @@ def run_forge(
             phase_started = time.monotonic()
             before_manifest_worker = repo_manifest(project)
             before = repo_fingerprint(project)
-            routed_outcome = run_claude_routed(
-                project,
-                compact_goal(goal, iteration, config),
-                decision,
-                config,
-                profile=logical_worker_profile,
-                routing_reason=worker_routing_reason,
-                iteration=iteration,
-                logs=logs,
-                status=status,
-                unavailable_models=unavailable_models,
-                max_worker_calls_remaining=max(
-                    0, chain_budgets.max_worker_calls - chain_worker_calls
-                ),
-                max_premium_calls_remaining=max(
-                    0,
-                    chain_budgets.max_premium_escalations - escalations_used,
-                ),
-            )
+            try:
+                routed_outcome = run_claude_routed(
+                    project,
+                    compact_goal(goal, iteration, config),
+                    decision,
+                    config,
+                    profile=logical_worker_profile,
+                    routing_reason=worker_routing_reason,
+                    iteration=iteration,
+                    logs=logs,
+                    status=status,
+                    unavailable_models=unavailable_models,
+                    max_worker_calls_remaining=max(
+                        0, chain_budgets.max_worker_calls - chain_worker_calls
+                    ),
+                    max_premium_calls_remaining=max(
+                        0,
+                        chain_budgets.max_premium_escalations - escalations_used,
+                    ),
+                )
+            except SubscriptionLimitError as exc:
+                dispatched_calls = int(getattr(exc, "worker_calls", 1))
+                dispatched_premium = int(getattr(exc, "premium_calls", 0))
+                chain_worker_calls += dispatched_calls
+                escalations_used += dispatched_premium
+                run_premium_escalations += dispatched_premium
+                turn_budget_records.extend(
+                    list(getattr(exc, "routing_records", []))
+                )
+                if (
+                    logical_attempt_pending
+                    and logical_attempt_packet_id is not None
+                    and project_plan is not None
+                ):
+                    project_plan = persist_attempt_refund(
+                        project_plan,
+                        logical_attempt_packet_id,
+                        recovery_attempt=logical_attempt_was_recovery,
+                        iteration=iteration,
+                        reason="subscription limit before a valid outcome",
+                    )
+                    logical_attempt_pending = False
+                raise
+            except Exception:
+                if (
+                    logical_attempt_pending
+                    and logical_attempt_packet_id is not None
+                    and project_plan is not None
+                ):
+                    project_plan = persist_attempt_refund(
+                        project_plan,
+                        logical_attempt_packet_id,
+                        recovery_attempt=logical_attempt_was_recovery,
+                        iteration=iteration,
+                        reason="worker transport raised before a valid outcome",
+                    )
+                    logical_attempt_pending = False
+                raise
             worker = routed_outcome.worker
             chain_worker_calls += routed_outcome.worker_calls
             escalations_used += routed_outcome.premium_calls
@@ -4490,22 +10624,145 @@ def run_forge(
             unavailable_models = dict(routed_outcome.unavailable_models)
             turn_budget_records.extend(routed_outcome.routing_records)
             save_json(logs / f"{iteration:02d}-worker.json", worker)
+            if worker.valid_worker_outcome:
+                logical_attempt_pending = False
+                if (
+                    project_plan is not None
+                    and packet_for_worker is not None
+                    and packet_for_worker.late_finding_repair_pending
+                ):
+                    completed_late_plan = project_plan.model_copy(deep=True)
+                    completed_late_packet = next(
+                        packet
+                        for packet in completed_late_plan.work_packets
+                        if packet.packet_id == packet_for_worker.packet_id
+                    )
+                    completed_late_packet.late_finding_repair_pending = False
+                    completed_late_plan.updated_at = utc_now()
+                    project_plan = ProjectPlan.model_validate(
+                        completed_late_plan.model_dump(mode="json")
+                    )
+                    save_plan(
+                        project,
+                        project_plan,
+                        snapshot_path=(
+                            run_directory
+                            / f"project-plan.late-finding-{iteration:02d}.json"
+                        ),
+                    )
             if worker.termination_reason == "model_unavailable_without_credits":
+                if (
+                    logical_attempt_pending
+                    and logical_attempt_packet_id is not None
+                    and project_plan is not None
+                ):
+                    project_plan = persist_attempt_refund(
+                        project_plan,
+                        logical_attempt_packet_id,
+                        recovery_attempt=logical_attempt_was_recovery,
+                        iteration=iteration,
+                        reason=worker.termination_reason,
+                    )
+                    logical_attempt_pending = False
                 raise RuntimeError(
                     "No subscription-included allowlisted Claude model is "
                     "available. Forge stopped without usage credits or API billing."
                 )
             if worker.termination_reason == "auth_failure":
+                if (
+                    logical_attempt_pending
+                    and logical_attempt_packet_id is not None
+                    and project_plan is not None
+                ):
+                    project_plan = persist_attempt_refund(
+                        project_plan,
+                        logical_attempt_packet_id,
+                        recovery_attempt=logical_attempt_was_recovery,
+                        iteration=iteration,
+                        reason=worker.termination_reason,
+                    )
+                    logical_attempt_pending = False
                 raise RuntimeError(
                     "Claude subscription authentication failed. Forge did not "
                     "attempt a model or API fallback."
                 )
-            if worker.termination_reason == "rate_limit":
+            if worker.termination_reason in {"rate_limit", "subscription_limit"}:
+                if (
+                    logical_attempt_pending
+                    and logical_attempt_packet_id is not None
+                    and project_plan is not None
+                ):
+                    project_plan = persist_attempt_refund(
+                        project_plan,
+                        logical_attempt_packet_id,
+                        recovery_attempt=logical_attempt_was_recovery,
+                        iteration=iteration,
+                        reason=worker.termination_reason,
+                    )
+                    logical_attempt_pending = False
                 raise SubscriptionLimitError(
-                    "Claude CLI reported a rate limit. Forge stopped without "
-                    "trying another model or paid API.",
+                    "Claude CLI reported a subscription or rate limit. Forge "
+                    "stopped without trying another model or paid API.",
                     worker,
                 )
+            if not worker.valid_worker_outcome:
+                if (
+                    logical_attempt_pending
+                    and logical_attempt_packet_id is not None
+                    and project_plan is not None
+                ):
+                    project_plan = persist_attempt_refund(
+                        project_plan,
+                        logical_attempt_packet_id,
+                        recovery_attempt=logical_attempt_was_recovery,
+                        iteration=iteration,
+                        reason=worker.termination_reason,
+                    )
+                    logical_attempt_pending = False
+                if worker.termination_reason == "sandbox_denial":
+                    raise RuntimeError(
+                        "Claude worker was denied by the OS sandbox before a "
+                        "valid outcome. Forge stopped instead of weakening the "
+                        "sandbox or escalating the model."
+                    )
+                retry_budget_reason = (
+                    current_budget_reason() if adaptive_enabled else None
+                )
+                if (
+                    iteration < int(config["max_iterations"])
+                    and retry_budget_reason is None
+                ):
+                    status.update_event(
+                        current_agent="Forge",
+                        message=(
+                            "Technical worker transport produced no valid outcome. "
+                            "Forge refunded the logical packet attempt and will retry "
+                            "without recording application no-progress or rescue."
+                        ),
+                    )
+                    worker = None
+                    continue
+                final_status = "needs_continuation"
+                stop_reason_code = (
+                    "chain_budget_exhausted"
+                    if retry_budget_reason is not None
+                    else "iterations_exhausted"
+                )
+                final_message = retry_budget_reason or (
+                    "The worker transport produced no valid outcome on the last "
+                    "run iteration. The logical packet attempt was refunded and "
+                    "the exact task is preserved for bounded continuation."
+                )
+                exit_code = EXIT_NEEDS_CONTINUATION
+                status.set_phase(
+                    "needs_continuation",
+                    iteration=iteration,
+                    current_agent="Forge",
+                    message=final_message,
+                    final_status="needs_continuation",
+                )
+                worker = None
+                break
             print(
                 f"[Claude][Result] exit {worker.exit_code} ({worker.duration_seconds:.1f}s)",
                 flush=True,
@@ -4535,7 +10792,18 @@ def run_forge(
                 message="Forge spúšťa automatické kontroly.",
             )
             phase_started = time.monotonic()
-            last_check_tier = decision.check_tier if adaptive_enabled else "release"
+            lean_docs_packet = bool(
+                lean_mode
+                and packet_for_worker is not None
+                and packet_for_worker.packet_type == "docs"
+            )
+            last_check_tier = (
+                "smoke"
+                if lean_docs_packet
+                else decision.check_tier
+                if adaptive_enabled
+                else "release"
+            )
             increment_count(check_suite_counts, last_check_tier)
             if not adaptive_enabled or last_check_tier in {"milestone", "release"}:
                 chain_full_check_suites += 1
@@ -4545,7 +10813,11 @@ def run_forge(
                 status,
                 tier=last_check_tier,
                 requested_ids=(
-                    decision.check_ids or None if adaptive_enabled else None
+                    None
+                    if lean_docs_packet
+                    else decision.check_ids or None
+                    if adaptive_enabled
+                    else None
                 ),
                 git_metadata_baseline=trusted_git_metadata,
                 check_contract=check_contract,
@@ -4572,6 +10844,34 @@ def run_forge(
             )
             after = repo_fingerprint(project)
             after_manifest_worker = repo_manifest(project)
+            if lean_docs_packet and packet_for_worker is not None:
+                docs_violations = lean_docs_scope_violations(
+                    packet_for_worker,
+                    before_manifest_worker,
+                    after_manifest_worker,
+                )
+                checks.append(
+                    CheckResult(
+                        command="forge internal lean-docs-scope",
+                        check_id="forge-lean-docs-scope",
+                        exit_code=1 if docs_violations else 0,
+                        output=(
+                            "Documentation packet changed forbidden paths: "
+                            + ", ".join(docs_violations)
+                            if docs_violations
+                            else (
+                                "Documentation changes stayed within docs/, "
+                                "README.md, and explicit expected_paths."
+                            )
+                        ),
+                        tier="smoke",
+                        report_valid=not docs_violations,
+                    )
+                )
+                save_json(
+                    logs / f"{iteration:02d}-checks.json",
+                    [item.model_dump(mode="json") for item in checks],
+                )
             if adaptive_enabled:
                 _, worker_diff = run_git(
                     project, "diff", "--no-ext-diff", "--", timeout=120
@@ -4619,7 +10919,10 @@ def run_forge(
                 no_progress_count=no_progress_count,
                 progress_made=progress_made,
                 repeated_failure_count=repeated_failure_count,
-                escalations_used=len(escalation_records),
+                # Count physical rescue dispatches in this run. An invalid
+                # rescue has no application-level record, but it still consumes
+                # the bounded per-run rescue opportunity.
+                escalations_used=run_rescue_attempts,
                 config=config,
             )
             if escalation_reasons:
@@ -4646,30 +10949,73 @@ def run_forge(
                     ),
                 )
                 escalation_before = repo_fingerprint(project)
-                rescue_outcome = run_claude_routed(
-                    project,
-                    compact_goal(goal, max(iteration, 2), config),
-                    escalation_decision,
-                    config,
-                    profile="rescue",
-                    routing_reason=(
-                        "Controlled rescue after measured stuck evidence: "
-                        + "; ".join(escalation_reasons)
-                    ),
-                    iteration=iteration,
-                    logs=logs,
-                    status=status,
-                    unavailable_models=unavailable_models,
-                    max_worker_calls_remaining=max(
-                        0, chain_budgets.max_worker_calls - chain_worker_calls
-                    ),
-                    max_premium_calls_remaining=max(
-                        0,
-                        chain_budgets.max_premium_escalations - escalations_used,
-                    ),
-                    log_stem=escalation_stem,
-                )
+                try:
+                    rescue_outcome = run_claude_routed(
+                        project,
+                        compact_goal(goal, max(iteration, 2), config),
+                        escalation_decision,
+                        config,
+                        profile="rescue",
+                        routing_reason=(
+                            "Controlled rescue after measured stuck evidence: "
+                            + "; ".join(escalation_reasons)
+                        ),
+                        iteration=iteration,
+                        logs=logs,
+                        status=status,
+                        unavailable_models=unavailable_models,
+                        max_worker_calls_remaining=max(
+                            0, chain_budgets.max_worker_calls - chain_worker_calls
+                        ),
+                        max_premium_calls_remaining=max(
+                            0,
+                            chain_budgets.max_premium_escalations - escalations_used,
+                        ),
+                        log_stem=escalation_stem,
+                    )
+                except SubscriptionLimitError as exc:
+                    dispatched_calls = int(getattr(exc, "worker_calls", 1))
+                    dispatched_premium = int(
+                        getattr(exc, "premium_calls", 0)
+                    )
+                    chain_worker_calls += dispatched_calls
+                    escalations_used += dispatched_premium
+                    run_premium_escalations += dispatched_premium
+                    turn_budget_records.extend(
+                        list(getattr(exc, "routing_records", []))
+                    )
+                    if (
+                        logical_attempt_pending
+                        and logical_attempt_packet_id is not None
+                        and project_plan is not None
+                    ):
+                        project_plan = persist_attempt_refund(
+                            project_plan,
+                            logical_attempt_packet_id,
+                            recovery_attempt=logical_attempt_was_recovery,
+                            iteration=iteration,
+                            reason="subscription limit before a valid outcome",
+                        )
+                        logical_attempt_pending = False
+                    raise
+                except Exception:
+                    if (
+                        logical_attempt_pending
+                        and logical_attempt_packet_id is not None
+                        and project_plan is not None
+                    ):
+                        project_plan = persist_attempt_refund(
+                            project_plan,
+                            logical_attempt_packet_id,
+                            recovery_attempt=logical_attempt_was_recovery,
+                            iteration=iteration,
+                            reason="rescue transport raised before a valid outcome",
+                        )
+                        logical_attempt_pending = False
+                    raise
                 worker = rescue_outcome.worker
+                if rescue_outcome.worker_calls > 0:
+                    run_rescue_attempts += 1
                 chain_worker_calls += rescue_outcome.worker_calls
                 escalations_used += rescue_outcome.premium_calls
                 run_premium_escalations += rescue_outcome.premium_calls
@@ -4678,20 +11024,124 @@ def run_forge(
                 unavailable_models = dict(rescue_outcome.unavailable_models)
                 turn_budget_records.extend(rescue_outcome.routing_records)
                 save_json(logs / f"{escalation_stem}-worker.json", worker)
+                if worker.valid_worker_outcome:
+                    logical_attempt_pending = False
                 if worker.termination_reason == "model_unavailable_without_credits":
+                    if (
+                        logical_attempt_pending
+                        and logical_attempt_packet_id is not None
+                        and project_plan is not None
+                    ):
+                        project_plan = persist_attempt_refund(
+                            project_plan,
+                            logical_attempt_packet_id,
+                            recovery_attempt=logical_attempt_was_recovery,
+                            iteration=iteration,
+                            reason=worker.termination_reason,
+                        )
+                        logical_attempt_pending = False
                     raise RuntimeError(
                         "Rescue candidates are unavailable without credits. "
                         "Forge stopped without API billing."
                     )
                 if worker.termination_reason == "auth_failure":
+                    if (
+                        logical_attempt_pending
+                        and logical_attempt_packet_id is not None
+                        and project_plan is not None
+                    ):
+                        project_plan = persist_attempt_refund(
+                            project_plan,
+                            logical_attempt_packet_id,
+                            recovery_attempt=logical_attempt_was_recovery,
+                            iteration=iteration,
+                            reason=worker.termination_reason,
+                        )
+                        logical_attempt_pending = False
                     raise RuntimeError(
                         "Claude subscription authentication failed during rescue."
                     )
-                if worker.termination_reason == "rate_limit":
+                if worker.termination_reason in {
+                    "rate_limit",
+                    "subscription_limit",
+                }:
+                    if (
+                        logical_attempt_pending
+                        and logical_attempt_packet_id is not None
+                        and project_plan is not None
+                    ):
+                        project_plan = persist_attempt_refund(
+                            project_plan,
+                            logical_attempt_packet_id,
+                            recovery_attempt=logical_attempt_was_recovery,
+                            iteration=iteration,
+                            reason=worker.termination_reason,
+                        )
+                        logical_attempt_pending = False
                     raise SubscriptionLimitError(
-                        "Claude CLI reported a rate limit during rescue.",
+                        "Claude CLI reported a subscription or rate limit during rescue.",
                         worker,
                     )
+                if not worker.valid_worker_outcome:
+                    if (
+                        logical_attempt_pending
+                        and logical_attempt_packet_id is not None
+                        and project_plan is not None
+                    ):
+                        project_plan = persist_attempt_refund(
+                            project_plan,
+                            logical_attempt_packet_id,
+                            recovery_attempt=logical_attempt_was_recovery,
+                            iteration=iteration,
+                            reason=worker.termination_reason,
+                        )
+                        logical_attempt_pending = False
+                    if worker.termination_reason == "sandbox_denial":
+                        raise RuntimeError(
+                            "Claude rescue worker was denied by the OS sandbox "
+                            "before a valid outcome. Forge stopped instead of "
+                            "weakening the sandbox or escalating again."
+                        )
+                    retry_budget_reason = (
+                        current_budget_reason() if adaptive_enabled else None
+                    )
+                    if (
+                        iteration < int(config["max_iterations"])
+                        and retry_budget_reason is None
+                    ):
+                        status.update_event(
+                            current_agent="Forge",
+                            message=(
+                                "Technical rescue transport produced no valid "
+                                "outcome. Forge will retry the same bounded work "
+                                "without project checks, application no-progress, "
+                                "failure-signature, or rescue-result accounting."
+                            ),
+                        )
+                        worker = None
+                        continue
+                    final_status = "needs_continuation"
+                    stop_reason_code = (
+                        "chain_budget_exhausted"
+                        if retry_budget_reason is not None
+                        else "iterations_exhausted"
+                    )
+                    final_message = retry_budget_reason or (
+                        "The rescue transport produced no valid outcome on the "
+                        "last run iteration. Physical call/time budgets remain "
+                        "consumed, and the exact task is preserved for bounded "
+                        "continuation."
+                    )
+                    exit_code = EXIT_NEEDS_CONTINUATION
+                    status.set_phase(
+                        "needs_continuation",
+                        iteration=iteration,
+                        current_agent="Forge",
+                        message=final_message,
+                        final_status="needs_continuation",
+                    )
+                    worker = None
+                    break
                 status.set_phase(
                     "automatic_checks",
                     iteration=iteration,
@@ -4746,6 +11196,226 @@ def run_forge(
                 }
                 escalation_records.append(escalation_record)
                 save_json(run_directory / "escalations.json", escalation_records)
+            if (
+                lean_mode
+                and project_plan is not None
+                and packet_for_worker is not None
+            ):
+                reviewed_packet = next(
+                    (
+                        packet
+                        for packet in project_plan.work_packets
+                        if packet.packet_id == packet_for_worker.packet_id
+                    ),
+                    None,
+                )
+                if reviewed_packet is not None:
+                    project_plan = record_lean_check_evidence(
+                        project_plan,
+                        reviewed_packet.packet_id,
+                        checks,
+                    )
+                    save_plan(
+                        project,
+                        project_plan,
+                        snapshot_path=(
+                            run_directory
+                            / f"project-plan.check-evidence-{iteration:02d}.json"
+                        ),
+                    )
+                    reviewed_packet = next(
+                        packet
+                        for packet in project_plan.work_packets
+                        if packet.packet_id == packet_for_worker.packet_id
+                    )
+                claude_review_approved = False
+                claude_review_candidate = bool(
+                    reviewed_packet is not None
+                    and reviewed_packet.packet_type != "docs"
+                    and checks_passed(checks)
+                    and config.get("routine_reviewer", "none") == "claude"
+                    and (
+                        reviewed_packet.check_tier == "milestone"
+                        or reviewed_packet.closes_milestone
+                    )
+                )
+                if claude_review_candidate and reviewed_packet is not None:
+                    increment_count(worker_profile_counts, "claude_reviewer")
+                    verdict, reviewer_outcome = run_read_only_claude_review(
+                        project,
+                        compact_goal(goal, max(iteration, 2), config),
+                        reviewed_packet,
+                        checks,
+                        config,
+                        iteration=iteration,
+                        logs=logs,
+                        status=status,
+                        unavailable_models=unavailable_models,
+                        max_worker_calls_remaining=max(
+                            0,
+                            chain_budgets.max_worker_calls
+                            - chain_worker_calls,
+                        ),
+                        max_premium_calls_remaining=max(
+                            0,
+                            chain_budgets.max_premium_escalations
+                            - escalations_used,
+                        ),
+                    )
+                    chain_worker_calls += reviewer_outcome.worker_calls
+                    escalations_used += reviewer_outcome.premium_calls
+                    run_premium_escalations += reviewer_outcome.premium_calls
+                    model_fallbacks += reviewer_outcome.model_fallbacks
+                    chain_model_fallbacks += reviewer_outcome.model_fallbacks
+                    unavailable_models = dict(
+                        reviewer_outcome.unavailable_models
+                    )
+                    turn_budget_records.extend(
+                        reviewer_outcome.routing_records
+                    )
+                    if verdict.approve:
+                        claude_review_approved = True
+                    else:
+                        project_plan, repair = prepare_claude_review_repair(
+                            project_plan,
+                            reviewed_packet.packet_id,
+                            verdict,
+                        )
+                        if repair is not None:
+                            lean_pending_decision = repair
+                            final_decision = repair
+                            packet_transition_ready = True
+                        save_plan(
+                            project,
+                            project_plan,
+                            snapshot_path=(
+                                run_directory
+                                / (
+                                    "project-plan.claude-review-repair-"
+                                    f"{iteration:02d}.json"
+                                )
+                            ),
+                        )
+                routine_check_close = bool(
+                    reviewed_packet is not None
+                    and (
+                        reviewed_packet.packet_type == "docs"
+                        or (
+                            reviewed_packet.packet_type in {"code", "docs"}
+                            and reviewed_packet.check_tier
+                            in {"smoke", "targeted"}
+                            and not reviewed_packet.closes_milestone
+                            and not reviewed_packet.requires_fresh_release_check
+                        )
+                        or claude_review_approved
+                    )
+                )
+                if routine_check_close and checks_passed(checks):
+                    project_plan = complete_lean_packet_by_checks(
+                        project_plan,
+                        reviewed_packet.packet_id,
+                        completed_by=(
+                            "claude_review"
+                            if claude_review_approved
+                            else "forge_checks"
+                        ),
+                    )
+                    save_plan(
+                        project,
+                        project_plan,
+                        snapshot_path=(
+                            run_directory
+                            / f"project-plan.forge-completed-{iteration:02d}.json"
+                        ),
+                    )
+                    next_packet = active_plan_packet(project_plan)
+                    unfinished_packets = [
+                        packet
+                        for packet in project_plan.work_packets
+                        if packet.status not in {"completed", "superseded"}
+                    ]
+                    if not unfinished_packets:
+                        lean_all_packets_complete = True
+                        packet_transition_ready = False
+                        final_decision = Decision(
+                            status="continue",
+                            decision_kind="verify_packet",
+                            assessment=(
+                                "All lean packets are complete by verified gates; "
+                                "run the fresh release suite and final Codex review."
+                            ),
+                            next_prompt=(
+                                "Do not implement. Transfer the completed plan to "
+                                "the mandatory fresh release and final review gates."
+                            ),
+                            acceptance_criteria=[],
+                            risks=project_plan.overall_risks,
+                            recommended_review_profile="final_review",
+                            check_tier="release",
+                            requires_release_check=True,
+                            routing_reason="All persistent lean packets are complete.",
+                        )
+                    elif (
+                        next_packet is not None
+                        and next_packet.status == "in_progress"
+                    ):
+                        lean_pending_decision = lean_packet_decision(
+                            next_packet,
+                            project_plan,
+                            assessment=(
+                                "Forge checks closed the previous routine packet; "
+                                "dispatch the next dependency-ready packet."
+                            ),
+                        )
+                        final_decision = lean_pending_decision
+                        packet_transition_ready = True
+                    refresh_monitor_context(
+                        last_result=(
+                            f"Packet {reviewed_packet.packet_id} uzavreli zelené "
+                            "Forge kontroly bez Codex review."
+                        ),
+                        next_action=(
+                            "Nasleduje čerstvý release gate."
+                            if lean_all_packets_complete
+                            else "Forge spustí ďalší uložený worker_prompt."
+                        ),
+                    )
+                elif (
+                    reviewed_packet is not None
+                    and not checks_passed(checks)
+                    and failed_iterations < 2
+                ):
+                    repair = lean_packet_decision(
+                        reviewed_packet,
+                        project_plan,
+                        assessment=(
+                            "First consecutive check failure; perform one "
+                            "deterministic repair before involving Codex."
+                        ),
+                        decision_kind="repair_packet",
+                    )
+                    failure_evidence = checks_as_text(checks, config)
+                    repair.next_prompt = (
+                        f"{repair.next_prompt}\n\nCURRENT FAILED CHECK EVIDENCE:\n"
+                        f"{failure_evidence}\n\nRepair all grounded failures above "
+                        "without weakening or removing valid checks."
+                    )
+                    lean_pending_decision = repair
+                    final_decision = repair
+                    packet_transition_ready = True
+            if (
+                logical_attempt_pending
+                and logical_attempt_packet_id is not None
+                and project_plan is not None
+            ):
+                project_plan = persist_attempt_refund(
+                    project_plan,
+                    logical_attempt_packet_id,
+                    recovery_attempt=logical_attempt_was_recovery,
+                    iteration=iteration,
+                    reason=worker.termination_reason,
+                )
+                logical_attempt_pending = False
             if no_progress_count >= 2:
                 print(
                     "Dve iterácie bez zmeny repozitára; ďalší Codex/GPT krok musí zmeniť stratégiu."
@@ -4754,6 +11424,12 @@ def run_forge(
                 f"[Forge][Iteration] {iteration} completed; checks_passed={checks_passed(checks)}",
                 flush=True,
             )
+            if lean_all_packets_complete:
+                break
+            if lean_pending_decision is not None and iteration < int(
+                config["max_iterations"]
+            ):
+                continue
         else:
             final_message = (
                 "Dosiahnutý maximálny počet iterácií; nasleduje povinný "
@@ -4791,7 +11467,19 @@ def run_forge(
             and worker is not None
         ):
             print("\n=== ZÁVEREČNÝ CODEX/GPT REVIEW PO POSLEDNEJ IMPLEMENTÁCII ===")
-            if adaptive_enabled and last_check_tier != "release":
+            lean_incomplete_review = bool(
+                lean_mode
+                and project_plan is not None
+                and any(
+                    packet.status not in {"completed", "superseded"}
+                    for packet in project_plan.work_packets
+                )
+            )
+            if (
+                adaptive_enabled
+                and last_check_tier != "release"
+                and not lean_incomplete_review
+            ):
                 budget_reason = current_budget_reason()
                 if budget_reason:
                     final_status = "needs_continuation"
@@ -4840,8 +11528,22 @@ def run_forge(
             if final_status != "needs_continuation":
                 if adaptive_enabled:
                     chain_codex_calls += 1
-                    increment_count(codex_profile_counts, "final_review")
-                final_model, final_effort = select_codex_profile(config, "final")
+                    increment_count(
+                        codex_profile_counts,
+                        (
+                            "important_review"
+                            if lean_incomplete_review
+                            else "final_review"
+                        ),
+                    )
+                final_review_phase = (
+                    "review" if lean_incomplete_review else "final"
+                )
+                final_model, final_effort = select_codex_profile(
+                    config,
+                    final_review_phase,
+                    important=lean_incomplete_review,
+                )
                 status.set_phase(
                     "final_codex_review",
                     iteration=int(config["max_iterations"]) + 1,
@@ -4871,6 +11573,28 @@ def run_forge(
                     checks=[item.model_dump(mode="json") for item in checks],
                 )
                 save_json(logs / "final-evidence-index.json", final_evidence_index)
+                final_contract_error = (
+                    check_contract_runtime_error(
+                        project, check_contract, config
+                    )
+                    if check_contract is not None
+                    else None
+                )
+                final_contract_evidence = None
+                if (
+                    final_contract_error is not None
+                    and final_contract_error.startswith(
+                        CHECK_CONTRACT_REVIEWABLE_DRIFT_PREFIXES
+                    )
+                    and check_contract is not None
+                ):
+                    final_contract_evidence = check_contract_drift_evidence(
+                        project, check_contract, config
+                    )
+                    save_json(
+                        logs / "final-check-contract-drift.json",
+                        final_contract_evidence,
+                    )
                 evidence_baseline = current_manifest
                 review_prompt = redact_text(
                     build_review_prompt(
@@ -4881,7 +11605,7 @@ def run_forge(
                         checks,
                         no_progress_count,
                         config,
-                        "final",
+                        final_review_phase,
                         project_plan=project_plan,
                         active_packet=active_plan_packet(project_plan),
                         allowed_check_ids=[
@@ -4891,20 +11615,173 @@ def run_forge(
                             )
                         ] if adaptive_enabled else [],
                         evidence_index=final_evidence_index.model_dump(mode="json"),
+                        check_contract_evidence=final_contract_evidence,
                     )
                 )
                 (logs / "final-evidence.txt").write_text(
                     redact_text(review_prompt), encoding="utf-8"
                 )
+                pre_final_decision = final_decision
                 final_decision = ask_orchestrator(
                     project,
                     review_prompt,
                     config,
                     logs / "final-decision-raw.json",
-                    phase="final",
+                    phase=final_review_phase,
                     important=True,
                     metadata_path=logs / "final-codex-usage.json",
                 )
+                if project_plan is not None:
+                    final_packet = active_plan_packet(project_plan)
+                    if final_packet is not None:
+                        final_reviewed_paths = sorted(
+                            set(
+                                final_evidence_index.changed_files
+                                + final_evidence_index.new_files
+                                + final_evidence_index.deleted_files
+                            )
+                        )
+                        project_plan, final_late_findings = (
+                            record_review_snapshot(
+                                project_plan,
+                                final_packet.packet_id,
+                                manifest=current_manifest,
+                                reviewed_paths=final_reviewed_paths,
+                                issues=final_decision.review_issues,
+                            )
+                        )
+                        final_issue_paths = [
+                            issue.file_path.replace("\\", "/").strip()
+                            for issue in final_decision.review_issues
+                            if issue.file_path.strip()
+                        ]
+                        final_late_only = bool(
+                            final_decision.status == "continue"
+                            and final_decision.decision_kind == "repair_packet"
+                            and final_issue_paths
+                            and len(final_late_findings)
+                            == len(final_decision.review_issues)
+                        )
+                        stored_final_packet = next(
+                            packet
+                            for packet in project_plan.work_packets
+                            if packet.packet_id == final_packet.packet_id
+                        )
+                        stored_final_packet.late_finding_repair_pending = (
+                            final_late_only
+                        )
+                        project_plan = ProjectPlan.model_validate(
+                            project_plan.model_dump(mode="json")
+                        )
+                        save_plan(
+                            project,
+                            project_plan,
+                            snapshot_path=(
+                                run_directory
+                                / "project-plan.final-review-snapshot.json"
+                            ),
+                        )
+                        save_json(
+                            logs / "final-review-snapshot.json",
+                            {
+                                "schema_version": SCHEMA_VERSION,
+                                "packet_id": final_packet.packet_id,
+                                "reviewed_files": {
+                                    path: current_manifest.get(path, "<deleted>")
+                                    for path in final_reviewed_paths
+                                },
+                                "issues": [
+                                    issue.model_dump(mode="json")
+                                    for issue in final_decision.review_issues
+                                ],
+                                "late_findings": final_late_findings,
+                                "packet_attempt_refund": final_late_only,
+                            },
+                        )
+                if (
+                    final_decision.approve_check_contract_drift
+                    and final_contract_error is None
+                ):
+                    raise RuntimeError(
+                        "Final Codex review approved check-contract drift "
+                        "without a current reviewable drift."
+                    )
+                if final_contract_error is not None:
+                    if not final_contract_error.startswith(
+                        CHECK_CONTRACT_REVIEWABLE_DRIFT_PREFIXES
+                    ):
+                        raise RuntimeError(
+                            "Non-reviewable check-contract integrity failure: "
+                            + final_contract_error
+                        )
+                    updated_contract, approved = (
+                        apply_check_contract_approval(
+                            project,
+                            config,
+                            check_contract,
+                            final_decision,
+                            final_contract_evidence,
+                        )
+                    )
+                    if approved:
+                        check_contract = updated_contract
+                        if project_plan is not None:
+                            project_plan.check_contract_hash = (
+                                check_contract.contract_hash
+                            )
+                            save_plan(
+                                project,
+                                project_plan,
+                                snapshot_path=(
+                                    run_directory
+                                    / "project-plan.contract-approved-final.json"
+                                ),
+                            )
+                        save_json(
+                            run_directory / "check-contract.snapshot.json",
+                            check_contract,
+                        )
+                    else:
+                        pending_check_contract_review = True
+                        if final_decision.status == "done":
+                            fallback_prompt = (
+                                pre_final_decision.next_prompt
+                                if pre_final_decision is not None
+                                and pre_final_decision.next_prompt
+                                else (
+                                    "Perform no implementation until the pending "
+                                    "check-contract semantic drift is explicitly "
+                                    "reviewed and approved."
+                                )
+                            )
+                            final_decision = Decision(
+                                status="continue",
+                                decision_kind="verify_packet",
+                                assessment=(
+                                    "Final review did not explicitly approve the "
+                                    "pending check-contract semantic drift."
+                                ),
+                                active_packet_id=(
+                                    project_plan.active_packet_id
+                                    if project_plan is not None
+                                    else None
+                                ),
+                                next_prompt=fallback_prompt,
+                                acceptance_criteria=(
+                                    pre_final_decision.acceptance_criteria
+                                    if pre_final_decision is not None
+                                    else []
+                                ),
+                                risks=(
+                                    pre_final_decision.risks
+                                    if pre_final_decision is not None
+                                    else []
+                                ),
+                                routing_reason=(
+                                    "Explicit check-contract approval is still "
+                                    "required before worker execution."
+                                ),
+                            )
                 if adaptive_enabled and project_plan is not None:
                     project_plan = update_plan_from_decision(
                         project,
@@ -4914,6 +11791,49 @@ def run_forge(
                         snapshot_path=run_directory / "project-plan.final-review.json",
                         goal=goal,
                     )
+                    (
+                        project_plan,
+                        final_review_recovery_authorized,
+                    ) = maybe_authorize_final_review_recovery(
+                        project_plan,
+                        final_decision,
+                        checks,
+                        config=config,
+                        last_check_tier=last_check_tier,
+                        no_progress_count=no_progress_count,
+                        failed_iterations=failed_iterations,
+                        budget_reason=current_budget_reason(),
+                    )
+                    if final_review_recovery_authorized:
+                        save_plan(
+                            project,
+                            project_plan,
+                            snapshot_path=(
+                                run_directory
+                                / "project-plan.final-review-recovery.json"
+                            ),
+                        )
+                    if (
+                        lean_incomplete_review
+                        and final_decision.decision_kind == "complete_packet"
+                        and any(
+                            packet.status not in {"completed", "superseded"}
+                            for packet in project_plan.work_packets
+                        )
+                    ):
+                        next_packet = active_plan_packet(project_plan)
+                        if (
+                            next_packet is not None
+                            and next_packet.status == "in_progress"
+                        ):
+                            final_decision = lean_packet_decision(
+                                next_packet,
+                                project_plan,
+                                assessment=(
+                                    "Codex completed the milestone packet; the next "
+                                    "dependency-ready lean packet is persisted."
+                                ),
+                            )
                 save_json(logs / "final-decision.json", final_decision)
                 print(f"[Codex][Decision] {final_decision.status}", flush=True)
                 print(f"[Codex][Assessment] {redact_text(final_decision.assessment)}")
@@ -4967,7 +11887,29 @@ def run_forge(
                     final_status="blocked",
                 )
             elif final_decision.status == "continue":
-                stop_reason_code = "reviewer_continue"
+                exhausted_packet = (
+                    active_plan_packet(project_plan)
+                    if adaptive_enabled and project_plan is not None
+                    else None
+                )
+                attempts_terminal = bool(
+                    not pending_check_contract_review
+                    and
+                    exhausted_packet is not None
+                    and packet_attempt_budget_exhausted(
+                        exhausted_packet,
+                        config,
+                    )
+                )
+                stop_reason_code = (
+                    "external_change_review_required"
+                    if pending_check_contract_review
+                    else (
+                        "packet_attempts_exhausted"
+                        if attempts_terminal
+                        else "reviewer_continue"
+                    )
+                )
                 continuation_payload = ContinuationPayload(
                     source_run_id=run_id,
                     continuation_chain_id=continuation_chain_id,
@@ -5012,6 +11954,13 @@ def run_forge(
                         if check_contract is not None
                         else None
                     ),
+                    config_hash=run_config_hash,
+                    base_chain_budgets=base_chain_budgets,
+                    effective_chain_budgets=effective_chain_budgets,
+                    budget_extension_count=budget_extension_count,
+                    last_budget_extension_source_run_id=(
+                        last_budget_extension_source_run_id
+                    ),
                 )
                 final_status = "needs_continuation"
                 final_message = (
@@ -5026,11 +11975,33 @@ def run_forge(
                     message=final_message,
                     final_status="needs_continuation",
                 )
+                if attempts_terminal and exhausted_packet is not None:
+                    final_message = (
+                        "Final review still requires a repair, but the packet has "
+                        "already consumed its bounded attempts and its single "
+                        "final-review recovery. Manual resume would repeat the same "
+                        f"stop for {exhausted_packet.packet_id}; human replanning is "
+                        "required."
+                    )
+                    status.set_phase(
+                        "needs_continuation",
+                        current_agent="Forge",
+                        message=final_message,
+                        final_status="needs_continuation",
+                    )
+                resume_hint = (
+                    f"\nResume: forge.py resume --project \"{project}\" "
+                    f"--run-id {run_id}"
+                    if not attempts_terminal
+                    else (
+                        "\nNo resume command was emitted because this state "
+                        "requires replanning."
+                    )
+                )
                 print(
                     "[Forge][NeedsContinuation] "
                     + final_message
-                    + f"\nResume: forge.py resume --project \"{project}\" "
-                    + f"--run-id {run_id}",
+                    + resume_hint,
                     flush=True,
                 )
             else:
@@ -5139,14 +12110,42 @@ def run_forge(
                         if check_contract is not None
                         else None
                     ),
+                    config_hash=run_config_hash,
+                    base_chain_budgets=base_chain_budgets,
+                    effective_chain_budgets=effective_chain_budgets,
+                    budget_extension_count=budget_extension_count,
+                    last_budget_extension_source_run_id=(
+                        last_budget_extension_source_run_id
+                    ),
+                )
+                continuation_hint = (
+                    f"\nResume: forge.py resume --project \"{project}\" --run-id {run_id}"
+                    if stop_reason_code != "packet_attempts_exhausted"
+                    else (
+                        "\nNo resume command was emitted because the packet "
+                        "requires human replanning."
+                    )
                 )
                 print(
-                    f"[Forge][NeedsContinuation] {final_message}\n"
-                    f"Resume: forge.py resume --project \"{project}\" --run-id {run_id}",
+                    f"[Forge][NeedsContinuation] {final_message}"
+                    + continuation_hint,
                     flush=True,
                 )
 
     except SubscriptionLimitError as exc:
+        if (
+            logical_attempt_pending
+            and logical_attempt_packet_id is not None
+            and project_plan is not None
+        ):
+            project_plan = persist_attempt_refund(
+                project_plan,
+                logical_attempt_packet_id,
+                recovery_attempt=logical_attempt_was_recovery,
+                iteration=logical_attempt_iteration,
+                reason="subscription limit before a valid worker outcome",
+            )
+            logical_attempt_pending = False
         if exc.worker_result is not None:
             worker = exc.worker_result
             current_iteration = int(status.snapshot().get("iteration") or 0)
@@ -5165,6 +12164,24 @@ def run_forge(
         )
         print(f"[Forge][SubscriptionLimit] {truncate(final_message, 3000)}")
     except Exception as exc:
+        if (
+            logical_attempt_pending
+            and logical_attempt_packet_id is not None
+            and project_plan is not None
+        ):
+            try:
+                project_plan = persist_attempt_refund(
+                    project_plan,
+                    logical_attempt_packet_id,
+                    recovery_attempt=logical_attempt_was_recovery,
+                    iteration=logical_attempt_iteration,
+                    reason="technical failure before a valid worker outcome",
+                )
+                logical_attempt_pending = False
+            except Exception as refund_exc:
+                error_text = redact_text(
+                    f"Attempt refund also failed: {refund_exc}"
+                )
         final_status = "failed"
         stop_reason_code = "technical_failure"
         final_message = redact_text(str(exc))
@@ -5205,6 +12222,13 @@ def run_forge(
         stop_reason_code=stop_reason_code,
         automatic_resume_allowed=automatic_resume_allowed,
     )
+    needs_human = (
+        final_status in {"blocked", "subscription_limit"}
+        or (
+            final_status == "needs_continuation"
+            and not termination.automatic_resume_allowed
+        )
+    )
     final_state = {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
@@ -5215,6 +12239,7 @@ def run_forge(
         "final_status": final_status,
         "stop_reason_code": termination.stop_reason_code,
         "automatic_resume_allowed": termination.automatic_resume_allowed,
+        "needs_human": needs_human,
         "final_message": final_message,
         "error": error_text,
         "final_decision": final_decision.model_dump(mode="json") if final_decision else None,
@@ -5231,6 +12256,8 @@ def run_forge(
         "repository_fingerprint": repo_fingerprint(project),
         "no_progress_count": no_progress_count,
         "failed_iterations": failed_iterations,
+        "last_failure_signature": last_failure_signature,
+        "repeated_failure_count": repeated_failure_count,
         "chain_worker_calls": chain_worker_calls,
         "chain_elapsed_seconds": chain_elapsed_seconds,
         "chain_full_check_suites": chain_full_check_suites,
@@ -5241,6 +12268,15 @@ def run_forge(
         "chain_codex_calls": chain_codex_calls,
         "chain_no_progress_events": chain_no_progress_events,
         "chain_budgets": chain_budgets.model_dump(mode="json"),
+        "base_chain_budgets": base_chain_budgets.model_dump(mode="json"),
+        "effective_chain_budgets": effective_chain_budgets.model_dump(mode="json"),
+        "budget_extension_count": budget_extension_count,
+        "last_budget_extension_source_run_id": (
+            last_budget_extension_source_run_id
+        ),
+        "config_integrity_version": CONFIG_INTEGRITY_VERSION,
+        "config_hash": run_config_hash,
+        "config_snapshot_file": "config.snapshot.json",
         "last_check_tier": last_check_tier,
         "last_release_check_run_id": last_release_check_run_id,
         "project_id": (
@@ -5285,6 +12321,7 @@ def run_forge(
         "elapsed_seconds": round(time.monotonic() - chain_started_monotonic, 3),
         "chain_elapsed_seconds": chain_elapsed_seconds,
         "child_run_index": chain_child_runs,
+        "budget_extension_count": budget_extension_count,
         "packet_total": packet_total,
         "packet_completed": packet_completed,
         "packets_first_attempt": (
@@ -5343,11 +12380,11 @@ def run_forge(
             if final_status == "done"
             else (
                 "Používateľský zásah je potrebný."
-                if final_status in {"blocked", "subscription_limit"}
+                if needs_human
                 else "Forge chain možno bezpečne pokračovať explicitným resume."
             )
         ),
-        needs_human=final_status in {"blocked", "subscription_limit"},
+        needs_human=needs_human,
         activity_state="terminal",
     )
     save_json(run_directory / "result.json", final_state)
@@ -5366,34 +12403,249 @@ def run_forge(
     return exit_code
 
 
-def resume_forge(project: Path, requested_run_id: str) -> int:
+def resume_eligibility(
+    project: Path,
+    requested_run_id: str,
+    *,
+    supervisor_config: dict[str, Any] | None = None,
+    in_wsl: bool | None = None,
+    expected_decision_recovery_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Return a model-free, non-mutating decision for an explicit human resume."""
     try:
-        resume_context = load_resume_context(project, requested_run_id)
-    except Exception as exc:
-        print(
-            "[Forge][ResumeFailed] " + truncate(redact_text(str(exc)), 5000),
-            file=sys.stderr,
+        context = load_resume_context(
+            project,
+            requested_run_id,
+            resume_kind="explicit_human",
+            authorize_packet_recovery=False,
+            expected_decision_recovery_sha256=(
+                expected_decision_recovery_sha256
+            ),
         )
-        return EXIT_FAILED
-    print(
-        "[Forge][Resume] Zdrojový run: "
-        f"{resume_context['source_run_id']}; vytvorí sa nový nemenný run directory.",
-        flush=True,
+        safety_overrides: list[str] = []
+        effective_security_profile = str(
+            context["config"].get("security_profile", "")
+        )
+        supervisor_config_hash: str | None = None
+        if supervisor_config is not None:
+            effective_config, safety_overrides = enforce_unattended_resume_config(
+                context["config"],
+                supervisor_config,
+                in_wsl=in_wsl,
+            )
+            effective_security_profile = str(
+                effective_config.get("security_profile", "")
+            )
+            supervisor_config_hash = config_hash(
+                _canonical_config_snapshot(supervisor_config)
+            )
+    except Exception as exc:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "eligible": False,
+            "source_run_id": str(requested_run_id),
+            "resume_kind": "explicit_human",
+            "action": "none",
+            "reason_code": "resume_validation_failed",
+            "message": truncate(redact_text(str(exc)), 5000),
+            "bounded_packet_recovery_eligible": False,
+            "budget_tranche_extension_eligible": False,
+            "post_worker_decision_recovery_eligible": False,
+            "recovery_attempt_budget_normalization_eligible": False,
+            "model_calls_made": 0,
+            "state_mutated": False,
+            "supervisor_config_enforced": supervisor_config is not None,
+        }
+
+    post_worker_recovery = bool(
+        context.get("post_worker_decision_recovery_eligible", False)
     )
-    return run_forge(
-        project,
-        str(resume_context["goal"]),
-        Path(__file__).with_name("forge.config.json"),
-        resume_context=resume_context,
+    attempt_budget_normalization = bool(
+        context.get(
+            "recovery_attempt_budget_normalization_eligible", False
+        )
     )
+    if (
+        post_worker_recovery or attempt_budget_normalization
+    ) and supervisor_config is None:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "eligible": False,
+            "source_run_id": context["source_run_id"],
+            "resume_kind": "explicit_human",
+            "source_stop_reason_code": context[
+                "source_stop_reason_code"
+            ],
+            "source_automatic_resume_allowed": context[
+                "source_automatic_resume_allowed"
+            ],
+            "action": "none",
+            "reason_code": "supervised_run_chain_required",
+            "message": (
+                "Post-worker decision recovery requires an explicit supervised "
+                "run-chain configuration."
+            ),
+            "bounded_packet_recovery_eligible": False,
+            "budget_tranche_extension_eligible": False,
+            "post_worker_decision_recovery_eligible": False,
+            "recovery_attempt_budget_normalization_eligible": False,
+            "model_calls_made": 0,
+            "state_mutated": False,
+            "supervisor_config_enforced": False,
+        }
+    packet_recovery = bool(context["bounded_packet_recovery_eligible"])
+    budget_extension = bool(context["budget_extended"])
+    if post_worker_recovery:
+        action = POST_WORKER_DECISION_RECOVERY_ACTION
+    elif attempt_budget_normalization:
+        action = RECOVERY_ATTEMPT_BUDGET_NORMALIZATION_ACTION
+    elif packet_recovery:
+        action = "bounded_final_review_recovery"
+    elif budget_extension:
+        action = "extend_chain_budget_one_tranche"
+    else:
+        action = "validated_exact_resume"
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "eligible": True,
+        "source_run_id": context["source_run_id"],
+        "resume_kind": "explicit_human",
+        "source_stop_reason_code": context["source_stop_reason_code"],
+        "source_automatic_resume_allowed": context[
+            "source_automatic_resume_allowed"
+        ],
+        "action": action,
+        "reason_code": "eligible",
+        "message": "Explicit resume passed all model-free core validations.",
+        "bounded_packet_recovery_eligible": packet_recovery,
+        "post_worker_decision_recovery_eligible": post_worker_recovery,
+        "post_worker_decision_recovery": (
+            context.get("post_worker_decision_recovery")
+            if post_worker_recovery
+            else None
+        ),
+        "recovery_attempt_budget_normalization_eligible": (
+            attempt_budget_normalization
+        ),
+        "recovery_attempt_budget_normalization": (
+            context.get("recovery_attempt_budget_normalization")
+            if attempt_budget_normalization
+            else None
+        ),
+        "recovery_authorized_from_run_id": context[
+            "recovery_authorized_from_run_id"
+        ],
+        "budget_tranche_extension_eligible": budget_extension,
+        "budget_extension_count_after_resume": context[
+            "budget_extension_count"
+        ],
+        "legacy_config_compatibility": context[
+            "legacy_config_compatibility"
+        ],
+        "supervisor_config_enforced": supervisor_config is not None,
+        "supervisor_config_hash": supervisor_config_hash,
+        "effective_security_profile": effective_security_profile,
+        "safety_overrides": safety_overrides,
+        "model_calls_made": 0,
+        "state_mutated": False,
+    }
 
 
-def run_chain(
+def resume_forge(
+    project: Path,
+    requested_run_id: str,
+    *,
+    resume_kind: ResumeKind = "direct_manual",
+    supervisor_config: dict[str, Any] | None = None,
+    expected_decision_recovery_sha256: str | None = None,
+) -> int:
+    resolved_project = validate_existing_project_path(project)
+    with project_run_lock(
+        resolved_project,
+        create_forge_directory=False,
+    ):
+        try:
+            if supervisor_config is not None:
+                preliminary_context = load_resume_context(
+                    resolved_project,
+                    requested_run_id,
+                    resume_kind=resume_kind,
+                    authorize_packet_recovery=False,
+                    expected_decision_recovery_sha256=(
+                        expected_decision_recovery_sha256
+                    ),
+                )
+                effective_config, safety_overrides = (
+                    enforce_unattended_resume_config(
+                        preliminary_context["config"],
+                        supervisor_config,
+                    )
+                )
+                # The writer lock stays held from this authorization through
+                # child-run initialization and every plan mutation.
+                resume_context = load_resume_context(
+                    resolved_project,
+                    requested_run_id,
+                    resume_kind=resume_kind,
+                    authorize_packet_recovery=True,
+                    expected_decision_recovery_sha256=(
+                        expected_decision_recovery_sha256
+                    ),
+                )
+                resume_context["config"] = effective_config
+                resume_context["safety_overrides"] = safety_overrides
+            else:
+                resume_context = load_resume_context(
+                    resolved_project,
+                    requested_run_id,
+                    resume_kind=resume_kind,
+                    authorize_packet_recovery=True,
+                    expected_decision_recovery_sha256=(
+                        expected_decision_recovery_sha256
+                    ),
+                )
+            if (
+                (
+                    resume_context.get(
+                        "post_worker_decision_recovery_eligible"
+                    )
+                    or resume_context.get(
+                        "recovery_attempt_budget_normalization_eligible"
+                    )
+                )
+                and supervisor_config is None
+            ):
+                raise RuntimeError(
+                    "Special recovery migration requires an explicit supervised "
+                    "run-chain configuration."
+                )
+        except Exception as exc:
+            print(
+                "[Forge][ResumeFailed] "
+                + truncate(redact_text(str(exc)), 5000),
+                file=sys.stderr,
+            )
+            return EXIT_FAILED
+        print(
+            "[Forge][Resume] Zdrojový run: "
+            f"{resume_context['source_run_id']}; vytvorí sa nový nemenný run directory.",
+            flush=True,
+        )
+        return _run_forge_locked(
+            resolved_project,
+            str(resume_context["goal"]),
+            Path(__file__).with_name("forge.config.json"),
+            resume_context=resume_context,
+        )
+
+
+def _run_chain_impl(
     project: Path,
     goal: str | None,
     config_path: Path,
     *,
     resume_run_id: str | None = None,
+    expected_decision_recovery_sha256: str | None = None,
 ) -> int:
     """Bounded local supervisor that only follows validated continuation payloads."""
     project = (
@@ -5417,10 +12669,49 @@ def run_chain(
     save_json(supervisor_path, supervisor_state)
     supervisor_config = load_config(config_path)
     validate_config(supervisor_config)
-    if (
-        supervisor_config.get("unattended_requires_sandbox", True)
-        and not sandbox_runtime_available()
+    if supervisor_config.get("unattended_requires_sandbox") is not True:
+        message = (
+            "Bezobslužný run-chain nesmie vypnúť "
+            "unattended_requires_sandbox. Forge sa zastavil pred prvým workerom."
+        )
+        supervisor_state.update(
+            {
+                "status": "failed",
+                "stop_reason": message,
+                "stop_reason_code": "technical_failure",
+                "automatic_resume_allowed": False,
+                "exit_code": EXIT_FAILED,
+                "finished_at": utc_now(),
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+            }
+        )
+        save_json(supervisor_path, supervisor_state)
+        print(f"[Forge][SupervisorSafety] {message}", file=sys.stderr)
+        return EXIT_FAILED
+    if running_in_wsl() and (
+        str(supervisor_config.get("security_profile", "")).lower() != "strict"
+        or supervisor_config.get("claude_outer_srt_on_wsl") is not True
     ):
+        message = (
+            "Bezobslužný run-chain vo WSL2 vyžaduje security_profile=strict. "
+            "Vyžaduje aj claude_outer_srt_on_wsl=true; Forge sa zastavil pred "
+            "prvým workerom."
+        )
+        supervisor_state.update(
+            {
+                "status": "failed",
+                "stop_reason": message,
+                "stop_reason_code": "technical_failure",
+                "automatic_resume_allowed": False,
+                "exit_code": EXIT_FAILED,
+                "finished_at": utc_now(),
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+            }
+        )
+        save_json(supervisor_path, supervisor_state)
+        print(f"[Forge][SupervisorSafety] {message}", file=sys.stderr)
+        return EXIT_FAILED
+    if not sandbox_runtime_available():
         message = (
             "Bezobslužný run-chain sa zastavil pred prvým workerom: overený "
             "Sandbox Runtime (srt) nie je dostupný. Nainštaluj "
@@ -5442,7 +12733,15 @@ def run_chain(
         print(f"[Forge][SupervisorSafety] {message}", file=sys.stderr)
         return EXIT_FAILED
     if resume_run_id is not None:
-        exit_code = resume_forge(project, resume_run_id)
+        exit_code = resume_forge(
+            project,
+            resume_run_id,
+            resume_kind="explicit_human",
+            supervisor_config=supervisor_config,
+            expected_decision_recovery_sha256=(
+                expected_decision_recovery_sha256
+            ),
+        )
     else:
         if not isinstance(goal, str) or not goal.strip():
             raise RuntimeError("run-chain requires a non-empty goal.")
@@ -5492,6 +12791,9 @@ def run_chain(
             if not termination.automatic_resume_allowed:
                 supervisor_state["status"] = termination.final_status
                 supervisor_state["stop_reason"] = final_message_text
+                supervisor_state["needs_human"] = (
+                    termination.final_status == "needs_continuation"
+                )
                 break
         else:
             # Legacy schema compatibility only. Current results never route by text.
@@ -5520,7 +12822,12 @@ def run_chain(
             "no generic restart and no model polling.",
             flush=True,
         )
-        exit_code = resume_forge(project, run_id)
+        exit_code = resume_forge(
+            project,
+            run_id,
+            resume_kind="internal_automatic",
+            supervisor_config=supervisor_config,
+        )
 
     try:
         latest_result = (
@@ -5533,18 +12840,201 @@ def run_chain(
         supervisor_state["status"] = "failed"
         supervisor_state["stop_reason"] = str(exc)
         exit_code = EXIT_FAILED
+    exit_terminal_status = {
+        EXIT_DONE: "done",
+        EXIT_BLOCKED: "blocked",
+        EXIT_SUBSCRIPTION_LIMIT: "subscription_limit",
+        EXIT_FAILED: "failed",
+    }.get(exit_code)
+    existing_status = supervisor_state.get("status")
+    if existing_status == "running":
+        existing_status = None
+    latest_status = latest_result.get("final_status")
+    if (
+        latest_status == "needs_continuation"
+        and exit_terminal_status in {
+            "done",
+            "blocked",
+            "subscription_limit",
+            "failed",
+        }
+    ):
+        # A validated child resume may be mocked in tests or may finish just
+        # before its result pointer becomes visible. Its terminal process exit
+        # supersedes the still-visible source continuation state.
+        latest_status = None
     supervisor_state["status"] = str(
-        latest_result.get("final_status")
-        or supervisor_state.get("status")
+        latest_status
+        or existing_status
+        or exit_terminal_status
         or "failed"
     )
+    if not latest_result:
+        fallback_reason = {
+            "done": "completed",
+            "blocked": "blocked",
+            "subscription_limit": "subscription_limit",
+            "failed": "technical_failure",
+        }.get(supervisor_state["status"])
+        if fallback_reason is not None:
+            supervisor_state.setdefault("stop_reason_code", fallback_reason)
+            supervisor_state.setdefault("automatic_resume_allowed", False)
     supervisor_state["exit_code"] = exit_code
     supervisor_state["last_run_id"] = latest_result.get(
         "run_id", supervisor_state.get("last_run_id")
     )
+    supervisor_state["needs_human"] = bool(
+        latest_result.get(
+            "needs_human",
+            supervisor_state.get(
+                "needs_human",
+                supervisor_state["status"]
+                in {"blocked", "subscription_limit"},
+            ),
+        )
+    )
     supervisor_state["finished_at"] = utc_now()
     supervisor_state["elapsed_seconds"] = round(time.monotonic() - started, 3)
     save_json(supervisor_path, supervisor_state)
+    return exit_code
+
+
+def run_chain(
+    project: Path,
+    goal: str | None,
+    config_path: Path,
+    *,
+    resume_run_id: str | None = None,
+    expected_decision_recovery_sha256: str | None = None,
+) -> int:
+    """Run the bounded supervisor and always persist a terminal supervisor state."""
+    started = time.monotonic()
+    supervisor_path: Path | None = None
+    resolved_project: Path | None = None
+    exit_code = EXIT_FAILED
+    failure_message: str | None = None
+    try:
+        resolved_project = (
+            validate_existing_project_path(project)
+            if resume_run_id is not None
+            else validate_project_path(project)
+        )
+        supervisor_path = resolved_project / ".forge" / "chain-supervisor.json"
+        exit_code = _run_chain_impl(
+            resolved_project,
+            goal,
+            config_path,
+            resume_run_id=resume_run_id,
+            expected_decision_recovery_sha256=(
+                expected_decision_recovery_sha256
+            ),
+        )
+    except (Exception, SystemExit) as exc:
+        failure_message = truncate(
+            redact_text(f"{type(exc).__name__}: {exc}"),
+            5000,
+        )
+        exit_code = EXIT_FAILED
+        print(
+            f"[Forge][SupervisorFailed] {failure_message}",
+            file=sys.stderr,
+        )
+    finally:
+        if supervisor_path is not None and resolved_project is not None:
+            supervisor_state: dict[str, Any] = {}
+            if supervisor_path.is_file():
+                try:
+                    loaded = json.loads(
+                        supervisor_path.read_text(encoding="utf-8")
+                    )
+                    if isinstance(loaded, dict):
+                        supervisor_state = loaded
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    supervisor_state = {}
+            supervisor_state.setdefault("schema_version", SCHEMA_VERSION)
+            supervisor_state.setdefault("project", str(resolved_project))
+            supervisor_state.setdefault("started_at", utc_now())
+            supervisor_state.setdefault(
+                "mode",
+                "resume-chain" if resume_run_id is not None else "run-chain",
+            )
+            supervisor_state.setdefault("source_run_id", resume_run_id)
+            supervisor_state.setdefault("child_runs_started", 0)
+            supervisor_state.setdefault("last_run_id", None)
+            supervisor_state.setdefault("model_polling", False)
+            terminal_exit_codes = {
+                "done": EXIT_DONE,
+                "blocked": EXIT_BLOCKED,
+                "subscription_limit": EXIT_SUBSCRIPTION_LIMIT,
+                "failed": EXIT_FAILED,
+                "needs_continuation": EXIT_NEEDS_CONTINUATION,
+            }
+            supervisor_status = str(
+                supervisor_state.get("status") or ""
+            )
+            invalid_terminal_status = supervisor_status not in terminal_exit_codes
+            terminal_exit_mismatch = (
+                not invalid_terminal_status
+                and terminal_exit_codes[supervisor_status] != exit_code
+            )
+            if (
+                failure_message is not None
+                or invalid_terminal_status
+                or terminal_exit_mismatch
+            ):
+                fail_closed_reason = failure_message
+                if fail_closed_reason is None and invalid_terminal_status:
+                    fail_closed_reason = (
+                        "The chain supervisor exited without a validated "
+                        "terminal result."
+                    )
+                if fail_closed_reason is None:
+                    fail_closed_reason = (
+                        "The chain supervisor terminal status and process exit "
+                        "code did not match."
+                    )
+                supervisor_state.update(
+                    {
+                        "status": "failed",
+                        "stop_reason": fail_closed_reason,
+                        "stop_reason_code": "technical_failure",
+                        "automatic_resume_allowed": False,
+                        "needs_human": False,
+                    }
+                )
+                exit_code = EXIT_FAILED
+            elif supervisor_state.get("status") == "failed":
+                supervisor_state.setdefault(
+                    "stop_reason",
+                    "The chain supervisor failed before a validated terminal result.",
+                )
+                supervisor_state.setdefault(
+                    "stop_reason_code",
+                    "technical_failure",
+                )
+                supervisor_state.setdefault(
+                    "automatic_resume_allowed",
+                    False,
+                )
+                supervisor_state.setdefault("needs_human", False)
+                exit_code = EXIT_FAILED
+            supervisor_state["exit_code"] = exit_code
+            supervisor_state["finished_at"] = utc_now()
+            supervisor_state["elapsed_seconds"] = round(
+                time.monotonic() - started,
+                3,
+            )
+            try:
+                save_json(supervisor_path, supervisor_state)
+            except Exception as exc:
+                # Storage failure is the only case where persistence itself is
+                # impossible. Report it without exposing sensitive path data.
+                print(
+                    "[Forge][SupervisorFinalizationFailed] "
+                    + truncate(redact_text(str(exc)), 1000),
+                    file=sys.stderr,
+                )
+                exit_code = EXIT_FAILED
     return exit_code
 
 
@@ -5581,6 +13071,39 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Zdrojový run_id alebo hodnota 'latest'.",
     )
+    eligibility = sub.add_parser(
+        "resume-eligibility",
+        help=(
+            "Bez modelového volania a bez mutácie overí, či je explicitný resume "
+            "bezpečný, vrátane bounded packet recovery."
+        ),
+    )
+    eligibility.add_argument(
+        "--project",
+        required=True,
+        type=Path,
+        help="Existujúci samostatný priečinok projektu.",
+    )
+    eligibility.add_argument(
+        "--run-id",
+        required=True,
+        help="Zdrojový run_id alebo hodnota 'latest'.",
+    )
+    eligibility.add_argument(
+        "--config",
+        type=Path,
+        help=(
+            "Voliteľná trusted supervisor konfigurácia; ak je zadaná, eligibility "
+            "overí aj unattended safety envelope, ktorý použije run-chain."
+        ),
+    )
+    eligibility.add_argument(
+        "--expected-decision-recovery-sha256",
+        help=(
+            "Explicit audited lowercase SHA-256 of the unmatched raw decision; "
+            "required only for bounded failed-run decision recovery."
+        ),
+    )
     chain = sub.add_parser(
         "run-chain",
         help=(
@@ -5605,6 +13128,13 @@ def parse_args() -> argparse.Namespace:
         default=Path(__file__).with_name("forge.config.json"),
         help="Cesta ku konfiguračnému JSON súboru pre prvý run.",
     )
+    chain.add_argument(
+        "--expected-decision-recovery-sha256",
+        help=(
+            "Explicit audited lowercase SHA-256 for the first failed-run "
+            "decision recovery; it is never reused by automatic child resumes."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -5616,10 +13146,34 @@ def main() -> int:
         return run_forge(args.project, args.goal, args.config.resolve())
     if args.command == "resume":
         return resume_forge(args.project, args.run_id)
+    if args.command == "resume-eligibility":
+        supervisor_config = (
+            load_config(args.config.resolve()) if args.config is not None else None
+        )
+        result = resume_eligibility(
+            args.project,
+            args.run_id,
+            supervisor_config=supervisor_config,
+            expected_decision_recovery_sha256=(
+                args.expected_decision_recovery_sha256
+            ),
+        )
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return EXIT_DONE if result["eligible"] else EXIT_FAILED
     if args.command == "run-chain":
         if bool(args.goal) == bool(args.resume_run_id):
             print(
                 "run-chain vyžaduje práve jednu voľbu: --goal alebo --resume-run-id.",
+                file=sys.stderr,
+            )
+            return EXIT_FAILED
+        if (
+            args.expected_decision_recovery_sha256 is not None
+            and args.resume_run_id is None
+        ):
+            print(
+                "--expected-decision-recovery-sha256 requires "
+                "--resume-run-id.",
                 file=sys.stderr,
             )
             return EXIT_FAILED
@@ -5628,6 +13182,9 @@ def main() -> int:
             args.goal,
             args.config.resolve(),
             resume_run_id=args.resume_run_id,
+            expected_decision_recovery_sha256=(
+                args.expected_decision_recovery_sha256
+            ),
         )
     return 1
 

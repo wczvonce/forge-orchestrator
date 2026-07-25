@@ -1040,6 +1040,74 @@ class WrapperSafetyContractTests(unittest.TestCase):
                 msg=completed.stdout + completed.stderr,
             )
 
+    @unittest.skipUnless(os.name == "nt", "PowerShell timestamp test is Windows-only")
+    def test_monitor_timestamp_accepts_native_datetime_values(self) -> None:
+        powershell = shutil.which("powershell.exe")
+        self.assertIsNotNone(powershell)
+        command = "\n".join(
+            [
+                "$tokens = $null",
+                "$errors = $null",
+                "$ast = [System.Management.Automation.Language.Parser]::ParseFile(",
+                f"  '{WATCH}', [ref]$tokens, [ref]$errors",
+                ")",
+                "if ($errors.Count) { throw 'Watch parser error.' }",
+                "$wanted = @('Get-OptionalProperty', 'Get-StateTimestamp')",
+                "foreach ($name in $wanted) {",
+                "  $nodes = @($ast.FindAll({",
+                "    param($node)",
+                "    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and",
+                "      $node.Name -ceq $name",
+                "  }, $true))",
+                "  if ($nodes.Count -ne 1) { throw \"Missing function: $name\" }",
+                "  Invoke-Expression $nodes[0].Extent.Text",
+                "}",
+                "$text = '2026-07-25T06:00:00.0000000+00:00'",
+                "$values = @(",
+                "  [DateTime]::Parse(",
+                "    $text,",
+                "    [Globalization.CultureInfo]::InvariantCulture,",
+                "    [Globalization.DateTimeStyles]::RoundtripKind",
+                "  ),",
+                "  [DateTimeOffset]::Parse(",
+                "    $text,",
+                "    [Globalization.CultureInfo]::InvariantCulture,",
+                "    [Globalization.DateTimeStyles]::RoundtripKind",
+                "  ),",
+                "  $text",
+                ")",
+                "foreach ($value in $values) {",
+                "  $parsed = Get-StateTimestamp `",
+                "    -Object ([pscustomobject]@{ timestamp = $value }) `",
+                "    -Names @('timestamp')",
+                "  if ($null -eq $parsed) { throw 'Timestamp was rejected.' }",
+                "  $parsed.ToUniversalTime().ToString('o')",
+                "}",
+            ]
+        )
+        completed = subprocess.run(
+            [powershell, "-NoProfile", "-Command", command],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=15,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=completed.stdout + completed.stderr,
+        )
+        values = [
+            line.strip()
+            for line in completed.stdout.splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(
+            values,
+            ["2026-07-25T06:00:00.0000000+00:00"] * 3,
+        )
+
     @unittest.skipUnless(os.name == "nt", "DrvFS canary test is Windows-only")
     def test_project_drvfs_canary_enforces_exact_write_boundary_without_model(self) -> None:
         powershell = shutil.which("powershell.exe")

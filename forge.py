@@ -4743,28 +4743,19 @@ def _bootstrap_symlink_finding(
         return direct_finding
     assert direct_target is not None
 
-    try:
-        resolved_target = (link_path.parent / Path(target_text)).resolve(
-            strict=False
-        )
-        resolved_relative_target = resolved_target.relative_to(project).as_posix()
-    except (OSError, RuntimeError, ValueError):
-        return "symlink-outside-project-target"
-    if resolved_relative_target.split("/", 1)[0].casefold() in {
-        ".git",
-        ".forge",
-    }:
-        return "symlink-protected-control-target"
-    if not resolved_target.exists() and direct_target not in (
-        staged_paths or set()
-    ):
-        return "symlink-dangling-target"
+    # Validate the stage-zero Git graph lexically instead of dereferencing the
+    # working tree.  GitHub Windows runners may expose the checkout through a
+    # path alias whose resolved spelling is not relative to the lexical
+    # workspace, and dereferencing here would also inspect data outside the
+    # approved index chain.  Every accepted hop below must still be present in
+    # the index and use an explicitly supported mode.
+    direct_candidate = project / Path(direct_target)
     if direct_target not in index_entries:
-        return "symlink-untracked-target"
-    if (
-        resolved_target.exists()
-        and resolved_relative_target not in index_entries
-    ):
+        if (
+            not direct_candidate.exists()
+            and direct_target not in (staged_paths or set())
+        ):
+            return "symlink-dangling-target"
         return "symlink-untracked-target"
 
     visited: set[str] = set()

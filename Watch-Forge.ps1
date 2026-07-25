@@ -136,6 +136,12 @@ function Get-StateTimestamp {
     if ($null -eq $Value) {
       continue
     }
+    if ($Value -is [DateTimeOffset]) {
+      return [DateTimeOffset]$Value
+    }
+    if ($Value -is [DateTime]) {
+      return [DateTimeOffset]([DateTime]$Value)
+    }
     if ($Value -isnot [string]) {
       return $null
     }

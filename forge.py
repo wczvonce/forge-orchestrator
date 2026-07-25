@@ -5213,6 +5213,36 @@ def changed_manifest_paths(
     return changed, deleted
 
 
+def lean_docs_scope_violations(
+    packet: WorkPacket,
+    before_manifest: dict[str, str],
+    after_manifest: dict[str, str],
+) -> list[str]:
+    """Return changed paths that a lean documentation packet may not touch."""
+    changed, deleted = changed_manifest_paths(
+        before_manifest,
+        after_manifest,
+    )
+    expected = {
+        path.replace("\\", "/").lstrip("./").casefold()
+        for path in packet.expected_paths
+        if path.strip()
+    }
+
+    def allowed(raw_path: str) -> bool:
+        path = raw_path.replace("\\", "/").lstrip("./")
+        folded = path.casefold()
+        if folded == "readme.md" or folded.startswith("docs/"):
+            return True
+        return any(
+            folded == candidate
+            or folded.startswith(candidate.rstrip("/") + "/")
+            for candidate in expected
+        )
+
+    return sorted(path for path in [*changed, *deleted] if not allowed(path))
+
+
 def repo_fingerprint(project: Path) -> str:
     h = hashlib.sha256()
     code, out = run_git(project, "ls-files", "--cached", "--others", "--exclude-standard")
@@ -10766,7 +10796,18 @@ def _run_forge_locked(
                 message="Forge spúšťa automatické kontroly.",
             )
             phase_started = time.monotonic()
-            last_check_tier = decision.check_tier if adaptive_enabled else "release"
+            lean_docs_packet = bool(
+                lean_mode
+                and packet_for_worker is not None
+                and packet_for_worker.packet_type == "docs"
+            )
+            last_check_tier = (
+                "smoke"
+                if lean_docs_packet
+                else decision.check_tier
+                if adaptive_enabled
+                else "release"
+            )
             increment_count(check_suite_counts, last_check_tier)
             if not adaptive_enabled or last_check_tier in {"milestone", "release"}:
                 chain_full_check_suites += 1
@@ -10776,7 +10817,11 @@ def _run_forge_locked(
                 status,
                 tier=last_check_tier,
                 requested_ids=(
-                    decision.check_ids or None if adaptive_enabled else None
+                    None
+                    if lean_docs_packet
+                    else decision.check_ids or None
+                    if adaptive_enabled
+                    else None
                 ),
                 git_metadata_baseline=trusted_git_metadata,
                 check_contract=check_contract,
@@ -10803,6 +10848,34 @@ def _run_forge_locked(
             )
             after = repo_fingerprint(project)
             after_manifest_worker = repo_manifest(project)
+            if lean_docs_packet and packet_for_worker is not None:
+                docs_violations = lean_docs_scope_violations(
+                    packet_for_worker,
+                    before_manifest_worker,
+                    after_manifest_worker,
+                )
+                checks.append(
+                    CheckResult(
+                        command="forge internal lean-docs-scope",
+                        check_id="forge-lean-docs-scope",
+                        exit_code=1 if docs_violations else 0,
+                        output=(
+                            "Documentation packet changed forbidden paths: "
+                            + ", ".join(docs_violations)
+                            if docs_violations
+                            else (
+                                "Documentation changes stayed within docs/, "
+                                "README.md, and explicit expected_paths."
+                            )
+                        ),
+                        tier="smoke",
+                        report_valid=not docs_violations,
+                    )
+                )
+                save_json(
+                    logs / f"{iteration:02d}-checks.json",
+                    [item.model_dump(mode="json") for item in checks],
+                )
             if adaptive_enabled:
                 _, worker_diff = run_git(
                     project, "diff", "--no-ext-diff", "--", timeout=120
@@ -11162,6 +11235,7 @@ def _run_forge_locked(
                 claude_review_approved = False
                 claude_review_candidate = bool(
                     reviewed_packet is not None
+                    and reviewed_packet.packet_type != "docs"
                     and checks_passed(checks)
                     and config.get("routine_reviewer", "none") == "claude"
                     and (
@@ -11229,7 +11303,8 @@ def _run_forge_locked(
                 routine_check_close = bool(
                     reviewed_packet is not None
                     and (
-                        (
+                        reviewed_packet.packet_type == "docs"
+                        or (
                             reviewed_packet.packet_type in {"code", "docs"}
                             and reviewed_packet.check_tier
                             in {"smoke", "targeted"}

@@ -534,6 +534,35 @@ class ProjectPlanTests(unittest.TestCase):
         )
         self.assertEqual(refunded.work_packets[0].attempts, 0)
 
+    def test_docs_scope_allows_docs_readme_and_explicit_paths_only(self):
+        packet = self.packet(
+            "packet-docs",
+            packet_type="docs",
+            worker_prompt="Update the documentation.",
+            expected_paths=["CHANGELOG.md"],
+        )
+        before = {
+            "docs/guide.md": "old",
+            "README.md": "old",
+            "CHANGELOG.md": "old",
+            "src/app.py": "old",
+        }
+        allowed_after = {
+            **before,
+            "docs/guide.md": "new",
+            "README.md": "new",
+            "CHANGELOG.md": "new",
+        }
+        self.assertEqual(
+            forge.lean_docs_scope_violations(packet, before, allowed_after),
+            [],
+        )
+        forbidden_after = {**allowed_after, "src/app.py": "new"}
+        self.assertEqual(
+            forge.lean_docs_scope_violations(packet, before, forbidden_after),
+            ["src/app.py"],
+        )
+
     def test_replan_preserves_completed_packets_and_safe_assumptions(self):
         completed = self.packet("packet-001", status="completed")
         pending = self.packet(

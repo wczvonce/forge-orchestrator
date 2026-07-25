@@ -499,6 +499,22 @@ class AdaptiveRuntimeTests(unittest.TestCase):
         self.assertEqual(plan["work_packets"][0]["completed_by"], "forge_checks")
         self.assertEqual(plan["work_packets"][1]["completed_by"], "forge_checks")
         self.assertEqual(plan["work_packets"][2]["completed_by"], "codex_review")
+        first_run = sorted(
+            (self.project / ".forge" / "runs").iterdir()
+        )[0]
+        docs_checks = json.loads(
+            (first_run / "logs" / "02-checks.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertTrue(docs_checks)
+        self.assertTrue(
+            all(check["tier"] == "smoke" for check in docs_checks)
+        )
+        self.assertIn(
+            "forge-lean-docs-scope",
+            {check["check_id"] for check in docs_checks},
+        )
 
     def test_self_installation_is_rejected(self):
         with self.assertRaises(SystemExit):

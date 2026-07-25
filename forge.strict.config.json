@@ -57,6 +57,7 @@
   "final_review_after_last_worker": true,
   "adaptive_orchestration": true,
   "adaptive_auto_supervisor": true,
+  "orchestration_style": "lean",
   "claude_supports_model": true,
   "claude_supports_effort": true,
   "claude_supports_max_turns": false,

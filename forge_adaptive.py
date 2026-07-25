@@ -90,6 +90,8 @@ class WorkPacket(StrictModel):
     title: str = Field(min_length=1, max_length=160)
     objective: str = Field(min_length=1)
     context: str = ""
+    packet_type: Literal["code", "docs", "infra"] = "code"
+    worker_prompt: str | None = None
     dependencies: list[str] = Field(default_factory=list)
     acceptance_criteria: list[str] = Field(min_length=1, max_length=4)
     status: Literal[
@@ -119,6 +121,7 @@ class WorkPacket(StrictModel):
     last_failure_signature: str | None = None
     closes_milestone: bool = False
     requires_fresh_release_check: bool = False
+    completed_by: Literal["forge_checks", "claude_review", "codex_review"] | None = None
 
     @model_validator(mode="after")
     def validate_packet(self) -> "WorkPacket":
@@ -150,6 +153,8 @@ class PacketUpdate(StrictModel):
     ] | None = None
     objective: str | None = None
     context: str | None = None
+    packet_type: Literal["code", "docs", "infra"] | None = None
+    worker_prompt: str | None = None
     dependencies: list[str] | None = None
     acceptance_criteria: list[str] | None = Field(default=None, min_length=1, max_length=4)
     difficulty: Literal["mechanical", "routine", "complex", "frontier"] | None = None
@@ -171,6 +176,7 @@ class PacketUpdate(StrictModel):
     last_failure_signature: str | None = None
     closes_milestone: bool | None = None
     requires_fresh_release_check: bool | None = None
+    completed_by: Literal["forge_checks", "claude_review", "codex_review"] | None = None
     justification: str = Field(min_length=1)
 
 
@@ -1114,6 +1120,7 @@ def bootstrap_packet(decision: AdaptiveDecision, goal: str) -> WorkPacket:
         title="Initial coherent implementation packet",
         objective=decision.next_prompt or goal,
         context="Compatibility bootstrap because the architecture response did not add packets.",
+        worker_prompt=decision.next_prompt or goal,
         acceptance_criteria=criteria[:4],
         difficulty="routine",
         risk="medium",
@@ -1121,6 +1128,41 @@ def bootstrap_packet(decision: AdaptiveDecision, goal: str) -> WorkPacket:
         recommended_review_profile=decision.recommended_review_profile,
         check_tier=decision.check_tier,
         max_worker_turns=decision.recommended_worker_max_turns,
+    )
+
+
+def validate_lean_initial_plan(packets: list[WorkPacket]) -> None:
+    """Fail closed when the one-shot lean architecture is not executable."""
+    if not 4 <= len(packets) <= 12:
+        raise ValueError(
+            "Lean architecture must create 4 to 12 coherent work packets."
+        )
+    missing_prompts = [
+        packet.packet_id
+        for packet in packets
+        if not (packet.worker_prompt or "").strip()
+    ]
+    if missing_prompts:
+        raise ValueError(
+            "Lean architecture requires a complete worker_prompt for every packet; "
+            "missing: " + ", ".join(missing_prompts)
+        )
+
+
+def dependency_ready_packet(plan: ProjectPlan) -> WorkPacket | None:
+    """Return the first pending dependency-ready packet in persistent plan order."""
+    by_id = {packet.packet_id: packet for packet in plan.work_packets}
+    return next(
+        (
+            packet
+            for packet in plan.work_packets
+            if packet.status == "pending"
+            and all(
+                by_id[dependency].status == "completed"
+                for dependency in packet.dependencies
+            )
+        ),
+        None,
     )
 
 

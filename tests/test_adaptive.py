@@ -78,6 +78,34 @@ class AdaptiveSchemaTests(unittest.TestCase):
                 check_contract_approval_reason="Looks fine.",
             )
 
+    def test_lean_architecture_requires_every_worker_prompt(self):
+        packets = [
+            self.packet(
+                packet_id=f"packet-{index:03d}",
+                worker_prompt=(
+                    "Implement the bounded packet and run targeted checks."
+                    if index != 3
+                    else None
+                ),
+            )
+            for index in range(1, 5)
+        ]
+        with self.assertRaisesRegex(ValueError, "packet-003"):
+            adaptive.validate_lean_initial_plan(packets)
+        packets[2].worker_prompt = "Implement packet 3 and run its checks."
+        adaptive.validate_lean_initial_plan(packets)
+
+    def test_worker_prompt_and_packet_type_are_backward_compatible(self):
+        legacy = self.packet()
+        self.assertEqual(legacy.packet_type, "code")
+        self.assertIsNone(legacy.worker_prompt)
+        docs = self.packet(
+            packet_type="docs",
+            worker_prompt="Update README.md only and run git diff --check.",
+        )
+        self.assertEqual(docs.packet_type, "docs")
+        self.assertIn("README.md", docs.worker_prompt or "")
+
 
 class ProjectPlanTests(unittest.TestCase):
     def packet(self, packet_id="packet-001", **overrides):
@@ -186,6 +214,31 @@ class ProjectPlanTests(unittest.TestCase):
             adaptive.apply_plan_patch(base, patch, checks_passed=False)
         updated = adaptive.apply_plan_patch(base, patch, checks_passed=True)
         self.assertEqual(updated.completed_packet_ids, ["packet-001"])
+
+    def test_dependency_ready_packet_uses_persistent_plan_order(self):
+        first = self.packet("packet-001", status="completed")
+        second = self.packet(
+            "packet-002",
+            dependencies=["packet-001"],
+        )
+        third = self.packet(
+            "packet-003",
+            dependencies=["packet-001"],
+        )
+        plan = adaptive.ProjectPlan(
+            plan_id="plan-1",
+            project_id="project-1",
+            goal_hash="g",
+            spec_hash="s",
+            created_at=adaptive.utc_now(),
+            updated_at=adaptive.utc_now(),
+            work_packets=[first, second, third],
+            completed_packet_ids=["packet-001"],
+        )
+        self.assertEqual(
+            adaptive.dependency_ready_packet(plan).packet_id,
+            "packet-002",
+        )
 
     def test_replan_preserves_completed_packets_and_safe_assumptions(self):
         completed = self.packet("packet-001", status="completed")

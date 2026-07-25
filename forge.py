@@ -46,6 +46,7 @@ from forge_adaptive import (
     collect_indirect_check_sources,
     collision_safe_auto_check_id,
     config_hash,
+    dependency_ready_packet,
     detect_test_count,
     export_schemas,
     git_baseline,
@@ -59,6 +60,7 @@ from forge_adaptive import (
     save_plan,
     select_check_definitions,
     stable_project_identity,
+    validate_lean_initial_plan,
     validate_check_report,
     validate_contract_update,
     write_assumptions,
@@ -753,6 +755,9 @@ DEFAULT_CONFIG = {
     # construct DEFAULT_CONFIG directly.
     "adaptive_orchestration": False,
     "adaptive_auto_supervisor": False,
+    # Audited JSON profiles opt into lean.  Keeping the in-code fallback
+    # classic preserves callers that construct DEFAULT_CONFIG directly.
+    "orchestration_style": "classic",
     "claude_supports_model": True,
     "claude_supports_effort": True,
     # Claude Code 2.1.205 does not advertise --max-turns. Forge therefore
@@ -6184,7 +6189,17 @@ def build_review_prompt(
     adaptive_instruction = (
         (
             "This is the first planning pass. Create a coherent 4-12 packet plan_patch "
-            "and activate the first dependency-ready packet."
+            "and activate the first dependency-ready packet. "
+            + (
+                "This run uses lean orchestration: every added packet MUST contain "
+                "packet_type and a complete, self-contained worker_prompt. Each "
+                "worker_prompt must state the bounded goal, relevant context, all "
+                "acceptance criteria, expected_paths, forbidden_scope, and the "
+                "allowlisted checks/check tier that must pass. Forge will dispatch "
+                "these prompts without another routine Codex planning call."
+                if config.get("orchestration_style", "classic") == "lean"
+                else ""
+            )
             if phase == "architecture"
             else "Update only the active packet through a minimal validated plan_patch."
         )
@@ -7410,6 +7425,10 @@ def load_config(path: Path) -> dict:
 
 
 def validate_config(config: dict) -> None:
+    if config.get("orchestration_style", "classic") not in {"lean", "classic"}:
+        raise RuntimeError(
+            "orchestration_style must be either 'lean' or 'classic'."
+        )
     if not 1 <= int(config.get("max_iterations", 0)) <= 10:
         raise RuntimeError("max_iterations musí byť v rozsahu 1 až 10.")
     if int(config.get("max_diff_chars", 0)) < 2000:
@@ -7995,6 +8014,40 @@ def update_plan_from_decision(
     return plan
 
 
+def lean_packet_decision(
+    packet: WorkPacket,
+    plan: ProjectPlan,
+    *,
+    assessment: str,
+    decision_kind: Literal["implement_packet", "repair_packet"] = "implement_packet",
+) -> Decision:
+    """Build the deterministic runtime decision from the persisted lean plan."""
+    prompt = (packet.worker_prompt or "").strip()
+    if not prompt:
+        raise RuntimeError(
+            f"Lean packet {packet.packet_id} has no persisted worker_prompt."
+        )
+    return Decision(
+        status="continue",
+        decision_kind=decision_kind,
+        assessment=assessment,
+        active_packet_id=packet.packet_id,
+        packet_assessment="Dependency-ready packet selected from the persistent plan.",
+        next_prompt=prompt,
+        acceptance_criteria=packet.acceptance_criteria,
+        risks=plan.overall_risks,
+        recommended_worker_profile=packet.recommended_worker_profile,
+        recommended_worker_max_turns=packet.max_worker_turns,
+        recommended_review_profile=packet.recommended_review_profile,
+        check_tier=packet.check_tier,
+        routing_reason=(
+            "Deterministic lean dispatch from the persisted dependency-ordered plan."
+        ),
+        closes_milestone=packet.closes_milestone,
+        requires_release_check=packet.requires_fresh_release_check,
+    )
+
+
 def maybe_authorize_final_review_recovery(
     plan: ProjectPlan,
     decision: Decision,
@@ -8139,6 +8192,10 @@ def _run_forge_locked(
     trusted_git_metadata = git_metadata_manifest(project)
     save_json(run_directory / "git-metadata-baseline.json", trusted_git_metadata)
     adaptive_enabled = bool(config.get("adaptive_orchestration", False))
+    lean_mode = (
+        adaptive_enabled
+        and config.get("orchestration_style", "classic") == "lean"
+    )
     project_identity: dict[str, str] | None = None
     project_plan: ProjectPlan | None = None
     check_contract: CheckContract | None = None
@@ -9431,6 +9488,60 @@ def _run_forge_locked(
                     important=important_goal or adaptive_important,
                     metadata_path=logs / f"{iteration:02d}-codex-usage.json",
                 )
+                if lean_mode and codex_phase == "architecture":
+                    try:
+                        validate_lean_initial_plan(
+                            decision.plan_patch.add_packets
+                            if decision.plan_patch is not None
+                            else []
+                        )
+                    except ValueError as first_error:
+                        budget_reason = current_budget_reason()
+                        if budget_reason:
+                            final_status = "needs_continuation"
+                            final_message = budget_reason
+                            stop_reason_code = "chain_budget_exhausted"
+                            exit_code = EXIT_NEEDS_CONTINUATION
+                            break
+                        retry_prompt = redact_text(
+                            review_prompt
+                            + "\n\nLEAN ARCHITECTURE VALIDATION FAILED:\n"
+                            + str(first_error)
+                            + "\nReturn one corrected full architecture decision. "
+                            "This is the only architecture retry."
+                        )
+                        chain_codex_calls += 1
+                        increment_count(codex_profile_counts, "architecture")
+                        save_json(
+                            logs / f"{iteration:02d}-architecture-retry.json",
+                            {
+                                "schema_version": SCHEMA_VERSION,
+                                "first_error": str(first_error),
+                                "retry_count": 1,
+                            },
+                        )
+                        decision = ask_orchestrator(
+                            project,
+                            retry_prompt,
+                            config,
+                            logs / f"{iteration:02d}-decision-retry-raw.json",
+                            phase="architecture",
+                            important=important_goal,
+                            metadata_path=(
+                                logs / f"{iteration:02d}-codex-usage-retry.json"
+                            ),
+                        )
+                        try:
+                            validate_lean_initial_plan(
+                                decision.plan_patch.add_packets
+                                if decision.plan_patch is not None
+                                else []
+                            )
+                        except ValueError as second_error:
+                            raise RuntimeError(
+                                "Lean architecture remained invalid after its "
+                                f"single retry: {second_error}"
+                            ) from second_error
                 print(
                     f"[Forge][Phase] codex_review completed in "
                     f"{time.monotonic() - phase_started:.1f}s",
@@ -9584,6 +9695,24 @@ def _run_forge_locked(
                     goal=goal,
                 )
                 active_packet = active_plan_packet(project_plan)
+                if (
+                    lean_mode
+                    and decision.status == "continue"
+                    and active_packet is not None
+                ):
+                    decision = lean_packet_decision(
+                        active_packet,
+                        project_plan,
+                        assessment=(
+                            "Lean architecture accepted; dispatch the persisted "
+                            "worker prompt for the active packet."
+                        ),
+                        decision_kind=(
+                            "repair_packet"
+                            if decision.decision_kind == "repair_packet"
+                            else "implement_packet"
+                        ),
+                    )
                 refresh_monitor_context(
                     codex_assignment=decision.next_prompt,
                     check_tier=decision.check_tier,
@@ -9615,18 +9744,7 @@ def _run_forge_locked(
                     for packet in project_plan.work_packets
                 )
             ):
-                ready_packet = next(
-                    (
-                        packet
-                        for packet in project_plan.work_packets
-                        if packet.status == "pending"
-                        and all(
-                            dependency in project_plan.completed_packet_ids
-                            for dependency in packet.dependencies
-                        )
-                    ),
-                    None,
-                )
+                ready_packet = dependency_ready_packet(project_plan)
                 if ready_packet is not None:
                     project_plan = apply_plan_patch(
                         project_plan,
@@ -9651,26 +9769,39 @@ def _run_forge_locked(
                             f"Codex skontroluje ďalší packet: {ready_packet.title}."
                         )
                     )
-                    final_decision = Decision(
-                        status="continue",
-                        decision_kind="implement_packet",
-                        assessment=(
-                            "Verified packet completed; continue with the next "
-                            "dependency-ready packet."
-                        ),
-                        active_packet_id=ready_packet.packet_id,
-                        packet_assessment="Next packet is ready.",
-                        next_prompt=ready_packet.objective,
-                        acceptance_criteria=ready_packet.acceptance_criteria,
-                        risks=project_plan.overall_risks,
-                        recommended_worker_profile=(
-                            ready_packet.recommended_worker_profile
-                        ),
-                        recommended_review_profile=(
-                            ready_packet.recommended_review_profile
-                        ),
-                        check_tier=ready_packet.check_tier,
-                        routing_reason="Deterministic dependency-ready packet transition.",
+                    final_decision = (
+                        lean_packet_decision(
+                            ready_packet,
+                            project_plan,
+                            assessment=(
+                                "Verified packet completed; continue with the next "
+                                "dependency-ready packet."
+                            ),
+                        )
+                        if lean_mode
+                        else Decision(
+                            status="continue",
+                            decision_kind="implement_packet",
+                            assessment=(
+                                "Verified packet completed; continue with the next "
+                                "dependency-ready packet."
+                            ),
+                            active_packet_id=ready_packet.packet_id,
+                            packet_assessment="Next packet is ready.",
+                            next_prompt=ready_packet.objective,
+                            acceptance_criteria=ready_packet.acceptance_criteria,
+                            risks=project_plan.overall_risks,
+                            recommended_worker_profile=(
+                                ready_packet.recommended_worker_profile
+                            ),
+                            recommended_review_profile=(
+                                ready_packet.recommended_review_profile
+                            ),
+                            check_tier=ready_packet.check_tier,
+                            routing_reason=(
+                                "Deterministic dependency-ready packet transition."
+                            ),
+                        )
                     )
                     packet_transition_ready = True
                 print(

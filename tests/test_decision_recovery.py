@@ -53,7 +53,7 @@ class DecisionNormalizationTests(unittest.TestCase):
         )
         decision = forge.Decision.model_validate(normalized)
         self.assertFalse(decision.approve_check_contract_drift)
-        self.assertTrue(decision.normalization_warnings)
+        self.assertEqual(decision.normalization_warnings, [])
 
     def test_normalizer_never_coerces_or_weakens_true_approval(self) -> None:
         with self.assertRaises(ValueError):

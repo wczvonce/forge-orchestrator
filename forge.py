@@ -183,17 +183,6 @@ def normalize_codex_decision_payload(payload: dict[str, Any]) -> dict[str, Any]:
         reason = payload.get("check_contract_approval_reason")
         if approval is False and isinstance(reason, str) and reason.strip():
             normalized["check_contract_approval_reason"] = ""
-            warning = (
-                "Dropped check_contract_approval_reason because "
-                "approve_check_contract_drift=false."
-            )
-            warnings = normalized.get("normalization_warnings")
-            if not isinstance(warnings, list):
-                warnings = []
-            normalized["normalization_warnings"] = [
-                *[str(item) for item in warnings if str(item).strip()],
-                *([] if warning in warnings else [warning]),
-            ]
     return normalized
 
 
@@ -2337,15 +2326,6 @@ def _load_authentic_post_worker_decision(
         raise RuntimeError(
             "The failed decision is not the one permitted native-false approval "
             "normalization case."
-        )
-    try:
-        Decision.model_validate(raw_payload)
-    except Exception:
-        pass
-    else:
-        raise RuntimeError(
-            "The raw decision already validates; no bounded normalization "
-            "recovery is justified."
         )
     normalized = normalize_codex_decision_payload(raw_payload)
     changed_fields = sorted(
@@ -6778,8 +6758,24 @@ def ask_orchestrator(
 
     try:
         payload = json.loads(output_path.read_text(encoding="utf-8"))
+        cosmetic_reason_normalized = bool(
+            isinstance(payload, dict)
+            and payload.get("approve_check_contract_drift") is False
+            and isinstance(
+                payload.get("check_contract_approval_reason"),
+                str,
+            )
+            and payload["check_contract_approval_reason"].strip()
+        )
         normalized_payload = normalize_codex_decision_payload(payload)
         decision = Decision.model_validate(normalized_payload)
+        if cosmetic_reason_normalized:
+            warning = (
+                "Dropped check_contract_approval_reason because "
+                "approve_check_contract_drift=false."
+            )
+            if warning not in decision.normalization_warnings:
+                decision.normalization_warnings.append(warning)
         # Keep the run-scoped raw artifact faithful to the Codex response.  It
         # is redacted and atomically rewritten for storage safety, but the
         # ineffective reason is removed only from the validated Decision and

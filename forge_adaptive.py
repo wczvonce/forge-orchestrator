@@ -90,8 +90,14 @@ class WorkPacket(StrictModel):
     title: str = Field(min_length=1, max_length=160)
     objective: str = Field(min_length=1)
     context: str = ""
-    packet_type: Literal["code", "docs", "infra"] = "code"
-    worker_prompt: str | None = None
+    packet_type: Literal["code", "docs", "infra"] = Field(
+        default="code",
+        exclude_if=lambda value: value == "code",
+    )
+    worker_prompt: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     dependencies: list[str] = Field(default_factory=list)
     acceptance_criteria: list[str] = Field(min_length=1, max_length=4)
     status: Literal[
@@ -121,12 +127,33 @@ class WorkPacket(StrictModel):
     last_failure_signature: str | None = None
     closes_milestone: bool = False
     requires_fresh_release_check: bool = False
-    completed_by: Literal["forge_checks", "claude_review", "codex_review"] | None = None
+    completed_by: Literal[
+        "forge_checks", "claude_review", "codex_review"
+    ] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     consecutive_check_failures: list[dict[str, Any]] = Field(
         default_factory=list,
         max_length=2,
+        exclude_if=lambda value: not value,
     )
-    claude_review_repair_used: bool = False
+    claude_review_repair_used: bool = Field(
+        default=False,
+        exclude_if=lambda value: value is False,
+    )
+    reviewed_file_hashes: dict[str, str] = Field(
+        default_factory=dict,
+        exclude_if=lambda value: not value,
+    )
+    late_findings: list[dict[str, str]] = Field(
+        default_factory=list,
+        exclude_if=lambda value: not value,
+    )
+    late_finding_repair_pending: bool = Field(
+        default=False,
+        exclude_if=lambda value: value is False,
+    )
 
     @model_validator(mode="after")
     def validate_packet(self) -> "WorkPacket":
@@ -279,6 +306,11 @@ class ProjectPlan(StrictModel):
         return self
 
 
+class ReviewIssue(StrictModel):
+    file_path: str = ""
+    description: str = Field(min_length=1)
+
+
 class AdaptiveDecision(StrictModel):
     schema_version: int = ADAPTIVE_SCHEMA_VERSION
     status: Literal["continue", "done", "blocked"]
@@ -297,6 +329,7 @@ class AdaptiveDecision(StrictModel):
     next_prompt: str | None = None
     acceptance_criteria: list[str] = Field(default_factory=list, max_length=4)
     risks: list[str] = Field(default_factory=list)
+    review_issues: list[ReviewIssue] = Field(default_factory=list)
     recommended_worker_profile: Literal[
         "economy", "standard", "complex", "frontier", "rescue"
     ] = "standard"
@@ -941,6 +974,19 @@ def plan_hash(plan: ProjectPlan) -> str:
             packet.pop("final_review_recovery_authorized", None)
         if not packet.get("final_review_recovery_used", False):
             packet.pop("final_review_recovery_used", None)
+        compatibility_defaults = {
+            "packet_type": "code",
+            "worker_prompt": None,
+            "completed_by": None,
+            "consecutive_check_failures": [],
+            "claude_review_repair_used": False,
+            "reviewed_file_hashes": {},
+            "late_findings": [],
+            "late_finding_repair_pending": False,
+        }
+        for key, default in compatibility_defaults.items():
+            if packet.get(key) == default:
+                packet.pop(key, None)
     return sha256_text(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
 

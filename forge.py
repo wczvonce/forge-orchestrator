@@ -32,6 +32,7 @@ from forge_adaptive import (
     PacketUpdate,
     PlanPatch,
     ProjectPlan,
+    ReviewIssue,
     WorkPacket,
     apply_plan_patch,
     atomic_json,
@@ -6277,9 +6278,13 @@ def build_review_prompt(
         actionable defect that the evidence substantiates in this one decision;
         do not drip-feed one small finding per review. If a repair is needed,
         make next_prompt a single bounded repair packet that enumerates all such
-        defects visible now.
+        defects visible now, and put every actionable objection in review_issues
+        with its repository-relative file_path whenever one exists.
         Treat the user's goal and SPEC as authoritative. Do not invent stricter
         product, compliance, or workflow requirements that they do not contain.
+        A schema-validation error, broken pipe, sandbox denial, timeout, or other
+        model transport failure is technical evidence, not a content failure of
+        the work packet, and must never be reported as an implementation defect.
         Keep observed UI capability, local runtime behavior, remote transport,
         account permission, and OAuth/API scope as separate facts; evidence for
         one is not proof of another.
@@ -8312,6 +8317,54 @@ def record_lean_check_evidence(
     return ProjectPlan.model_validate(updated.model_dump(mode="json"))
 
 
+def record_review_snapshot(
+    plan: ProjectPlan,
+    packet_id: str,
+    *,
+    manifest: dict[str, str],
+    reviewed_paths: list[str],
+    issues: list[ReviewIssue],
+) -> tuple[ProjectPlan, list[dict[str, str]]]:
+    """Persist review file hashes and identify objections delayed on unchanged files."""
+    updated = plan.model_copy(deep=True)
+    packet = next(
+        (
+            item
+            for item in updated.work_packets
+            if item.packet_id == packet_id
+        ),
+        None,
+    )
+    if packet is None:
+        raise ValueError(f"Unknown reviewed packet {packet_id}.")
+    late: list[dict[str, str]] = []
+    normalized_issue_paths: list[str] = []
+    for issue in issues:
+        path = issue.file_path.replace("\\", "/").strip()
+        if not path:
+            continue
+        normalized_issue_paths.append(path)
+        current_hash = manifest.get(path, "<deleted>")
+        if packet.reviewed_file_hashes.get(path) == current_hash:
+            finding = {
+                "file_path": path,
+                "description": issue.description,
+                "file_hash": current_hash,
+                "detected_at": utc_now(),
+            }
+            late.append(finding)
+            packet.late_findings.append(finding)
+    for raw_path in [*reviewed_paths, *normalized_issue_paths]:
+        path = raw_path.replace("\\", "/").strip()
+        if path:
+            packet.reviewed_file_hashes[path] = manifest.get(path, "<deleted>")
+    updated.updated_at = utc_now()
+    return (
+        ProjectPlan.model_validate(updated.model_dump(mode="json")),
+        late,
+    )
+
+
 def prepare_claude_review_repair(
     plan: ProjectPlan,
     packet_id: str,
@@ -9430,6 +9483,9 @@ def _run_forge_locked(
             current_manifest = repo_manifest(project)
             current_fingerprint = repo_fingerprint(project)
             active_packet = active_plan_packet(project_plan)
+            codex_model_reviewed = False
+            reviewed_paths_for_snapshot: list[str] = []
+            late_finding_only_repair = False
             reviewed_check_contract_evidence: dict[str, Any] | None = None
             allowed_check_ids = (
                 [
@@ -9644,6 +9700,7 @@ def _run_forge_locked(
                             codex_profile_counts,
                             "important_review" if important_goal else "routine_review",
                         )
+                    codex_model_reviewed = True
                     decision = ask_orchestrator(
                         project,
                         review_prompt,
@@ -9760,6 +9817,13 @@ def _run_forge_locked(
                     logs / f"{iteration:02d}-evidence-index.json",
                     structured_evidence,
                 )
+                reviewed_paths_for_snapshot = sorted(
+                    set(
+                        structured_evidence.changed_files
+                        + structured_evidence.new_files
+                        + structured_evidence.deleted_files
+                    )
+                )
                 current_contract_error = (
                     check_contract_runtime_error(
                         project, check_contract, config
@@ -9812,6 +9876,7 @@ def _run_forge_locked(
                         exit_code = EXIT_NEEDS_CONTINUATION
                         break
                     chain_codex_calls += 1
+                codex_model_reviewed = True
                 decision = ask_orchestrator(
                     project,
                     review_prompt,
@@ -9879,6 +9944,66 @@ def _run_forge_locked(
                     f"[Forge][Phase] codex_review completed in "
                     f"{time.monotonic() - phase_started:.1f}s",
                     flush=True,
+                )
+            if (
+                adaptive_enabled
+                and codex_model_reviewed
+                and project_plan is not None
+                and active_packet is not None
+            ):
+                project_plan, late_findings = record_review_snapshot(
+                    project_plan,
+                    active_packet.packet_id,
+                    manifest=current_manifest,
+                    reviewed_paths=reviewed_paths_for_snapshot,
+                    issues=decision.review_issues,
+                )
+                issue_paths = [
+                    issue.file_path.replace("\\", "/").strip()
+                    for issue in decision.review_issues
+                    if issue.file_path.strip()
+                ]
+                late_finding_only_repair = bool(
+                    decision.status == "continue"
+                    and decision.decision_kind == "repair_packet"
+                    and issue_paths
+                    and len(late_findings) == len(decision.review_issues)
+                )
+                reviewed_plan_packet = next(
+                    packet
+                    for packet in project_plan.work_packets
+                    if packet.packet_id == active_packet.packet_id
+                )
+                reviewed_plan_packet.late_finding_repair_pending = (
+                    late_finding_only_repair
+                )
+                project_plan = ProjectPlan.model_validate(
+                    project_plan.model_dump(mode="json")
+                )
+                save_plan(
+                    project,
+                    project_plan,
+                    snapshot_path=(
+                        run_directory
+                        / f"project-plan.review-snapshot-{iteration:02d}.json"
+                    ),
+                )
+                save_json(
+                    logs / f"{iteration:02d}-review-snapshot.json",
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "packet_id": active_packet.packet_id,
+                        "reviewed_files": {
+                            path: current_manifest.get(path, "<deleted>")
+                            for path in reviewed_paths_for_snapshot
+                        },
+                        "issues": [
+                            issue.model_dump(mode="json")
+                            for issue in decision.review_issues
+                        ],
+                        "late_findings": late_findings,
+                        "packet_attempt_refund": late_finding_only_repair,
+                    },
                 )
             if adaptive_enabled and check_contract is not None:
                 contract_error = check_contract_runtime_error(
@@ -10326,13 +10451,30 @@ def _run_forge_locked(
                     project_plan is not None
                     and active_plan_packet(project_plan) is not None
                 ):
-                    project_plan, logical_attempt_was_recovery = begin_packet_attempt(
-                        project_plan,
-                        packet_for_worker.packet_id,
-                        config,
-                    )
-                    logical_attempt_pending = True
-                    logical_attempt_packet_id = packet_for_worker.packet_id
+                    if (
+                        late_finding_only_repair
+                        or packet_for_worker.late_finding_repair_pending
+                    ):
+                        logical_attempt_pending = False
+                        status.update_event(
+                            current_agent="Forge",
+                            message=(
+                                "Late finding on unchanged reviewed files is "
+                                "batched into one repair without consuming a "
+                                "packet attempt."
+                            ),
+                        )
+                    else:
+                        (
+                            project_plan,
+                            logical_attempt_was_recovery,
+                        ) = begin_packet_attempt(
+                            project_plan,
+                            packet_for_worker.packet_id,
+                            config,
+                        )
+                        logical_attempt_pending = True
+                        logical_attempt_packet_id = packet_for_worker.packet_id
                     save_plan(
                         project,
                         project_plan,
@@ -10429,6 +10571,30 @@ def _run_forge_locked(
             save_json(logs / f"{iteration:02d}-worker.json", worker)
             if worker.valid_worker_outcome:
                 logical_attempt_pending = False
+                if (
+                    project_plan is not None
+                    and packet_for_worker is not None
+                    and packet_for_worker.late_finding_repair_pending
+                ):
+                    completed_late_plan = project_plan.model_copy(deep=True)
+                    completed_late_packet = next(
+                        packet
+                        for packet in completed_late_plan.work_packets
+                        if packet.packet_id == packet_for_worker.packet_id
+                    )
+                    completed_late_packet.late_finding_repair_pending = False
+                    completed_late_plan.updated_at = utc_now()
+                    project_plan = ProjectPlan.model_validate(
+                        completed_late_plan.model_dump(mode="json")
+                    )
+                    save_plan(
+                        project,
+                        project_plan,
+                        snapshot_path=(
+                            run_directory
+                            / f"project-plan.late-finding-{iteration:02d}.json"
+                        ),
+                    )
             if worker.termination_reason == "model_unavailable_without_credits":
                 if (
                     logical_attempt_pending
@@ -11365,6 +11531,73 @@ def _run_forge_locked(
                     important=True,
                     metadata_path=logs / "final-codex-usage.json",
                 )
+                if project_plan is not None:
+                    final_packet = active_plan_packet(project_plan)
+                    if final_packet is not None:
+                        final_reviewed_paths = sorted(
+                            set(
+                                final_evidence_index.changed_files
+                                + final_evidence_index.new_files
+                                + final_evidence_index.deleted_files
+                            )
+                        )
+                        project_plan, final_late_findings = (
+                            record_review_snapshot(
+                                project_plan,
+                                final_packet.packet_id,
+                                manifest=current_manifest,
+                                reviewed_paths=final_reviewed_paths,
+                                issues=final_decision.review_issues,
+                            )
+                        )
+                        final_issue_paths = [
+                            issue.file_path.replace("\\", "/").strip()
+                            for issue in final_decision.review_issues
+                            if issue.file_path.strip()
+                        ]
+                        final_late_only = bool(
+                            final_decision.status == "continue"
+                            and final_decision.decision_kind == "repair_packet"
+                            and final_issue_paths
+                            and len(final_late_findings)
+                            == len(final_decision.review_issues)
+                        )
+                        stored_final_packet = next(
+                            packet
+                            for packet in project_plan.work_packets
+                            if packet.packet_id == final_packet.packet_id
+                        )
+                        stored_final_packet.late_finding_repair_pending = (
+                            final_late_only
+                        )
+                        project_plan = ProjectPlan.model_validate(
+                            project_plan.model_dump(mode="json")
+                        )
+                        save_plan(
+                            project,
+                            project_plan,
+                            snapshot_path=(
+                                run_directory
+                                / "project-plan.final-review-snapshot.json"
+                            ),
+                        )
+                        save_json(
+                            logs / "final-review-snapshot.json",
+                            {
+                                "schema_version": SCHEMA_VERSION,
+                                "packet_id": final_packet.packet_id,
+                                "reviewed_files": {
+                                    path: current_manifest.get(path, "<deleted>")
+                                    for path in final_reviewed_paths
+                                },
+                                "issues": [
+                                    issue.model_dump(mode="json")
+                                    for issue in final_decision.review_issues
+                                ],
+                                "late_findings": final_late_findings,
+                                "packet_attempt_refund": final_late_only,
+                            },
+                        )
                 if (
                     final_decision.approve_check_contract_drift
                     and final_contract_error is None

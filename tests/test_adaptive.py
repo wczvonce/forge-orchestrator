@@ -418,6 +418,85 @@ class ProjectPlanTests(unittest.TestCase):
         self.assertIsNone(second_repair)
         self.assertEqual(second.work_packets[0].attempts, 1)
 
+    def test_second_review_issue_on_unchanged_file_is_late_without_attempt(self):
+        packet = self.packet(
+            "packet-001",
+            worker_prompt="Repair the packet.",
+            status="in_progress",
+            attempts=2,
+        )
+        plan = adaptive.ProjectPlan(
+            plan_id="plan-1",
+            project_id="project-1",
+            goal_hash="g",
+            spec_hash="s",
+            created_at=adaptive.utc_now(),
+            updated_at=adaptive.utc_now(),
+            status="active",
+            active_packet_id=packet.packet_id,
+            work_packets=[packet],
+        )
+        manifest = {"src/app.py": "same-sha256"}
+        plan, first_late = forge.record_review_snapshot(
+            plan,
+            packet.packet_id,
+            manifest=manifest,
+            reviewed_paths=["src/app.py"],
+            issues=[],
+        )
+        self.assertEqual(first_late, [])
+        plan, second_late = forge.record_review_snapshot(
+            plan,
+            packet.packet_id,
+            manifest=manifest,
+            reviewed_paths=["src/app.py"],
+            issues=[
+                adaptive.ReviewIssue(
+                    file_path="src/app.py",
+                    description="Previously omitted grounded issue.",
+                )
+            ],
+        )
+        self.assertEqual(len(second_late), 1)
+        self.assertEqual(
+            second_late[0]["file_path"],
+            "src/app.py",
+        )
+        self.assertEqual(plan.work_packets[0].attempts, 2)
+        self.assertEqual(len(plan.work_packets[0].late_findings), 1)
+
+    def test_normal_content_attempt_increments_and_technical_refund_restores_it(self):
+        packet = self.packet(
+            "packet-001",
+            worker_prompt="Implement packet.",
+            status="in_progress",
+            attempts=0,
+        )
+        plan = adaptive.ProjectPlan(
+            plan_id="plan-1",
+            project_id="project-1",
+            goal_hash="g",
+            spec_hash="s",
+            created_at=adaptive.utc_now(),
+            updated_at=adaptive.utc_now(),
+            status="active",
+            active_packet_id=packet.packet_id,
+            work_packets=[packet],
+        )
+        attempted, recovery = adaptive.begin_packet_attempt(
+            plan,
+            packet.packet_id,
+            forge.DEFAULT_CONFIG,
+        )
+        self.assertFalse(recovery)
+        self.assertEqual(attempted.work_packets[0].attempts, 1)
+        refunded = adaptive.refund_packet_attempt(
+            attempted,
+            packet.packet_id,
+            recovery_attempt=False,
+        )
+        self.assertEqual(refunded.work_packets[0].attempts, 0)
+
     def test_replan_preserves_completed_packets_and_safe_assumptions(self):
         completed = self.packet("packet-001", status="completed")
         pending = self.packet(

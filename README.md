@@ -7,6 +7,58 @@ Forge používa existujúce ChatGPT a Claude.ai predplatné, nie API kľúče:
 - **Forge** je lokálna Python slučka, ktorá vyberá správny model podľa fázy, zbiera iba potrebné dôkazy, spúšťa kontroly a bezpečne zastavuje proces.
 - **Live Monitor** je obyčajný lokálny PowerShell. Jeho obnovovanie nespotrebúva modelové tokeny.
 
+## Lean orchestration — predvolený auditovaný tok
+
+Aktívne konfiguračné profily používajú `orchestration_style: "lean"`.
+Kompatibilný `classic` tok zostáva dostupný pre staré alebo explicitne
+klasické konfigurácie. Pri načítaní legacy konfigurácie bez nového kľúča Forge
+bezpečne zachová pôvodný `classic` tok, aby sa existujúci beh potichu nezmenil.
+
+Rozdiel je v počte strategických review, nie v bezpečnostných kontrolách:
+
+- `lean`: prvý Codex architecture call pripraví pre každý packet úplný
+  `worker_prompt`; Forge potom vyberá dependency-ready packety v stabilnom
+  poradí. Bežný `smoke` alebo `targeted` packet uzavrú zelené lokálne kontroly
+  a zapíšu `completed_by: "forge_checks"`. Codex sa vracia pri míľniku,
+  opakovanom zlyhaní, zmene plánu/check kontraktu a pri finálnom release review.
+- `classic`: zachováva pôvodné Codex rozhodnutie medzi implementačnými
+  iteráciami a predvolený Codex routine review.
+
+Návrhovým cieľom lean toku je približne päť Codex volaní na bežný projekt:
+architektúra, niekoľko skutočných míľnikov a finálny review. Nie je to
+garancia ani tvrdenie o percentuálnej úspore. Skutočný počet rastie pri
+opravách, contract drifte, externých zmenách alebo bezpečnostnom riziku.
+Deterministický fake-CLI E2E s piatimi packetmi, jedným docs packetom a jedným
+míľnikom používa tri Codex volania: architektúru, míľnik a finál.
+
+### Kto rozhoduje čo
+
+| Vrstva | Rozhodnutia a zodpovednosť |
+|---|---|
+| Python Forge | vyberá dependency-ready packet, povoľuje modelový profil, vynucuje scope, budgety, stavové prechody, resume a bezpečnostné hranice |
+| Lokálne checky | poskytujú model-free dôkaz pre `smoke`, `targeted`, `milestone` a `release`; zelený výsledok môže v lean toku uzavrieť rutinný packet |
+| Claude Code | implementuje iba aktívny `worker_prompt`; voliteľný `claude_reviewer` je samostatný read-only reviewer bez Write/Edit/Bash |
+| Codex | vytvára plán, rieši míľniky, opakované zlyhania a zmeny kontraktu a ako jediný model schvaľuje konečný `done` po čerstvej release suite |
+
+### Pravidlá prvého lean plánu
+
+- plán má 4 až 12 koherentných packetov a každý má samostatne postačujúci
+  `worker_prompt`;
+- najneskôr prvý, druhý alebo tretí packet vytvorí spustiteľný walking
+  skeleton mimo `docs/`;
+- najviac dva z prvých piatich packetov môžu byť dokumentačné alebo procesné;
+- externé služby sa plánujú mock-first: nedostupný prístup blokuje pripojenie
+  reálnych dát, nie lokálne UI, doménovú logiku ani syntetický tok;
+- `docs` packet používa iba smoke/diff kontroly a smie meniť iba `docs/`,
+  `README.md` a svoje explicitné `expected_paths`;
+- zelené checks nenahrádzajú finálny gate: `done` stále vyžaduje všetky
+  dokončené packety, čerstvú release suite a silný read-only Codex review.
+
+Voliteľný `routine_reviewer` má hodnotu `none`, `claude` alebo `codex`.
+Lean profily používajú `none`; classic predvolene `codex`. Pri hodnote
+`claude` neschválený read-only verdikt povoľuje jeden repair cyklus a potom
+eskaluje na Codex, nikdy však sám nevydá projektový status `done`.
+
 ## Recovery a bootstrap hardening — 24. júl 2026
 
 Technické zlyhanie transportu alebo neplatný worker výsledok už nespotrebuje
